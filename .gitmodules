@@ -1,0 +1,18 @@
+[submodule "external/vst3sdk"]
+	path = external/vst3sdk
+	url = ../vst3sdk
+[submodule "external/G711_G72x"]
+	path = external/G711_G72x
+	url = ../G711_G721_G723_codec
+[submodule "external/libgsm"]
+	path = external/libgsm
+	url = ../libgsm
+[submodule "external/opencore-amr"]
+	path = external/opencore-amr
+	url = ../opencore-amr
+[submodule "external/vo-amrwbenc"]
+	path = external/vo-amrwbenc
+	url = ../vo-amrwbenc
+[submodule "external/r8brain"]
+	path = external/r8brain
+	url = ../r8brain-free-src
