@@ -1,21 +1,101 @@
-﻿# CMakeList.txt : TelephonyVoice の CMake プロジェクト。ソースを含めて、次を定義します:
-# プロジェクト専用ロジックはこちらです。
-#
-cmake_minimum_required (VERSION 3.10)
+cmake_minimum_required(VERSION 3.15)
 
-# サポートされている場合は、MSVC コンパイラのホット リロードを有効にします。
-if (POLICY CMP0141)
-  cmake_policy(SET CMP0141 NEW)
-  set(CMAKE_MSVC_DEBUG_INFORMATION_FORMAT "$<IF:$<AND:$<C_COMPILER_ID:MSVC>,$<CXX_COMPILER_ID:MSVC>>,$<$<CONFIG:Debug,RelWithDebInfo>:EditAndContinue>,$<$<CONFIG:Debug,RelWithDebInfo>:ProgramDatabase>>")
+project(TelephonyVoice VERSION 1.0.0 LANGUAGES C CXX)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# ---------------------------------------------------------------------------
+# VST3 SDK Configuration
+# ---------------------------------------------------------------------------
+set(SMTG_ENABLE_VST3_PLUGIN_EXAMPLES OFF CACHE BOOL "Disable examples" FORCE)
+set(SMTG_ENABLE_VST3_HOSTING_EXAMPLES OFF CACHE BOOL "Disable hosting examples" FORCE)
+set(SMTG_ENABLE_VSTGUI_SUPPORT ON CACHE BOOL "Enable VSTGUI" FORCE)
+set(SMTG_CREATE_PLUGIN_LINK OFF CACHE BOOL "Disable symbolic link creation" FORCE)
+set(SMTG_CREATE_MODULE_INFO OFF CACHE BOOL "Disable moduleinfo.json creation" FORCE)
+set(SMTG_RUN_VST_VALIDATOR OFF CACHE BOOL "Disable VST validator" FORCE)
+
+add_subdirectory(external/vst3sdk)
+
+# ---------------------------------------------------------------------------
+# External Libraries
+# ---------------------------------------------------------------------------
+include(cmake/vo-amrwbenc.cmake)
+include(cmake/opencore-amr.cmake)
+include(cmake/r8brain.cmake)
+include(cmake/g711.cmake)
+include(cmake/libgsm.cmake)
+
+# ---------------------------------------------------------------------------
+# TelephonyDSP Library (Shared Logic)
+# ---------------------------------------------------------------------------
+add_library(TelephonyDSP STATIC TelephonyDSP.cpp)
+
+target_link_libraries(TelephonyDSP PUBLIC
+    vo-amrwbenc
+    opencore-amrnb
+    opencore-amrwb
+    r8brain
+    g711-codec
+    gsm
+)
+# Ensure headers are found
+target_include_directories(TelephonyDSP PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
+
+
+# ---------------------------------------------------------------------------
+# TelephonyVoice VST3 Plugin
+# ---------------------------------------------------------------------------
+smtg_add_vst3plugin(TelephonyVoice
+    TelephonyVoice.cpp
+    TelephonyVoice.h
+)
+
+target_link_libraries(TelephonyVoice
+    PRIVATE
+    TelephonyDSP
+    sdk             # VST3 SDK Base
+    vstgui_support
+)
+
+target_include_directories(TelephonyVoice PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/external/vst3sdk")
+
+if(MSVC)
+    target_compile_options(TelephonyVoice PRIVATE /W3 /MP)
 endif()
 
-project ("TelephonyVoice")
-
-# ソースをこのプロジェクトの実行可能ファイルに追加します。
-add_executable (TelephonyVoice "TelephonyVoice.cpp" "TelephonyVoice.h")
-
-if (CMAKE_VERSION VERSION_GREATER 3.12)
-  set_property(TARGET TelephonyVoice PROPERTY CXX_STANDARD 20)
+# Fix for vo-amrwbenc crash in Debug mode:
+# vo-amrwbenc requires optimization /O2 to avoid stack corruption crashes (likely due to internal buffer overflows hidden by optimization).
+# However, /O2 is incompatible with /RTC1 (default in Debug).
+# We strip /RTC1 from the global debug flags to allow per-target /O2 usage.
+if(MSVC)
+    foreach(flag_var
+        CMAKE_C_FLAGS_DEBUG
+        CMAKE_CXX_FLAGS_DEBUG
+    )
+        if(${flag_var} MATCHES "/RTC1")
+            string(REPLACE "/RTC1" "" ${flag_var} "${${flag_var}}")
+        elseif(${flag_var} MATCHES "/RTCsu")
+             string(REPLACE "/RTCsu" "" ${flag_var} "${${flag_var}}")
+        endif()
+    endforeach()
 endif()
 
-# TODO: テストを追加し、必要な場合は、ターゲットをインストールします。
+# ---------------------------------------------------------------------------
+# TelephonyRunner (Sample EXE)
+# ---------------------------------------------------------------------------
+set(WAV_TOOLS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/external/opencore-amr/test")
+
+add_executable(TelephonyRunner 
+    TelephonyRunner.cpp
+    "${WAV_TOOLS_DIR}/wavreader.c"
+    "${WAV_TOOLS_DIR}/wavwriter.c"
+)
+
+target_include_directories(TelephonyRunner PRIVATE "${WAV_TOOLS_DIR}")
+target_link_libraries(TelephonyRunner PRIVATE TelephonyDSP)
+
+if(MSVC)
+    target_compile_options(TelephonyRunner PRIVATE /W3 /MP)
+    target_compile_definitions(TelephonyRunner PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
