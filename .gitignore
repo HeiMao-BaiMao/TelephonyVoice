@@ -364,3 +364,20 @@ FodyWeavers.xsd
 
 # Build - build directories
 build/
+# CocoIndex Code (ccc)
+/.cocoindex_code/
+# Serena agent
+/.serena/
+# Test artifacts (wav generator / unit test scratch)
+test_input*.wav
+test_evs_direct.cpp
+make_test_wav.cpp
+runner_out.txt
+runner_err.txt
+
+# Audio file
+*.wav
+
+# Execute file
+*.exe
+*.dll

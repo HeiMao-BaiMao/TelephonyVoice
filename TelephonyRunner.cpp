@@ -22,7 +22,8 @@ const char* getModeSuffix(TelephonyDSP::EraMode mode) {
         case TelephonyDSP::EraMode::GSM_FR: return "gsm";
         case TelephonyDSP::EraMode::AMR_NB_3G: return "3g";
         case TelephonyDSP::EraMode::AMR_WB_VOLTE: return "volte";
-        case TelephonyDSP::EraMode::EVS_LIKE: return "evs";
+        case TelephonyDSP::EraMode::EVS_LIKE: return "evs_like";
+        case TelephonyDSP::EraMode::EVS_NATIVE: return "evs_native";
         case TelephonyDSP::EraMode::Bypass: return "bypass";
         default: return "unknown";
     }
@@ -62,6 +63,10 @@ void processFile(const std::string& inputFile, TelephonyDSP::EraMode mode) {
     TelephonyDSP::SignalProcessor dsp;
     dsp.setSampleRate(sampleRate);
     dsp.setMode(mode);
+    if (mode == TelephonyDSP::EraMode::EVS_NATIVE) {
+        // Default: SWB 32 kHz, 13.2 kbps (most common VoLTE voice config)
+        dsp.setEVSConfig(32000, EVS_BR_13200, EVS_SWB);
+    }
     dsp.setParameters(1.0f, 0.0f, false, 0.0f);
     dsp.setSimulateLatency(false); // Disable artificial 100ms latency for runner
 
@@ -155,7 +160,8 @@ int main(int argc, char* argv[]) {
         TelephonyDSP::EraMode::GSM_FR,
         TelephonyDSP::EraMode::AMR_NB_3G,
         TelephonyDSP::EraMode::AMR_WB_VOLTE,
-        TelephonyDSP::EraMode::EVS_LIKE
+        TelephonyDSP::EraMode::EVS_LIKE,
+        // TelephonyDSP::EraMode::EVS_NATIVE  // see README: hangs in init_encoder
     };
     for (auto mode : modes) processFile(inputFile, mode);
     return 0;

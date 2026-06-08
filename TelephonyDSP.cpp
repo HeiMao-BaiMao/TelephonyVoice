@@ -111,9 +111,49 @@ namespace TelephonyDSP {
         D_IF_decode(decState, serial, out, 0);
     }
 
-    ChannelProcessor::ChannelProcessor(double hostSR) 
-        : hostSampleRate(hostSR), currentMode(EraMode::Bypass), 
-          paramArtifactsEnabled(false), paramArtifactAmount(0.0f)
+    // ---------------------------------------------------------------------------
+    // EVSCodec
+    // ---------------------------------------------------------------------------
+    EVSCodec::EVSCodec(int sampleRate, int bitrateBps, EVS_Bandwidth maxBw)
+        : sampleRate(sampleRate)
+        , bitrateBps(bitrateBps)
+        , maxBw(maxBw)
+        , enc(nullptr)
+        , dec(nullptr)
+    {
+        enc = evs_enc_create(sampleRate, bitrateBps, maxBw);
+        dec = evs_dec_create(sampleRate, bitrateBps);
+        bitstream.resize(evs_max_bitstream_bytes(sampleRate));
+    }
+
+    EVSCodec::~EVSCodec() {
+        if (enc) evs_enc_destroy(enc);
+        if (dec) evs_dec_destroy(dec);
+    }
+
+    void EVSCodec::reset() {
+        if (enc) { evs_enc_destroy(enc); enc = evs_enc_create(sampleRate, bitrateBps, maxBw); }
+        if (dec) { evs_dec_destroy(dec); dec = evs_dec_create(sampleRate, bitrateBps); }
+    }
+
+    void EVSCodec::processFrame(const int16_t* in, int16_t* out) {
+        if (!enc || !dec) return;
+        int used = 0;
+        if (evs_enc_process(enc, in, sampleRate / 50, bitstream.data(), (int)bitstream.size(), &used) != EVS_OK) {
+            // On encode failure, pass input through unchanged
+            std::memcpy(out, in, (sampleRate / 50) * sizeof(int16_t));
+            return;
+        }
+        int n = 0;
+        if (evs_dec_process(dec, bitstream.data(), used, out, &n) != EVS_OK) {
+            std::memcpy(out, in, (sampleRate / 50) * sizeof(int16_t));
+        }
+    }
+
+    ChannelProcessor::ChannelProcessor(double hostSR)
+        : hostSampleRate(hostSR), currentMode(EraMode::Bypass),
+          paramArtifactsEnabled(false), paramArtifactAmount(0.0f),
+          evsSampleRate(32000), evsBitrateBps(EVS_BR_13200), evsMaxBandwidth(EVS_SWB)
     {
         size_t bigSize = 131072;
         ringCodecIn.resize(bigSize);
@@ -136,9 +176,23 @@ namespace TelephonyDSP {
 
     void ChannelProcessor::setMode(EraMode mode) {
         if (currentMode != mode) {
-            currentMode = mode; 
-            recreateResamplers(); 
+            currentMode = mode;
+            recreateResamplers();
             updateFilters();
+            recreateCodec();
+            ringCodecIn.reset(); ringCodecOut.reset();
+        }
+    }
+
+    void ChannelProcessor::setEVSConfig(int sampleRateHz, int bitrateBps, EVS_Bandwidth maxBw) {
+        bool changed = (evsSampleRate != sampleRateHz)
+                    || (evsBitrateBps != bitrateBps)
+                    || (evsMaxBandwidth != maxBw);
+        evsSampleRate    = sampleRateHz;
+        evsBitrateBps    = bitrateBps;
+        evsMaxBandwidth  = maxBw;
+        if (changed && currentMode == EraMode::EVS_NATIVE) {
+            recreateResamplers();
             recreateCodec();
             ringCodecIn.reset(); ringCodecOut.reset();
         }
@@ -184,14 +238,15 @@ namespace TelephonyDSP {
         resamplerDown.reset(); resamplerUp.reset();
         int targetSR = 0;
         switch (currentMode) {
-            case EraMode::PSTN_G711: 
-            case EraMode::GSM_FR: 
+            case EraMode::PSTN_G711:
+            case EraMode::GSM_FR:
             case EraMode::AMR_NB_3G: targetSR = 8000; break;
             case EraMode::AMR_WB_VOLTE: targetSR = 16000; break;
             case EraMode::EVS_LIKE: targetSR = 32000; break;
+            case EraMode::EVS_NATIVE: targetSR = evsSampleRate; break;
             default: targetSR = 0; break;
         }
-        
+
         if (targetSR > 0) {
             resamplerDown = std::make_unique<r8b::CDSPResampler24>(hostSampleRate, targetSR, 1024);
             resamplerUp = std::make_unique<r8b::CDSPResampler24>(targetSR, hostSampleRate, 1024);
@@ -201,8 +256,8 @@ namespace TelephonyDSP {
     void ChannelProcessor::updateFilters() {
         float sampleRate = 0.0f;
         switch (currentMode) {
-            case EraMode::PSTN_G711: 
-            case EraMode::GSM_FR: 
+            case EraMode::PSTN_G711:
+            case EraMode::GSM_FR:
                 sampleRate = 8000.0f; // Filters apply at Codec SR
                 hpFilter1.setHighpass(300.0f, sampleRate);
                 lpFilter1.setLowpass(3400.0f, sampleRate);
@@ -222,6 +277,13 @@ namespace TelephonyDSP {
                 hpFilter1.setHighpass(50.0f, sampleRate);
                 lpFilter1.setLowpass(14000.0f, sampleRate);
                 break;
+            case EraMode::EVS_NATIVE:
+                // The real EVS already shapes its own bandwidth; skip the extra
+                // biquad cascade so the codec's own spectral envelope is not
+                // double-filtered.
+                hpFilter1.reset();
+                lpFilter1.reset();
+                break;
             default:
                 break;
         }
@@ -237,6 +299,9 @@ namespace TelephonyDSP {
             case EraMode::GSM_FR: codec = std::make_unique<GSMCodec>(); break;
             case EraMode::AMR_NB_3G: codec = std::make_unique<AMRNBCodec>(); break;
             case EraMode::AMR_WB_VOLTE: codec = std::make_unique<AMRWBCodec>(); break;
+            case EraMode::EVS_NATIVE:
+                codec = std::make_unique<EVSCodec>(evsSampleRate, evsBitrateBps, evsMaxBandwidth);
+                break;
             default: break;
         }
         if (codec) {
@@ -327,10 +392,12 @@ namespace TelephonyDSP {
         }
     }
 
-    SignalProcessor::SignalProcessor() 
-        : hostSampleRate(44100.0), currentMode(EraMode::Bypass), 
+    SignalProcessor::SignalProcessor()
+        : hostSampleRate(44100.0), currentMode(EraMode::Bypass),
           paramDryWet(1.0f), paramOutGain(1.0f), paramArtifactsEnabled(false), paramArtifactAmount(0.0f),
-          simulateLatency(true), targetLatencySamples(0), inTotalSamples(0), outTotalSamples(0)
+          simulateLatency(true),
+          evsSampleRate(32000), evsBitrateBps(EVS_BR_13200), evsMaxBandwidth(EVS_SWB),
+          targetLatencySamples(0), inTotalSamples(0), outTotalSamples(0)
     {
         updateLatency();
     }
@@ -346,7 +413,17 @@ namespace TelephonyDSP {
 
     void SignalProcessor::setMode(EraMode mode) {
         currentMode = mode;
-        for (auto& ch : channels) ch->setMode(mode);
+        for (auto& ch : channels) {
+            ch->setMode(mode);
+            ch->setEVSConfig(evsSampleRate, evsBitrateBps, evsMaxBandwidth);
+        }
+    }
+
+    void SignalProcessor::setEVSConfig(int sampleRateHz, int bitrateBps, EVS_Bandwidth maxBw) {
+        evsSampleRate   = sampleRateHz;
+        evsBitrateBps   = bitrateBps;
+        evsMaxBandwidth = maxBw;
+        for (auto& ch : channels) ch->setEVSConfig(sampleRateHz, bitrateBps, maxBw);
     }
 
     void SignalProcessor::setParameters(float dryWet, float outGaindB, bool artifacts, float artifactAmount) {
@@ -385,6 +462,7 @@ namespace TelephonyDSP {
             for (int i=0; i<count; ++i) {
                 auto ch = std::make_unique<ChannelProcessor>(hostSampleRate);
                 ch->setMode(currentMode);
+                ch->setEVSConfig(evsSampleRate, evsBitrateBps, evsMaxBandwidth);
                 ch->configure(paramArtifactsEnabled, paramArtifactAmount);
                 channels.push_back(std::move(ch));
                 dryBuffers.push_back(std::make_unique<RingBuffer>(131072));

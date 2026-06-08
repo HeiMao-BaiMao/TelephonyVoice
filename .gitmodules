@@ -16,3 +16,6 @@
 [submodule "external/vst3sdk"]
 	path = external/vst3sdk
 	url = https://github.com/steinbergmedia/vst3sdk.git
+[submodule "external/3gpp-evs"]
+	path = external/3gpp-evs
+	url = https://github.com/lem21h/3gpp-evs.git

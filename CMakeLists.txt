@@ -6,6 +6,14 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # ---------------------------------------------------------------------------
+# 3GPP EVS codec variant selection
+# Default: floating-point reference (TS 26.443 v12.7.0 / v13.3.0)
+# Set TELEPHONY_USE_EVS_FX=ON to build the fixed-point variant
+# (TS 26.442 v12.15.0 / v13.10.0 / v14.6.0 / v15.4.0 / v16.4.0) instead.
+# ---------------------------------------------------------------------------
+option(TELEPHONY_USE_EVS_FX "Use 3GPP EVS fixed-point reference (v16.4.0) instead of floating-point (v13.3.0)" OFF)
+
+# ---------------------------------------------------------------------------
 # VST3 SDK Configuration
 # ---------------------------------------------------------------------------
 set(SMTG_ENABLE_VST3_PLUGIN_EXAMPLES OFF CACHE BOOL "Disable examples" FORCE)
@@ -25,11 +33,23 @@ include(cmake/opencore-amr.cmake)
 include(cmake/r8brain.cmake)
 include(cmake/g711.cmake)
 include(cmake/libgsm.cmake)
+include(cmake/3gpp-evs.cmake)
 
 # ---------------------------------------------------------------------------
 # TelephonyDSP Library (Shared Logic)
 # ---------------------------------------------------------------------------
-add_library(TelephonyDSP STATIC TelephonyDSP.cpp)
+if(TELEPHONY_USE_EVS_FX)
+    set(EVS_API_SRC "${CMAKE_CURRENT_SOURCE_DIR}/evs_api_fx.c")
+    set(EVS_API_LIBS evs-lib-enc-fx evs-lib-dec-fx)
+else()
+    set(EVS_API_SRC "${CMAKE_CURRENT_SOURCE_DIR}/evs_api.c")
+    set(EVS_API_LIBS evs-lib-enc evs-lib-dec)
+endif()
+
+add_library(TelephonyDSP STATIC
+    TelephonyDSP.cpp
+    ${EVS_API_SRC}
+)
 
 target_link_libraries(TelephonyDSP PUBLIC
     vo-amrwbenc
@@ -38,6 +58,7 @@ target_link_libraries(TelephonyDSP PUBLIC
     r8brain
     g711-codec
     gsm
+    ${EVS_API_LIBS}
 )
 # Ensure headers are found
 target_include_directories(TelephonyDSP PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
@@ -86,7 +107,7 @@ endif()
 # ---------------------------------------------------------------------------
 set(WAV_TOOLS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/external/opencore-amr/test")
 
-add_executable(TelephonyRunner 
+add_executable(TelephonyRunner
     TelephonyRunner.cpp
     "${WAV_TOOLS_DIR}/wavreader.c"
     "${WAV_TOOLS_DIR}/wavwriter.c"

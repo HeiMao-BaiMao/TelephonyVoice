@@ -9,6 +9,7 @@
 
 // External Libraries
 #include "CDSPResampler.h"
+#include "evs_api.h"
 
 extern "C" {
     unsigned char linear2ulaw(int pcm_val);
@@ -24,7 +25,8 @@ namespace TelephonyDSP {
         GSM_FR,
         AMR_NB_3G,
         AMR_WB_VOLTE,
-        EVS_LIKE,
+        EVS_LIKE,    // Filter-only stand-in (safe for distribution, no codec)
+        EVS_NATIVE,  // Real 3GPP EVS reference encoder+decoder (personal use)
         Bypass
     };
 
@@ -154,6 +156,38 @@ namespace TelephonyDSP {
         void* decState;
     };
 
+    // ---------------------------------------------------------------------------
+    // EVSCodec
+    //
+    // Wraps the 3GPP EVS reference (TS 26.443 v12.7.0/v13.3.0) via the
+    // evs_api.h C interface. Operates at 8 / 16 / 32 / 48 kHz internally with
+    // 20 ms frames, so getFrameSize() returns sampleRate / 50. Configurable
+    // total bitrate and bandwidth ceiling.
+    // ---------------------------------------------------------------------------
+    class EVSCodec : public ICodec {
+    public:
+        EVSCodec(int sampleRate, int bitrateBps, EVS_Bandwidth maxBw);
+        ~EVSCodec() override;
+        void reset() override;
+        int getSampleRate() const override { return sampleRate; }
+        int getFrameSize() const override { return sampleRate / 50; }
+        void processFrame(const int16_t* in, int16_t* out) override;
+
+        int getBitrate() const { return bitrateBps; }
+        EVS_Bandwidth getMaxBandwidth() const { return maxBw; }
+
+    private:
+        int sampleRate;
+        int bitrateBps;
+        EVS_Bandwidth maxBw;
+
+        EVS_Encoder* enc;
+        EVS_Decoder* dec;
+
+        // Reusable scratch buffers for the bitstream roundtrip.
+        std::vector<unsigned char> bitstream;
+    };
+
     class ChannelProcessor {
     public:
         ChannelProcessor(double hostSR);
@@ -161,6 +195,7 @@ namespace TelephonyDSP {
 
         void setSampleRate(double sr);
         void setMode(EraMode mode);
+        void setEVSConfig(int sampleRateHz, int bitrateBps, EVS_Bandwidth maxBw);
         void reset();
         void pushInput(const float* in, int numSamples);
         size_t pullOutput(float* out, int numSamples);
@@ -172,6 +207,11 @@ namespace TelephonyDSP {
         EraMode currentMode;
         bool paramArtifactsEnabled;
         float paramArtifactAmount;
+
+        // EVS configuration (only used when currentMode == EVS_NATIVE)
+        int evsSampleRate;
+        int evsBitrateBps;
+        EVS_Bandwidth evsMaxBandwidth;
 
         RingBuffer ringCodecIn;
         RingBuffer ringCodecOut;
@@ -196,7 +236,7 @@ namespace TelephonyDSP {
         void recreateCodec();
         void prepareInternalBuffers(int maxBlockSize);
         void updateFilters();
-        
+
         void processG711(int numSamples, const float* in, float* out);
         void processEVSLike(int numSamples, const float* in, float* out);
         void processCodec(int numSamples, const float* in);
@@ -210,6 +250,7 @@ namespace TelephonyDSP {
 
         void setSampleRate(double sampleRate);
         void setMode(EraMode mode);
+        void setEVSConfig(int sampleRateHz, int bitrateBps, EVS_Bandwidth maxBw);
         void setParameters(float dryWet, float outGaindB, bool artifacts, float artifactAmount);
         void setSimulateLatency(bool enable);
         void reset();
@@ -224,6 +265,11 @@ namespace TelephonyDSP {
         bool paramArtifactsEnabled;
         float paramArtifactAmount;
         bool simulateLatency;
+
+        // EVS configuration (only used when currentMode == EVS_NATIVE)
+        int evsSampleRate;
+        int evsBitrateBps;
+        EVS_Bandwidth evsMaxBandwidth;
 
         int targetLatencySamples;
         int64_t inTotalSamples;
