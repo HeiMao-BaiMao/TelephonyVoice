@@ -14,7 +14,11 @@ namespace Vst {
         kParamOutputGain,
         kParamArtifactsEnabled,
         kParamArtifactAmount,
-        kParamMasterBypass // VST3 standard bypass
+        kParamMasterBypass, // VST3 standard bypass
+        kParamPacketLossRate,
+        kParamNetworkDegradation,
+        kParamOutputEndpoint,
+        kParamDegradationSegment
     };
 
     // --------------------------------------------------------------------------
@@ -47,10 +51,14 @@ namespace Vst {
         
         // Parameter values (normalized or plain)
         int32 currentEraMode;
+        int32 currentOutputEndpoint;
+        int32 currentDegradationSegment;
         float currentDryWet;
         float currentOutGain;
         bool currentArtifactsEnabled;
         float currentArtifactAmount;
+        float currentPacketLossRate;
+        float currentNetworkDegradation;
         bool currentBypass;
 
         void updateDSPParameters();

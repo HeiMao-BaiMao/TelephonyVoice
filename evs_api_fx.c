@@ -86,3 +86,9 @@ int evs_dec_process(EVS_Decoder* dec,
     (void)pcm_out; (void)n_samples;
     return EVS_ERROR;
 }
+
+int evs_dec_process_lost(EVS_Decoder* dec,
+                         short* pcm_out, int* n_samples) {
+    (void)dec; (void)pcm_out; (void)n_samples;
+    return EVS_ERROR;
+}

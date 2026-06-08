@@ -1,8 +1,10 @@
 # TelephonyVoice
 
-VST3 plugin (and CLI runner) that emulates various telephone / cellular voice
-codecs on the audio.  Personal-use builds can swap the codec stubs for the
-real 3GPP reference implementations.
+VST3 plugin (and CLI runner) that emulates telephone / cellular voice paths.
+The VST UI uses route labels such as `in -> exchange -> out`, `fixed line`,
+`4G mobile`, and `5G mobile` rather than codec-standard names. Personal-use
+builds can use the bundled 3GPP reference implementations; distribution builds
+hide those modes and use distributable stand-ins only.
 
 ## Quick Start
 
@@ -29,10 +31,27 @@ Run the CLI on any 16-bit PCM WAV:
 .\out\build\x64-release\TelephonyRunner.exe path\to\input.wav
 ```
 
-It produces `<input>.<mode>.wav` for each era (G.711, GSM FR, AMR-NB, AMR-WB,
-EVS-like) in parallel.
+It produces `<input>.<mode>.wav` for each internal mode in parallel.
 
-## Modes
+## Routes and Modes
+
+The VST path is modeled as two independently degraded legs:
+
+```text
+in -> exchange -> out
+```
+
+UI parameters:
+
+* `in` – fixed line / 2G mobile / 3G mobile / 4G mobile / 5G mobile
+* `out` – fixed line / 2G mobile / 3G mobile / 4G mobile / 5G mobile
+* `degraded segment: in -> exchange -> out` – both legs, only input-to-exchange,
+  only exchange-to-output, or none
+* `packet loss` – applied as packet/frame erasure on the selected degraded leg(s)
+* `network degradation` – narrows the simulated path bandwidth and increases burst
+  loss on the selected degraded leg(s)
+
+Internally those user-facing endpoints map to codec-era modes:
 
 | `EraMode`                | Sample rate | Codec                  | Real implementation?                  |
 | ------------------------ | ----------- | ---------------------- | ------------------------------------- |
@@ -59,13 +78,28 @@ EVS-like) in parallel.
   `init_encoder` / `evs_enc` / `init_decoder` / `evs_dec` quartet.  Uses
   `tmpfile()` to round-trip the G.192 bitstream between encoder and decoder.
 * `evs_api_fx.c` – stub for the fixed-point variant (`TELEPHONY_USE_EVS_FX`
-  build option).  Not implemented.
+  build option).  Not implemented. The current FX source set still mixes
+  float and fixed headers (`stat_com.h` pulls in `cnst.h` next to
+  `cnst_fx.h`), so this cannot be made the default yet.
 * `TelephonyDSP` extended with an `EVS_NATIVE` mode, `EVSCodec` class
   wrapping the C API, EVS configuration plumbing on `ChannelProcessor` and
   `SignalProcessor`.  Default config: SWB 32 kHz / 13.2 kbps.
 * `TelephonyRunner` was wired up to call `setEVSConfig` for `EVS_NATIVE`.
   After discovering the hang (below) the iteration was commented out so the
   CLI ships in a usable state.
+* VST3 route selection now exposes `in`, `out`, and
+  `degraded segment: in -> exchange -> out`. Normal/personal builds expose
+  fixed line, 2G, 3G, 4G, 5G, and 5G precise/native. Distribution builds expose
+  only fixed line, 2G, and 5G stand-in.
+* Packet loss is modeled before/during the codec frame rather than as output
+  noise. AMR-NB and AMR-WB use the decoder `bfi` path. EVS Native uses
+  `FRAMEMODE_MISSING`. G.711, GSM, and EVS-Like use a waveform-repetition PLC
+  with pitch estimation and attenuation because those bundled APIs do not expose
+  a standards-grade PLC entry point.
+* `TELEPHONY_DISTRIBUTION_BUILD=ON` is implemented as a non-3GPP build path:
+  AMR/AMR-WB/EVS reference libraries are not included or linked, the UI only
+  exposes fixed line / 2G / 5G stand-in, and direct `EVS_NATIVE` requests are
+  aliased to `EVS_LIKE`.
 
 ### Not Working Yet (Handoff)
 
@@ -136,32 +170,42 @@ Suspected root causes to investigate (in order):
 cmake -DTELEPHONY_USE_EVS_FX=ON --preset x64-release
 ```
 
-This builds the fixed-point variant (TS 26.442 v16.4.0).  The float
-wrapper (`evs_api.c`) is replaced by the stub `evs_api_fx.c`, which
-currently just returns errors.  A full implementation of `evs_api_fx.c`
-would mirror the float version but use `Encoder_State_fx` /
-`init_encoder_fx` / `evs_enc_fx` / `Decoder_State_fx` /
-`init_decoder_fx` / `evs_dec_fx` and the Q-format Word16 buffers.
+This is intended to build the fixed-point variant (TS 26.442 v16.4.0), but it
+is not currently usable. The float wrapper (`evs_api.c`) is replaced by the
+stub `evs_api_fx.c`, which returns errors, and the FX library build currently
+fails before linking because fixed-point sources include `cnst_fx.h` while
+`stat_com.h` still pulls in the float `cnst.h`.
 
-## Distribution / Non-EVS Edition (Not Started)
+The user-facing target is that `5G mobile (precise)` / `EVS_NATIVE` should use
+the fixed-point implementation by default, matching real mobile deployments.
+Do not flip `TELEPHONY_USE_EVS_FX` to ON by default until:
+
+* the fixed-point source collection no longer mixes float and FX headers;
+* `evs_api_fx.c` implements `evs_enc_create`, `evs_enc_process`,
+  `evs_dec_process`, and `evs_dec_process_lost`;
+* the normal and distribution builds both pass, with distribution still hiding
+  all native 3GPP codecs.
+
+## Distribution / Non-EVS Edition
 
 User requirement: a separate, distributable build that drops
 AMR/AMR-WB/EVS entirely (the codecs that have patent / 3GPP-member
-encumbrance) and only ships G.711, GSM and the EVS_LIKE filter stand-in.
+encumbrance) and only ships fixed line, 2G, and the 5G stand-in route.
 
-The cleanest path:
+Implemented path:
 
-* Add a CMake option `TELEPHONY_DISTRIBUTION_BUILD=ON` that:
-  * Excludes `cmake/vo-amrwbenc.cmake`, `cmake/opencore-amr.cmake`,
-    `cmake/3gpp-evs.cmake`.
-  * Adds a tiny `codec_emu` library that re-implements AMR-NB /
-    AMR-WB / EVS_LIKE / EVS_NATIVE "LIKE" modes with cascading biquads
-    plus band-limited noise (the EVS_LIKE branch already does this;
-    just promote it to a proper class).
-* Make `EraMode::EVS_NATIVE` and `EraMode::AMR_*` compile-out under
-  that option (or alias them to `EVS_LIKE` / `Bypass`).
-
-This is sketched out but not implemented.
+* `TELEPHONY_DISTRIBUTION_BUILD=ON` excludes
+  `cmake/vo-amrwbenc.cmake`, `cmake/opencore-amr.cmake`, and
+  `cmake/3gpp-evs.cmake`.
+* `TelephonyDSP` compiles without AMR/AMR-WB/EVS symbols. AMR stand-ins keep
+  the existing resampling/filter path and pass frames through instead of using
+  the 3GPP codecs.
+* `EraMode::EVS_NATIVE` is aliased to `EVS_LIKE` under the distribution build.
+* The VST3 UI lists only fixed line, 2G mobile, and 5G mobile stand-in under
+  the distribution build. 3G, 4G, and 5G precise/native are not reachable from
+  the distribution UI.
+* `TelephonyRunner` lists only G.711, GSM, and EVS-Like under the distribution
+  build because it still uses the internal mode names for generated filenames.
 
 ## Code Layout
 
@@ -179,8 +223,8 @@ This is sketched out but not implemented.
 ├── evs_api.h              # public C API for the 3GPP EVS wrapper
 ├── evs_api.c              # float variant (working wrapper, see issue above)
 ├── evs_api_fx.c           # fixed-point variant stub
-├── TelephonyDSP.h         # public C++ API of the SignalProcessor
-├── TelephonyDSP.cpp       # codec emulations, resampler/filter chain
+├── TelephonyDSP.h         # public C++ API of the route-aware SignalProcessor
+├── TelephonyDSP.cpp       # two-leg path, codec emulations, PLC, resampler/filter chain
 ├── TelephonyVoice.h       # VST3 processor + edit controller
 ├── TelephonyVoice.cpp     # VST3 glue
 ├── TelephonyRunner.cpp    # CLI: applies every era to a WAV
@@ -199,19 +243,21 @@ This is sketched out but not implemented.
 | Option                     | Default | Effect                                                                 |
 | -------------------------- | ------- | ---------------------------------------------------------------------- |
 | `TELEPHONY_USE_EVS_FX`     | OFF     | Build fixed-point EVS (TS 26.442) instead of float (TS 26.443).         |
-| (planned) `TELEPHONY_DISTRIBUTION_BUILD` | OFF | Strip AMR/AMR-WB/EVS, build LIKE versions only.                |
+| `TELEPHONY_DISTRIBUTION_BUILD` | OFF | Strip AMR/AMR-WB/EVS references and expose only distributable modes. |
 
 ## License Note
 
 For personal use, all libraries are permissively licensed
 (Apache 2.0 / MIT / public domain / custom permissive).  However,
 **AMR/AMR-WB/EVS codec patents** (VoiceAge, Fraunhofer, NTT DoCoMo,
-Ericsson, Nokia, etc.) apply to commercial distribution.  The
-distribution-only build (planned, not implemented) addresses this.
+Ericsson, Nokia, etc.) apply to commercial distribution.  Use
+`TELEPHONY_DISTRIBUTION_BUILD=ON` for a build that avoids those codec
+implementations.
 
-The current `evs_native` mode must not be shipped.  It is gated by
-`EraMode::EVS_NATIVE`, which is left disabled in `TelephonyRunner`
-(commented out) and not exposed in the VST3 UI.
+The normal/personal build exposes `5G mobile (precise)` / `EVS Native` in the
+VST3 UI for testing. It must not be shipped. `TelephonyRunner` still leaves
+`EVS_NATIVE` out of its automatic mode list because of the integration hang
+above.
 
 ## Open Questions for the Next Agent
 
@@ -220,11 +266,14 @@ The current `evs_native` mode must not be shipped.  It is gated by
    state-aliasing with the other codec libraries linked into the same
    binary – reproduce with a runner that processes only `EVS_NATIVE`
    to confirm.
-2. Is the fixed-point variant worth wiring up?  Pros: real production
-   implementation, deterministic, faster.  Cons: extra integration
-   effort, more Q-format conversion.
+2. Finish fixed-point EVS and make `EVS_NATIVE` default to it. This requires
+   fixing the current FX header collision (`cnst_fx.h` plus float `cnst.h`) and
+   replacing the `evs_api_fx.c` stub with a real wrapper.
 3. Should the `EVS_LIKE` mode be promoted to a proper `EVS_DIST`
    filter-only class for the distribution build, or stay as a single
    mode in `SignalProcessor`?
-4. Are there other 3GPP EVS mirrors worth considering if the lem21h
+4. Should a dedicated VSTGUI editor be added for a visual route diagram? The
+   current implementation exposes `in`, `out`, and `degraded segment` through
+   the host's generic VST parameter UI.
+5. Are there other 3GPP EVS mirrors worth considering if the lem21h
    one stays unmaintained?  (AOSP branches, etc.)

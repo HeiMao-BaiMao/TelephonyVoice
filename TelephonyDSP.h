@@ -30,6 +30,22 @@ namespace TelephonyDSP {
         Bypass
     };
 
+    enum class RouteEndpoint {
+        FixedLine = 0,
+        Mobile2G,
+        Mobile3G,
+        Mobile4G,
+        Mobile5G,
+        Mobile5GNative
+    };
+
+    enum class DegradationSegment {
+        Both = 0,
+        InputToExchange,
+        ExchangeToOutput,
+        None
+    };
+
     static const int LATENCY_MS = 100;
 
     // Simple Biquad Filter (Direct Form I)
@@ -104,7 +120,21 @@ namespace TelephonyDSP {
         virtual void reset() = 0;
         virtual int getSampleRate() const = 0;
         virtual int getFrameSize() const = 0;
-        virtual void processFrame(const int16_t* in, int16_t* out) = 0;
+        virtual void processFrame(const int16_t* in, int16_t* out, bool packetLost) = 0;
+    };
+
+    class WaveformConcealer {
+    public:
+        void reset(int frameSize);
+        void storeGoodFrame(const int16_t* frame, int frameSize);
+        void conceal(int16_t* out, int frameSize);
+
+    private:
+        std::vector<int16_t> history;
+        float attenuation = 1.0f;
+        int lastPitch = 80;
+
+        int estimatePitch(int frameSize) const;
     };
 
     class G711Codec : public ICodec {
@@ -112,10 +142,11 @@ namespace TelephonyDSP {
         G711Codec(int sampleRate);
         void reset() override;
         int getSampleRate() const override { return sampleRate; }
-        int getFrameSize() const override { return 1; }
-        void processFrame(const int16_t* in, int16_t* out) override;
+        int getFrameSize() const override { return sampleRate / 50; }
+        void processFrame(const int16_t* in, int16_t* out, bool packetLost) override;
     private:
         int sampleRate;
+        WaveformConcealer plc;
     };
 
     class GSMCodec : public ICodec {
@@ -125,9 +156,10 @@ namespace TelephonyDSP {
         void reset() override;
         int getSampleRate() const override { return 8000; }
         int getFrameSize() const override { return 160; }
-        void processFrame(const int16_t* in, int16_t* out) override;
+        void processFrame(const int16_t* in, int16_t* out, bool packetLost) override;
     private:
         void* gsmState;
+        WaveformConcealer plc;
     };
 
     class AMRNBCodec : public ICodec {
@@ -137,10 +169,12 @@ namespace TelephonyDSP {
         void reset() override;
         int getSampleRate() const override { return 8000; }
         int getFrameSize() const override { return 160; }
-        void processFrame(const int16_t* in, int16_t* out) override;
+        void processFrame(const int16_t* in, int16_t* out, bool packetLost) override;
     private:
         void* encState;
         void* decState;
+        std::vector<unsigned char> lastSerial;
+        WaveformConcealer fallbackPLC;
     };
 
     class AMRWBCodec : public ICodec {
@@ -150,10 +184,12 @@ namespace TelephonyDSP {
         void reset() override;
         int getSampleRate() const override { return 16000; }
         int getFrameSize() const override { return 320; }
-        void processFrame(const int16_t* in, int16_t* out) override;
+        void processFrame(const int16_t* in, int16_t* out, bool packetLost) override;
     private:
         void* encState;
         void* decState;
+        std::vector<unsigned char> lastSerial;
+        WaveformConcealer fallbackPLC;
     };
 
     // ---------------------------------------------------------------------------
@@ -171,7 +207,7 @@ namespace TelephonyDSP {
         void reset() override;
         int getSampleRate() const override { return sampleRate; }
         int getFrameSize() const override { return sampleRate / 50; }
-        void processFrame(const int16_t* in, int16_t* out) override;
+        void processFrame(const int16_t* in, int16_t* out, bool packetLost) override;
 
         int getBitrate() const { return bitrateBps; }
         EVS_Bandwidth getMaxBandwidth() const { return maxBw; }
@@ -186,6 +222,7 @@ namespace TelephonyDSP {
 
         // Reusable scratch buffers for the bitstream roundtrip.
         std::vector<unsigned char> bitstream;
+        WaveformConcealer fallbackPLC;
     };
 
     class ChannelProcessor {
@@ -200,13 +237,17 @@ namespace TelephonyDSP {
         void pushInput(const float* in, int numSamples);
         size_t pullOutput(float* out, int numSamples);
         size_t getAvailableOutput() const;
-        void configure(bool artifacts, float amount);
+        void configure(bool artifacts, float amount, float packetLossRate, float networkDegradation);
 
     private:
         double hostSampleRate;
         EraMode currentMode;
         bool paramArtifactsEnabled;
         float paramArtifactAmount;
+        float paramPacketLossRate;
+        float paramNetworkDegradation;
+        uint32_t packetLossSeed;
+        int packetLossBurstFrames;
 
         // EVS configuration (only used when currentMode == EVS_NATIVE)
         int evsSampleRate;
@@ -227,6 +268,7 @@ namespace TelephonyDSP {
         std::vector<int16_t> codecFrameSIn;
         std::vector<int16_t> codecFrameSOut;
         std::vector<float> tempProcessBuf;
+        WaveformConcealer simulatedPathPLC;
 
         // Filters for G.711 (Cascaded for 24dB/oct)
         Biquad hpFilter1, hpFilter2;
@@ -236,6 +278,8 @@ namespace TelephonyDSP {
         void recreateCodec();
         void prepareInternalBuffers(int maxBlockSize);
         void updateFilters();
+        float nextPacketRandom();
+        bool shouldDropPacket();
 
         void processG711(int numSamples, const float* in, float* out);
         void processEVSLike(int numSamples, const float* in, float* out);
@@ -250,8 +294,10 @@ namespace TelephonyDSP {
 
         void setSampleRate(double sampleRate);
         void setMode(EraMode mode);
+        void setRoute(RouteEndpoint input, RouteEndpoint output, DegradationSegment degradationSegment);
         void setEVSConfig(int sampleRateHz, int bitrateBps, EVS_Bandwidth maxBw);
-        void setParameters(float dryWet, float outGaindB, bool artifacts, float artifactAmount);
+        void setParameters(float dryWet, float outGaindB, bool artifacts, float artifactAmount,
+                           float packetLossRate = 0.0f, float networkDegradation = 0.0f);
         void setSimulateLatency(bool enable);
         void reset();
         void process(float** inputs, int numIns, float** outputs, int numOuts, int numSamples);
@@ -260,10 +306,16 @@ namespace TelephonyDSP {
     private:
         double hostSampleRate;
         EraMode currentMode;
+        bool routeModelEnabled;
+        RouteEndpoint inputEndpoint;
+        RouteEndpoint outputEndpoint;
+        DegradationSegment degradationSegment;
         float paramDryWet;
         float paramOutGain;
         bool paramArtifactsEnabled;
         float paramArtifactAmount;
+        float paramPacketLossRate;
+        float paramNetworkDegradation;
         bool simulateLatency;
 
         // EVS configuration (only used when currentMode == EVS_NATIVE)
@@ -275,11 +327,16 @@ namespace TelephonyDSP {
         int64_t inTotalSamples;
         int64_t outTotalSamples;
 
-        std::vector<std::unique_ptr<ChannelProcessor>> channels;
+        std::vector<std::unique_ptr<ChannelProcessor>> inputLegs;
+        std::vector<std::unique_ptr<ChannelProcessor>> outputLegs;
         std::vector<std::unique_ptr<RingBuffer>> dryBuffers;
 
         void updateLatency();
         void ensureChannels(int count);
+        EraMode endpointToMode(RouteEndpoint endpoint) const;
+        bool degradesInputLeg() const;
+        bool degradesOutputLeg() const;
+        void applyRouteToChannels();
     };
 
 }

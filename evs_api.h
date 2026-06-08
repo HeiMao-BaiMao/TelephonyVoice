@@ -103,6 +103,11 @@ int evs_dec_process(EVS_Decoder* dec,
                     const unsigned char* bitstream_in, int bitstream_len,
                     short* pcm_out, int* n_samples);
 
+// Decode one missing 20 ms frame using the reference decoder's packet-loss
+// concealment path (FRAMEMODE_MISSING). No encoded payload is supplied.
+int evs_dec_process_lost(EVS_Decoder* dec,
+                         short* pcm_out, int* n_samples);
+
 // ---------------------------------------------------------------------------
 // Bitstream size hints.
 // ---------------------------------------------------------------------------

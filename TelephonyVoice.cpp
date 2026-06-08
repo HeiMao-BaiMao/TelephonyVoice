@@ -2,6 +2,7 @@
 #include "pluginterfaces/vst/vsttypes.h"
 #include "pluginterfaces/vst/ivstparameterchanges.h"
 #include "base/source/fstreamer.h"
+#include <algorithm>
 
 // Define string macro for VST3 (UTF-16)
 #ifndef STR16
@@ -18,6 +19,49 @@ using namespace Steinberg::Vst;
 namespace Steinberg {
 namespace Vst {
 
+#ifdef TELEPHONY_DISTRIBUTION_BUILD
+constexpr int32 kMaxExposedEndpoint = 2;
+constexpr int32 kDefaultOutputEndpoint = 2;
+#else
+constexpr int32 kMaxExposedEndpoint = 5;
+constexpr int32 kDefaultOutputEndpoint = 4;
+#endif
+constexpr int32 kMaxDegradationSegment = 3;
+
+TelephonyDSP::RouteEndpoint endpointFromParameter(int32 endpoint)
+{
+    endpoint = std::clamp(endpoint, 0, kMaxExposedEndpoint);
+#ifdef TELEPHONY_DISTRIBUTION_BUILD
+    switch (endpoint) {
+        case 0: return TelephonyDSP::RouteEndpoint::FixedLine;
+        case 1: return TelephonyDSP::RouteEndpoint::Mobile2G;
+        case 2: return TelephonyDSP::RouteEndpoint::Mobile5G;
+        default: return TelephonyDSP::RouteEndpoint::FixedLine;
+    }
+#else
+    switch (endpoint) {
+        case 0: return TelephonyDSP::RouteEndpoint::FixedLine;
+        case 1: return TelephonyDSP::RouteEndpoint::Mobile2G;
+        case 2: return TelephonyDSP::RouteEndpoint::Mobile3G;
+        case 3: return TelephonyDSP::RouteEndpoint::Mobile4G;
+        case 4: return TelephonyDSP::RouteEndpoint::Mobile5G;
+        case 5: return TelephonyDSP::RouteEndpoint::Mobile5GNative;
+        default: return TelephonyDSP::RouteEndpoint::FixedLine;
+    }
+#endif
+}
+
+TelephonyDSP::DegradationSegment degradationSegmentFromParameter(int32 segment)
+{
+    switch (std::clamp(segment, 0, kMaxDegradationSegment)) {
+        case 0: return TelephonyDSP::DegradationSegment::Both;
+        case 1: return TelephonyDSP::DegradationSegment::InputToExchange;
+        case 2: return TelephonyDSP::DegradationSegment::ExchangeToOutput;
+        case 3: return TelephonyDSP::DegradationSegment::None;
+        default: return TelephonyDSP::DegradationSegment::Both;
+    }
+}
+
 // Generate unique IDs (Placeholders)
 FUID TelephonyVoiceProcessor::uid(0x8625E8D6, 0x22F3F7FE, 0x400ED50D, 0x3F00CBAA);
 FUID TelephonyVoiceController::uid(0x715EC843, 0x443AC666, 0x012F2754, 0x19E07432);
@@ -27,10 +71,14 @@ FUID TelephonyVoiceController::uid(0x715EC843, 0x443AC666, 0x012F2754, 0x19E0743
 // --------------------------------------------------------------------------
 TelephonyVoiceProcessor::TelephonyVoiceProcessor()
     : currentEraMode(0)
+    , currentOutputEndpoint(kDefaultOutputEndpoint)
+    , currentDegradationSegment(0)
     , currentDryWet(0.5f)
     , currentOutGain(0.0f)
     , currentArtifactsEnabled(false)
     , currentArtifactAmount(0.0f)
+    , currentPacketLossRate(0.0f)
+    , currentNetworkDegradation(0.0f)
     , currentBypass(false)
 {
     setControllerClass(TelephonyVoiceController::uid);
@@ -98,11 +146,21 @@ tresult PLUGIN_API TelephonyVoiceProcessor::process(ProcessData& data)
                 if (queue->getPoint(numPoints - 1, sampleOffset, value) == kResultOk) {
                     ParamID pid = queue->getParameterId();
                     switch (pid) {
-                        case kParamEraMode: currentEraMode = (int32)(value * 5.0 + 0.5); break;
+                        case kParamEraMode:
+                            currentEraMode = std::clamp((int32)(value * kMaxExposedEndpoint + 0.5), 0, kMaxExposedEndpoint);
+                            break;
+                        case kParamOutputEndpoint:
+                            currentOutputEndpoint = std::clamp((int32)(value * kMaxExposedEndpoint + 0.5), 0, kMaxExposedEndpoint);
+                            break;
+                        case kParamDegradationSegment:
+                            currentDegradationSegment = std::clamp((int32)(value * kMaxDegradationSegment + 0.5), 0, kMaxDegradationSegment);
+                            break;
                         case kParamDryWet: currentDryWet = (float)value; break;
                         case kParamOutputGain: currentOutGain = (float)(value * 84.0 - 60.0); break;
                         case kParamArtifactsEnabled: currentArtifactsEnabled = (value > 0.5); break;
                         case kParamArtifactAmount: currentArtifactAmount = (float)value; break;
+                        case kParamPacketLossRate: currentPacketLossRate = (float)value * 0.30f; break;
+                        case kParamNetworkDegradation: currentNetworkDegradation = (float)value; break;
                         case kParamMasterBypass: currentBypass = (value > 0.5); break;
                     }
                 }
@@ -138,8 +196,14 @@ tresult PLUGIN_API TelephonyVoiceProcessor::process(ProcessData& data)
 
 void TelephonyVoiceProcessor::updateDSPParameters()
 {
-    dsp.setMode((TelephonyDSP::EraMode)std::clamp(currentEraMode, 0, 5));
-    dsp.setParameters(currentDryWet, currentOutGain, currentArtifactsEnabled, currentArtifactAmount);
+    currentEraMode = std::clamp(currentEraMode, 0, kMaxExposedEndpoint);
+    currentOutputEndpoint = std::clamp(currentOutputEndpoint, 0, kMaxExposedEndpoint);
+    currentDegradationSegment = std::clamp(currentDegradationSegment, 0, kMaxDegradationSegment);
+    dsp.setRoute(endpointFromParameter(currentEraMode),
+                 endpointFromParameter(currentOutputEndpoint),
+                 degradationSegmentFromParameter(currentDegradationSegment));
+    dsp.setParameters(currentDryWet, currentOutGain, currentArtifactsEnabled, currentArtifactAmount,
+                      currentPacketLossRate, currentNetworkDegradation);
 }
 
 tresult PLUGIN_API TelephonyVoiceProcessor::setState(IBStream* state)
@@ -152,8 +216,18 @@ tresult PLUGIN_API TelephonyVoiceProcessor::setState(IBStream* state)
     if (!streamer.readBool(art)) return kResultFalse;
     if (!streamer.readFloat(amt)) return kResultFalse;
     if (!streamer.readBool(byp)) return kResultFalse;
-    currentEraMode = mode; currentDryWet = dry; currentOutGain = gain;
-    currentArtifactsEnabled = art; currentArtifactAmount = amt; currentBypass = byp;
+    currentEraMode = std::clamp(mode, 0, kMaxExposedEndpoint);
+    currentDryWet = dry; currentOutGain = gain;
+    currentArtifactsEnabled = art; currentArtifactAmount = amt;
+    currentBypass = byp;
+    if (!streamer.readInt32(currentOutputEndpoint)) currentOutputEndpoint = kDefaultOutputEndpoint;
+    if (!streamer.readInt32(currentDegradationSegment)) currentDegradationSegment = 0;
+    if (!streamer.readFloat(currentPacketLossRate)) currentPacketLossRate = 0.0f;
+    if (!streamer.readFloat(currentNetworkDegradation)) currentNetworkDegradation = 0.0f;
+    currentOutputEndpoint = std::clamp(currentOutputEndpoint, 0, kMaxExposedEndpoint);
+    currentDegradationSegment = std::clamp(currentDegradationSegment, 0, kMaxDegradationSegment);
+    currentPacketLossRate = std::clamp(currentPacketLossRate, 0.0f, 0.95f);
+    currentNetworkDegradation = std::clamp(currentNetworkDegradation, 0.0f, 1.0f);
     updateDSPParameters();
     return kResultOk;
 }
@@ -164,6 +238,10 @@ tresult PLUGIN_API TelephonyVoiceProcessor::getState(IBStream* state)
     streamer.writeInt32(currentEraMode); streamer.writeFloat(currentDryWet);
     streamer.writeFloat(currentOutGain); streamer.writeBool(currentArtifactsEnabled);
     streamer.writeFloat(currentArtifactAmount); streamer.writeBool(currentBypass);
+    streamer.writeInt32(currentOutputEndpoint);
+    streamer.writeInt32(currentDegradationSegment);
+    streamer.writeFloat(currentPacketLossRate);
+    streamer.writeFloat(currentNetworkDegradation);
     return kResultOk;
 }
 
@@ -178,16 +256,42 @@ tresult PLUGIN_API TelephonyVoiceController::initialize(FUnknown* context)
     tresult result = EditController::initialize(context);
     if (result != kResultOk) return result;
 
-    StringListParameter* modeParam = new StringListParameter(STR16("Era Mode"), kParamEraMode, nullptr, ParameterInfo::kCanAutomate | ParameterInfo::kIsList);
-    modeParam->appendString(STR16("PSTN (G.711)")); modeParam->appendString(STR16("GSM FR"));
-    modeParam->appendString(STR16("AMR-NB (3G)")); modeParam->appendString(STR16("AMR-WB (VoLTE)"));
-    modeParam->appendString(STR16("EVS-Like")); modeParam->appendString(STR16("Bypass"));
-    parameters.addParameter(modeParam);
+    auto appendEndpointStrings = [](StringListParameter* param) {
+        param->appendString(STR16("\u56fa\u5b9a\u96fb\u8a71"));
+        param->appendString(STR16("2G\u643a\u5e2f"));
+#ifndef TELEPHONY_DISTRIBUTION_BUILD
+        param->appendString(STR16("3G\u643a\u5e2f"));
+        param->appendString(STR16("4G\u643a\u5e2f"));
+#endif
+        param->appendString(STR16("5G\u643a\u5e2f"));
+#ifndef TELEPHONY_DISTRIBUTION_BUILD
+        param->appendString(STR16("5G\u643a\u5e2f (\u7cbe\u5bc6)"));
+#endif
+    };
+
+    StringListParameter* inputParam = new StringListParameter(STR16("in"), kParamEraMode, nullptr, ParameterInfo::kCanAutomate | ParameterInfo::kIsList);
+    appendEndpointStrings(inputParam);
+    inputParam->setNormalized(0.0);
+    parameters.addParameter(inputParam);
+
+    StringListParameter* outputParam = new StringListParameter(STR16("out"), kParamOutputEndpoint, nullptr, ParameterInfo::kCanAutomate | ParameterInfo::kIsList);
+    appendEndpointStrings(outputParam);
+    outputParam->setNormalized((double)kDefaultOutputEndpoint / (double)kMaxExposedEndpoint);
+    parameters.addParameter(outputParam);
+
+    StringListParameter* segmentParam = new StringListParameter(STR16("\u52a3\u5316\u533a\u9593: in -> \u4ea4\u63db\u5c40 -> out"), kParamDegradationSegment, nullptr, ParameterInfo::kCanAutomate | ParameterInfo::kIsList);
+    segmentParam->appendString(STR16("\u4e21\u65b9"));
+    segmentParam->appendString(STR16("in -> \u4ea4\u63db\u5c40"));
+    segmentParam->appendString(STR16("\u4ea4\u63db\u5c40 -> out"));
+    segmentParam->appendString(STR16("\u306a\u3057"));
+    parameters.addParameter(segmentParam);
 
     parameters.addParameter(new RangeParameter(STR16("Dry/Wet"), kParamDryWet, STR16("%"), 0.0, 1.0, 0.5, 0, ParameterInfo::kCanAutomate));
     parameters.addParameter(new RangeParameter(STR16("Output Gain"), kParamOutputGain, STR16("dB"), -60.0, 24.0, 0.0, 0, ParameterInfo::kCanAutomate));
     parameters.addParameter(new RangeParameter(STR16("Enable Artifacts"), kParamArtifactsEnabled, STR16(""), 0.0, 1.0, 0.0, 1, ParameterInfo::kCanAutomate));
     parameters.addParameter(new RangeParameter(STR16("Artifact Amount"), kParamArtifactAmount, STR16("%"), 0.0, 1.0, 0.0, 0, ParameterInfo::kCanAutomate));
+    parameters.addParameter(new RangeParameter(STR16("\u30d1\u30b1\u30c3\u30c8\u30ed\u30b9"), kParamPacketLossRate, STR16("%"), 0.0, 30.0, 0.0, 0, ParameterInfo::kCanAutomate));
+    parameters.addParameter(new RangeParameter(STR16("\u901a\u4fe1\u52a3\u5316"), kParamNetworkDegradation, STR16("%"), 0.0, 100.0, 0.0, 0, ParameterInfo::kCanAutomate));
     parameters.addParameter(new RangeParameter(STR16("Bypass"), kParamMasterBypass, STR16(""), 0, 1, 0, 1, ParameterInfo::kCanAutomate | ParameterInfo::kIsBypass));
 
     return kResultOk;

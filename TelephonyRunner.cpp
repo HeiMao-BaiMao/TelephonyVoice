@@ -158,10 +158,14 @@ int main(int argc, char* argv[]) {
     std::vector<TelephonyDSP::EraMode> modes = {
         TelephonyDSP::EraMode::PSTN_G711,
         TelephonyDSP::EraMode::GSM_FR,
+#ifndef TELEPHONY_DISTRIBUTION_BUILD
         TelephonyDSP::EraMode::AMR_NB_3G,
         TelephonyDSP::EraMode::AMR_WB_VOLTE,
+#endif
         TelephonyDSP::EraMode::EVS_LIKE,
+#ifndef TELEPHONY_DISTRIBUTION_BUILD
         // TelephonyDSP::EraMode::EVS_NATIVE  // see README: hangs in init_encoder
+#endif
     };
     for (auto mode : modes) processFile(inputFile, mode);
     return 0;

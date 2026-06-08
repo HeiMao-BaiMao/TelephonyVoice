@@ -12,6 +12,11 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # (TS 26.442 v12.15.0 / v13.10.0 / v14.6.0 / v15.4.0 / v16.4.0) instead.
 # ---------------------------------------------------------------------------
 option(TELEPHONY_USE_EVS_FX "Use 3GPP EVS fixed-point reference (v16.4.0) instead of floating-point (v13.3.0)" OFF)
+option(TELEPHONY_DISTRIBUTION_BUILD "Strip AMR/AMR-WB/EVS reference codecs and use distributable stand-ins only" OFF)
+
+if(TELEPHONY_DISTRIBUTION_BUILD AND TELEPHONY_USE_EVS_FX)
+    message(FATAL_ERROR "TELEPHONY_USE_EVS_FX is not available in TELEPHONY_DISTRIBUTION_BUILD")
+endif()
 
 # ---------------------------------------------------------------------------
 # VST3 SDK Configuration
@@ -28,17 +33,23 @@ add_subdirectory(external/vst3sdk)
 # ---------------------------------------------------------------------------
 # External Libraries
 # ---------------------------------------------------------------------------
-include(cmake/vo-amrwbenc.cmake)
-include(cmake/opencore-amr.cmake)
 include(cmake/r8brain.cmake)
 include(cmake/g711.cmake)
 include(cmake/libgsm.cmake)
-include(cmake/3gpp-evs.cmake)
+
+if(NOT TELEPHONY_DISTRIBUTION_BUILD)
+    include(cmake/vo-amrwbenc.cmake)
+    include(cmake/opencore-amr.cmake)
+    include(cmake/3gpp-evs.cmake)
+endif()
 
 # ---------------------------------------------------------------------------
 # TelephonyDSP Library (Shared Logic)
 # ---------------------------------------------------------------------------
-if(TELEPHONY_USE_EVS_FX)
+if(TELEPHONY_DISTRIBUTION_BUILD)
+    set(EVS_API_SRC "")
+    set(EVS_API_LIBS "")
+elseif(TELEPHONY_USE_EVS_FX)
     set(EVS_API_SRC "${CMAKE_CURRENT_SOURCE_DIR}/evs_api_fx.c")
     set(EVS_API_LIBS evs-lib-enc-fx evs-lib-dec-fx)
 else()
@@ -52,14 +63,21 @@ add_library(TelephonyDSP STATIC
 )
 
 target_link_libraries(TelephonyDSP PUBLIC
-    vo-amrwbenc
-    opencore-amrnb
-    opencore-amrwb
     r8brain
     g711-codec
     gsm
     ${EVS_API_LIBS}
 )
+
+if(NOT TELEPHONY_DISTRIBUTION_BUILD)
+    target_link_libraries(TelephonyDSP PUBLIC
+        vo-amrwbenc
+        opencore-amrnb
+        opencore-amrwb
+    )
+else()
+    target_compile_definitions(TelephonyDSP PUBLIC TELEPHONY_DISTRIBUTION_BUILD=1)
+endif()
 # Ensure headers are found
 target_include_directories(TelephonyDSP PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
 

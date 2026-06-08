@@ -220,7 +220,6 @@ int evs_dec_process(EVS_Decoder* dec,
     rewind(dec->bitfile);
 
     dec->st->bfi = 0;
-    dec->st->prev_bfi = 0;
 
     short ok = read_indices(dec->st, dec->bitfile, 0);
     if (!ok) return EVS_ERROR;
@@ -231,6 +230,32 @@ int evs_dec_process(EVS_Decoder* dec,
     evs_dec(dec->st, out, FRAMEMODE_NORMAL);
 
     int N = dec->st->output_Fs / 50;
+    for (int i = 0; i < N; ++i) {
+        float v = out[i];
+        if (v >  32767.0f) v =  32767.0f;
+        if (v < -32768.0f) v = -32768.0f;
+        pcm_out[i] = (short)v;
+    }
+    *n_samples = N;
+    free(out);
+    return EVS_OK;
+}
+
+int evs_dec_process_lost(EVS_Decoder* dec,
+                         short* pcm_out, int* n_samples) {
+    if (!dec || !dec->st || !pcm_out || !n_samples) return EVS_ERROR;
+
+    int N = dec->st->output_Fs / 50;
+    float* out = (float*)calloc(N, sizeof(float));
+    if (!out) return EVS_ERROR;
+
+    dec->st->bfi = 1;
+    if (dec->st->codec_mode == 0 && dec->st->last_codec_mode != 0) {
+        dec->st->codec_mode = dec->st->last_codec_mode;
+    }
+
+    evs_dec(dec->st, out, FRAMEMODE_MISSING);
+
     for (int i = 0; i < N; ++i) {
         float v = out[i];
         if (v >  32767.0f) v =  32767.0f;
