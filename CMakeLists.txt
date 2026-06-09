@@ -13,6 +13,23 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # ---------------------------------------------------------------------------
 option(TELEPHONY_USE_EVS_FX "Use 3GPP EVS fixed-point reference (v16.4.0) instead of floating-point (v13.3.0)" OFF)
 option(TELEPHONY_DISTRIBUTION_BUILD "Strip AMR/AMR-WB/EVS reference codecs and use distributable stand-ins only" OFF)
+# ---------------------------------------------------------------------------
+# Experimental / non-distribution additions
+#
+# When ON we build SpeexDSP (BSD) and Opus (BSD) into the project and expose
+# the new `OPUS_VOIP` mode + the SpeexDSP-backed VAD/DTX/CNG helper. This is
+# intentionally OFF under TELEPHONY_DISTRIBUTION_BUILD so shipped binaries
+# never link the experimental libraries. Personal / internal builds default
+# to ON so the new mode is available out of the box.
+# ---------------------------------------------------------------------------
+option(TELEPHONY_EXPERIMENTAL_NETWORK "Build SpeexDSP and Opus support and expose the experimental OPUS_VOIP mode (non-distribution builds only)" ON)
+
+if(TELEPHONY_DISTRIBUTION_BUILD AND TELEPHONY_EXPERIMENTAL_NETWORK)
+    # The distribution build intentionally avoids the experimental libraries;
+    # force the option off rather than letting it sneak in via cache.
+    set(TELEPHONY_EXPERIMENTAL_NETWORK OFF CACHE BOOL "" FORCE)
+    message(STATUS "TELEPHONY_EXPERIMENTAL_NETWORK forced OFF by TELEPHONY_DISTRIBUTION_BUILD")
+endif()
 
 if(TELEPHONY_DISTRIBUTION_BUILD AND TELEPHONY_USE_EVS_FX)
     message(FATAL_ERROR "TELEPHONY_USE_EVS_FX is not available in TELEPHONY_DISTRIBUTION_BUILD")
@@ -41,6 +58,15 @@ if(NOT TELEPHONY_DISTRIBUTION_BUILD)
     include(cmake/vo-amrwbenc.cmake)
     include(cmake/opencore-amr.cmake)
     include(cmake/3gpp-evs.cmake)
+endif()
+
+# SpeexDSP and Opus are experimental additions. They are BSD-licensed so
+# they're safe to ship, but they're not part of the original telephony stack
+# so we gate them behind TELEPHONY_EXPERIMENTAL_NETWORK. Distribution builds
+# always have that option forced OFF above.
+if(TELEPHONY_EXPERIMENTAL_NETWORK)
+    include(cmake/speexdsp.cmake)
+    include(cmake/opus.cmake)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -77,6 +103,15 @@ if(NOT TELEPHONY_DISTRIBUTION_BUILD)
     )
 else()
     target_compile_definitions(TelephonyDSP PUBLIC TELEPHONY_DISTRIBUTION_BUILD=1)
+endif()
+
+# Experimental additions (SpeexDSP, Opus). The OPUS_VOIP / SpeexDSP-backed
+# helper is referenced from TelephonyDSP only when this is ON.
+if(TELEPHONY_EXPERIMENTAL_NETWORK)
+    target_link_libraries(TelephonyDSP PUBLIC speexdsp-core opus-codec)
+    target_compile_definitions(TelephonyDSP PUBLIC TELEPHONY_EXPERIMENTAL_NETWORK=1)
+else()
+    target_compile_definitions(TelephonyDSP PUBLIC TELEPHONY_EXPERIMENTAL_NETWORK=0)
 endif()
 # Ensure headers are found
 target_include_directories(TelephonyDSP PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")

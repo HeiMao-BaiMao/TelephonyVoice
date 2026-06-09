@@ -19,3 +19,9 @@
 [submodule "external/3gpp-evs"]
 	path = external/3gpp-evs
 	url = https://github.com/lem21h/3gpp-evs.git
+[submodule "external/speexdsp"]
+	path = external/speexdsp
+	url = https://github.com/xiph/speexdsp.git
+[submodule "external/opus"]
+	path = external/opus
+	url = https://github.com/xiph/opus.git
