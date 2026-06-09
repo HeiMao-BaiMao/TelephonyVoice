@@ -20,14 +20,17 @@ extern "C" {
 
 namespace TelephonyDSP {
 
-    enum class EraMode {
+enum class EraMode {
         PSTN_G711 = 0,
         GSM_FR,
         AMR_NB_3G,
         AMR_WB_VOLTE,
         EVS_LIKE,    // Filter-only stand-in (safe for distribution, no codec)
         EVS_NATIVE,  // Real 3GPP EVS reference encoder+decoder (personal use)
-        Bypass
+        Bypass,
+        // Experimental additions (BSD-licensed; non-distribution only).
+        // Inserted at the end so existing numeric values remain stable.
+        OPUS_VOIP    // Opus encoder/decoder at VOIP-tuned settings (non-distribution)
     };
 
     enum class RouteEndpoint {
@@ -114,13 +117,19 @@ namespace TelephonyDSP {
         std::atomic<size_t> readPos;
     };
 
-    class ICodec {
+class ICodec {
     public:
         virtual ~ICodec() = default;
         virtual void reset() = 0;
         virtual int getSampleRate() const = 0;
         virtual int getFrameSize() const = 0;
         virtual void processFrame(const int16_t* in, int16_t* out, bool packetLost) = 0;
+        // Optional hook used by ChannelProcessor to push the current clamped
+        // network parameters (packet loss rate, network degradation) into the
+        // codec. Default is a no-op so existing codecs do not need to react;
+        // codecs that model real packetized VoIP (e.g. OpusCodec) override it
+        // to wire CTLs / internal jitter-buffer state.
+        virtual void configureNetwork(float packetLossRate, float networkDegradation) {}
     };
 
     class WaveformConcealer {
@@ -192,7 +201,7 @@ namespace TelephonyDSP {
         WaveformConcealer fallbackPLC;
     };
 
-    // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
     // EVSCodec
     //
     // Wraps the 3GPP EVS reference (TS 26.443 v12.7.0/v13.3.0) via the
@@ -224,6 +233,157 @@ namespace TelephonyDSP {
         std::vector<unsigned char> bitstream;
         WaveformConcealer fallbackPLC;
     };
+
+    // ---------------------------------------------------------------------------
+    // OpusCodec (experimental, non-distribution)
+    //
+    // Wraps the BSD-licensed Opus encoder/decoder from xiph/opus via its C
+    // API. Defaults are VOIP-friendly: 48 kHz, 20 ms frames (960 samples),
+    // application VOIP, 24 kbps target bitrate, moderate complexity.
+    //
+    // On top of the bare encoder/decoder round-trip this class simulates a
+    // small packetized VoIP transport so the path is closer to what an RTP
+    // pipeline would see:
+    //   - encoder CTLs are configured via configureNetwork(): FEC on, packet
+    //     loss percent driven by the configured loss rate / degradation
+    //   - each input frame becomes an Opus packet with an increasing sequence
+    //     number; packets have a deterministic arrival frame derived from a
+    //     small LCG seeded by networkDegradation
+    //   - the playback target lags by a small base delay plus a degradation-
+    //     dependent extra; if the target packet is available we decode it,
+    //     otherwise we fall back to in-band FEC (decode_fec=1) on the next
+    //     available packet, then Opus's built-in PLC, then the
+    //     WaveformConcealer
+    //   - the queue is capped and stale packets are dropped on each step so
+    //     the transport stays deterministic and bounded
+    //
+    // One output frame is still produced per input frame, so the surrounding
+    // ChannelProcessor / ring-buffer contract is unchanged.
+    //
+    // Only compiled into TelephonyDSP when TELEPHONY_EXPERIMENTAL_NETWORK=1.
+    // ---------------------------------------------------------------------------
+    class OpusCodec : public ICodec {
+    public:
+        OpusCodec(int sampleRate, int bitrateBps, int complexity);
+        ~OpusCodec() override;
+        void reset() override;
+        int getSampleRate() const override { return sampleRate; }
+        int getFrameSize() const override { return sampleRate / 50; }
+        void processFrame(const int16_t* in, int16_t* out, bool packetLost) override;
+        void configureNetwork(float packetLossRate, float networkDegradation) override;
+
+        int getBitrate() const { return bitrateBps; }
+
+    private:
+        int sampleRate;
+        int bitrateBps;
+        int frameSize;     // samples per 20 ms frame at sampleRate
+        int complexity;
+        void* encoder;     // OpusEncoder* (kept void* to avoid pulling opus.h into the header)
+        void* decoder;     // OpusDecoder*
+        std::vector<unsigned char> bitstream;
+        WaveformConcealer fallbackPLC;
+
+        // --- Packetized VoIP simulation state ---
+        //
+        // We never have more than this many buffered packets. Larger values
+        // waste memory; smaller values can starve Opus's PLC / FEC path.
+        static constexpr int kMaxQueueSize = 16;
+
+        // One transport packet: bitstream bytes plus sequence number and
+        // arrival frame (the playback-frame index at which it should become
+        // available to the decoder).
+        struct VoipPacket {
+            uint32_t seq;            // monotonically increasing per encoded frame
+            int      arrivalFrame;   // playback frame index at which it arrives
+            std::vector<unsigned char> data;
+        };
+
+        // Per-packet entry in the simulated network queue.
+        std::vector<VoipPacket> queue;
+
+        // Sequence number assigned to the next encoded packet.
+        uint32_t nextSeq;
+        // Playback frame counter; the codec emits one decoded frame per
+        // call, so this advances by exactly 1 each processFrame().
+        int      playbackFrame;
+
+        // Current clamped network parameters (mirrors what
+        // ChannelProcessor::configure pushed in).
+        float cfgPacketLossRate;
+        float cfgNetworkDegradation;
+
+        // Deterministic LCG state used to derive per-packet arrival jitter.
+        uint32_t jitterLcg;
+
+        // Initial Playback-target lag: this many decoded frames must be
+        // queued before we start playing back. Includes a degradation-
+        // dependent extra so higher degradation => more buffering.
+        int basePlaybackDelay() const;
+        // Map the network parameters to Opus's PACKET_LOSS_PERC value.
+        int derivedPacketLossPercent() const;
+        // Apply encoder CTLs based on the current cfgPacketLossRate /
+        // cfgNetworkDegradation. Safe to call multiple times.
+        void applyNetworkCtls();
+        // Derive the arrival frame for a packet with `seq` using the LCG
+        // state. The state is advanced as a side effect so each call is
+        // deterministic given the seed.
+        int arrivalFrameFor(uint32_t seq);
+        // Drop any packet whose sequence is older than
+        // (nextSeq - kMaxQueueSize); used to keep the queue bounded.
+        void trimQueue();
+    };
+
+    // ---------------------------------------------------------------------------
+    // SpeexDSPAux (experimental, non-distribution)
+    //
+    // Lightweight helper around the BSD-licensed speex_preprocess / jitter
+    // buffer APIs. The point of this first step is to compile SpeexDSP into
+    // TelephonyDSP and prove the headers / link line; it does not change
+    // audio output yet. A follow-up step can:
+    //   - use speex_preprocess_run() to compute VAD probability and decide
+    //     when to emit DTX/SID frames for OPUS_VOIP / EVS_LIKE
+    //   - drive a SpeexJitter wrapper around OPUS_VOIP packets
+    //   - generate low-level comfort noise for SILENCE frames
+    //
+    // Exposed here so future iterations can plumb it into ChannelProcessor
+    // without re-dealing with CMake / include paths.
+    // ---------------------------------------------------------------------------
+    class SpeexDSPAux {
+    public:
+        SpeexDSPAux();
+        ~SpeexDSPAux();
+        void configure(int sampleRate, int frameSize);
+        void reset();
+        // Returns speex_preprocess_ctl(SPEEX_PREPROCESS_GET_PROB) - speech
+        // probability in [0,1] (SpeexDSP reports it as a percent in [0,100]
+        // and we rescale). Returns -1.0 when SpeexDSP is not compiled in or
+        // when no frame has been processed yet. Currently only meaningful
+        // if SPEEX_PREPROCESS_SET_VAD has been enabled in configure(); with
+        // VAD disabled, the underlying value is not populated and callers
+        // should treat the result as "unknown".
+        float getSpeechProbability() const;
+        // Returns true if the last run() call detected voice activity.
+        // Always returns false when SpeexDSP is not compiled in, when the
+        // helper is not configured, or while SPEEX_PREPROCESS_SET_VAD is
+        // disabled in configure().
+        bool lastFrameIsSpeech() const;
+        void runPreprocess(int16_t* frame); // in-place, no-op when disabled
+    private:
+ void* state; // SpeexPreprocessState* kept void* to avoid speex headers here
+ int sampleRate;
+ int frameSize;
+ bool configured;
+// Tracks whether SPEEX_PREPROCESS_SET_VAD is enabled on `state`.
+  // SpeexDSP's VAD is currently a placeholder that logs
+  // "The VAD has been replaced by a hack pending a complete rewrite"
+  // every time it is enabled, so we leave it off and expose it as a
+  // separate flag rather than a derived state. While this is false,
+  // getSpeechProbability() returns -1.0f ("unknown") and
+  // lastFrameIsSpeech() returns false, instead of a `0.0f / false`
+  // pair that would falsely imply "definitely not speech".
+ bool vadEnabled;
+ };
 
     class ChannelProcessor {
     public:
@@ -269,6 +429,12 @@ namespace TelephonyDSP {
         // We track both values so we can chunk process() calls safely.
         int downMaxInLen;
         int upMaxInLen;
+
+        // Experimental SpeexDSP-backed VAD/DTX helper. Configured lazily when
+        // a codec rate becomes available; reset() touches it but it does not
+        // influence the audio path yet. Only present when
+        // TELEPHONY_EXPERIMENTAL_NETWORK is enabled.
+        std::unique_ptr<SpeexDSPAux> speexAux;
 
         // Buffers
         std::vector<double> resampInBuf;

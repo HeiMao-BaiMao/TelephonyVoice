@@ -25,6 +25,9 @@ const char* getModeSuffix(TelephonyDSP::EraMode mode) {
         case TelephonyDSP::EraMode::EVS_LIKE: return "evs_like";
         case TelephonyDSP::EraMode::EVS_NATIVE: return "evs_native";
         case TelephonyDSP::EraMode::Bypass: return "bypass";
+#if TELEPHONY_EXPERIMENTAL_NETWORK
+        case TelephonyDSP::EraMode::OPUS_VOIP: return "opus_voip";
+#endif
         default: return "unknown";
     }
 }
@@ -164,7 +167,10 @@ int main(int argc, char* argv[]) {
 #endif
         TelephonyDSP::EraMode::EVS_LIKE,
 #ifndef TELEPHONY_DISTRIBUTION_BUILD
-        TelephonyDSP::EraMode::EVS_NATIVE  // validated integrated EVS path; see README
+        TelephonyDSP::EraMode::EVS_NATIVE,  // validated integrated EVS path; see README
+#endif
+#if TELEPHONY_EXPERIMENTAL_NETWORK && !defined(TELEPHONY_DISTRIBUTION_BUILD)
+        TelephonyDSP::EraMode::OPUS_VOIP    // experimental, BSD-licensed Opus (non-distribution)
 #endif
     };
     for (auto mode : modes) processFile(inputFile, mode);

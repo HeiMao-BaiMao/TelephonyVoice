@@ -62,6 +62,7 @@ Internally those user-facing endpoints map to codec-era modes:
 | `EVS_LIKE`               | 32 kHz      | *filter-only stand-in* | ❌ (safe to ship)                     |
 | `EVS_NATIVE`             | 8/16/32/48  | 3GPP EVS reference     | ✅ (3GPP TS 26.443 v12.7.0/v13.3.0)   |
 | `Bypass`                 | host        | –                      | –                                     |
+| `OPUS_VOIP` *(experimental)* | 48 kHz   | Opus (VOIP application, 24 kbps) | ✅ (opus, BSD) — non-distribution only |
 
 ## Current State of Work
 
@@ -200,7 +201,9 @@ Implemented path:
 │   ├── g711.cmake
 │   ├── libgsm.cmake
 │   ├── opencore-amr.cmake
+│   ├── opus.cmake         # add_subdirectory(external/opus) with programs/tests OFF
 │   ├── r8brain.cmake
+│   ├── speexdsp.cmake     # static lib from selected libspeexdsp sources
 │   └── vo-amrwbenc.cmake
 ├── evs_api.h              # public C API for the 3GPP EVS wrapper
 ├── evs_api.c              # float variant (working wrapper)
@@ -215,7 +218,9 @@ Implemented path:
     ├── G711_G72x/         # G.711/G.721/G.723
     ├── libgsm/            # GSM 06.10
     ├── opencore-amr/      # AMR-NB + AMR-WB decoder
+    ├── opus/              # Opus codec (BSD)
     ├── r8brain/           # sample-rate converter
+    ├── speexdsp/          # SpeexDSP (BSD, only preprocess/jitter/FFT subset built)
     ├── vo-amrwbenc/       # AMR-WB encoder
     └── vst3sdk/           # Steinberg VST3 SDK
 ```
@@ -226,6 +231,7 @@ Implemented path:
 | -------------------------- | ------- | ---------------------------------------------------------------------- |
 | `TELEPHONY_USE_EVS_FX`     | OFF     | Build fixed-point EVS (TS 26.442) instead of float (TS 26.443).         |
 | `TELEPHONY_DISTRIBUTION_BUILD` | OFF | Strip AMR/AMR-WB/EVS references and expose only distributable modes. |
+| `TELEPHONY_EXPERIMENTAL_NETWORK` | ON (forced OFF in distribution builds) | Build SpeexDSP + Opus and expose `OPUS_VOIP` mode (BSD-licensed). |
 
 ## License Note
 
@@ -240,6 +246,89 @@ The normal/personal build exposes `5G mobile (precise)` / `EVS Native` in the
 VST3 UI for testing. It must not be shipped. The distribution build keeps
 `EVS_NATIVE` aliased to `EVS_LIKE` and out of the runner's mode list, so
 the EVS reference is never linked or invoked in shipped builds.
+
+## Experimental / Non-GPL Additions
+
+This first experimental step adds two BSD-licensed libraries — SpeexDSP and
+Opus — to the personal / non-distribution build, behind a new CMake option
+`TELEPHONY_EXPERIMENTAL_NETWORK` (default ON, **always OFF** under
+`TELEPHONY_DISTRIBUTION_BUILD`).
+
+The goal is to start reproducing 2G / 3G / 4G / 5G voice behaviour more
+faithfully while staying clear of GPL / AGPL and the heavier 3GPP patent
+encumbrances. Full RAN stacks (e.g. srsRAN, OAI) are intentionally **not**
+included; we only use the BSD DSP / codec primitives that already ship in
+those projects.
+
+What is wired up in this step:
+
+* `cmake/speexdsp.cmake` builds a small static `speexdsp-core` library from
+  only the SpeexDSP preprocess / jitter / FFT sources we need
+  (`preprocess.c`, `jitter.c`, `buffer.c`, `fftwrap.c`, `filterbank.c`,
+  `kiss_fft.c`, `kiss_fftr.c`, `smallft.c`). The submodule is read-only —
+  no file under `external/speexdsp/` is modified. The SpeexDSP
+  autotools-generated `speexdsp_config_types.h` is replaced by a minimal
+  C99 stdint-based shim that the cmake module writes into the build tree.
+* `cmake/opus.cmake` pulls in `external/opus/CMakeLists.txt` via
+  `add_subdirectory()` with `OPUS_BUILD_TESTING=OFF`,
+  `OPUS_BUILD_PROGRAMS=OFF`, `OPUS_INSTALL_PKG_CONFIG_MODULE=OFF`,
+  `OPUS_INSTALL_CMAKE_CONFIG_MODULE=OFF`, and
+  `OPUS_BUILD_SHARED_LIBRARY=OFF` so we only link the static `opus`
+  library and do not build test programs / demos / docs.
+* New `EraMode::OPUS_VOIP` mode. Numeric values for existing modes stay
+  stable (the new mode is appended after `Bypass`). The CLI runner adds it
+  to its normal mode list with the suffix `opus_voip`. The distribution
+  runner does **not** include it.
+* `TelephonyDSP::OpusCodec` wraps the libopus C API. Defaults: 48 kHz,
+  20 ms frames, `OPUS_APPLICATION_VOIP`, 24 kbps target bitrate,
+  complexity 6. Frame loss is handled by calling `opus_decode(NULL, 0)`,
+  which lets Opus run its built-in PLC; the waveform concealer is only
+  the last-resort fallback. The codec now models a tiny packetized
+  transport on top of the bare encode/decode pair: in-band FEC is enabled
+  via `OPUS_SET_INBAND_FEC(1)`, expected loss via
+  `OPUS_SET_PACKET_LOSS_PERC(...)` driven by the clamped loss /
+  degradation values, and a deterministic LCG-based jitter buffer
+  simulates packet arrivals with a base + degradation-dependent delay.
+  Missing packets are concealed by in-band FEC (`decode_fec=1`) when the
+  next packet is available, otherwise by Opus's built-in PLC; DTX stays
+  off until a real VAD story lands.
+* `TelephonyDSP::SpeexDSPAux` wraps `speex_preprocess` so the denoise (and
+  in the future VAD / AGC) primitives can be reached from
+  `ChannelProcessor`. In this first step it is wired into `recreateCodec`
+  / `reset` so it compiles and links correctly but does **not** alter the
+  audio path yet. Only `SPEEX_PREPROCESS_SET_DENOISE` is enabled in
+  `configure()`; the explicit `SPEEX_PREPROCESS_SET_VAD` ctl is left
+  commented out because SpeexDSP's VAD is still a placeholder that prints
+  `The VAD has been replaced by a hack pending a complete rewrite` every
+  time it is enabled, and `SpeexDSPAux` is not yet driving audio behavior
+  so the noisy runner output serves no purpose. A follow-up pass can
+  drive DTX/CNG for `OPUS_VOIP` / `EVS_LIKE` based on the speech
+  probability it reports (re-enable the ctl at that point).
+
+VST3 UI: the `OPUS_VOIP` mode is intentionally **not** exposed as a new
+endpoint in this step, to avoid changing the existing route string list
+or the host-side state-streams. It is reachable through `TelephonyRunner`
+for now; adding an endpoint option is a small follow-up.
+
+Distribution build (`TELEPHONY_DISTRIBUTION_BUILD=ON`):
+
+* Forces `TELEPHONY_EXPERIMENTAL_NETWORK=OFF`.
+* Skips `cmake/speexdsp.cmake` and `cmake/opus.cmake` entirely.
+* `OpusCodec` / `SpeexDSPAux` fall back to no-op stubs compiled with the
+  rest of `TelephonyDSP`, so the symbol table of a shipped plugin never
+  references `opus_*` or `speex_*`.
+
+What is deliberately still **not** in scope:
+
+* Full 2G/3G/4G PHY / RAN stacks. Anything under
+  `osmo-*` / `srsRAN` / `OAI` is GPL or AGPL and would force the whole
+  project onto those licenses; we are not pulling those in.
+* SpeexDSP-backed PLC / DTX integration into the audio path. The
+  SpeexDSPAux class compiles and is configured (denoise on, VAD off for
+  now — see the SpeexDSPAux bullet above); a future iteration can
+  re-enable the VAD ctl and use its speech probability to drop frames for
+  `EVS_LIKE` / `OPUS_VOIP` and optionally fill with low-level comfort
+  noise.
 
 ## Open Questions for the Next Agent
 

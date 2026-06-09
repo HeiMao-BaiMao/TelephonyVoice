@@ -14,6 +14,14 @@ extern "C" {
 #include "dec_if.h" // AMR-WB (opencore-amrwb)
 #endif
 
+#if TELEPHONY_EXPERIMENTAL_NETWORK
+extern "C" {
+#include <opus.h>
+#include "speex/speex_preprocess.h"
+#include "speex/speex_jitter.h"
+}
+#endif
+
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
@@ -21,9 +29,14 @@ extern "C" {
 namespace TelephonyDSP {
 
 #ifdef TELEPHONY_DISTRIBUTION_BUILD
-    static EraMode distributionSafeMode(EraMode mode) {
-        return mode == EraMode::EVS_NATIVE ? EraMode::EVS_LIKE : mode;
-    }
+ static EraMode distributionSafeMode(EraMode mode) {
+ // Defense-in-depth: experimental codecs (EVS_NATIVE, OPUS_VOIP) are
+ // disabled in distribution builds, but their enum entries remain
+ // reachable. Map both to the safe EVS_LIKE profile.
+ return (mode == EraMode::EVS_NATIVE || mode == EraMode::OPUS_VOIP)
+ ? EraMode::EVS_LIKE
+ : mode;
+ }
 #else
     static EraMode distributionSafeMode(EraMode mode) {
         return mode;
@@ -323,7 +336,7 @@ namespace TelephonyDSP {
 #endif
     }
 
-    void EVSCodec::processFrame(const int16_t* in, int16_t* out, bool packetLost) {
+void EVSCodec::processFrame(const int16_t* in, int16_t* out, bool packetLost) {
         const int fs = getFrameSize();
         if (packetLost) {
 #ifndef TELEPHONY_DISTRIBUTION_BUILD
@@ -357,6 +370,391 @@ namespace TelephonyDSP {
         fallbackPLC.storeGoodFrame(out, fs);
 #endif
     }
+
+    // ---------------------------------------------------------------------------
+    // OpusCodec
+    // ---------------------------------------------------------------------------
+#if TELEPHONY_EXPERIMENTAL_NETWORK
+    OpusCodec::OpusCodec(int sr, int bitrate, int complexity)
+        : sampleRate(sr)
+        , bitrateBps(bitrate)
+        , frameSize(sr / 50) // 20 ms
+        , complexity(complexity)
+        , encoder(nullptr)
+        , decoder(nullptr)
+        , queue()
+        , nextSeq(0)
+        , playbackFrame(0)
+        , cfgPacketLossRate(0.0f)
+        , cfgNetworkDegradation(0.0f)
+        , jitterLcg(0x9E3779B9u)
+    {
+        // Opus bitstream budget: a generous worst case so 64 kbps modes still
+        // fit. 4000 bytes is well over the ~1500 byte RTP payload ceiling.
+        bitstream.resize(4000, 0);
+        fallbackPLC.reset(frameSize);
+        queue.reserve(kMaxQueueSize);
+
+        int err = 0;
+        OpusEncoder* enc = opus_encoder_create(sampleRate, 1, OPUS_APPLICATION_VOIP, &err);
+        if (err != OPUS_OK || !enc) {
+            encoder = nullptr;
+        } else {
+            opus_encoder_ctl(enc, OPUS_SET_BITRATE(bitrateBps));
+            opus_encoder_ctl(enc, OPUS_SET_COMPLEXITY(complexity));
+            // Default CTLs; configureNetwork() may override these.
+            // - FEC on so the decoder can recover from a single lost packet
+            //   via in-band FEC when the next packet arrives.
+            // - Packet loss percent starts at 0; configureNetwork() updates
+            //   it from the network parameters.
+            // - DTX is intentionally OFF: Opus's DTX is driven by its own
+            //   internal VAD, which doesn't match what SpeexDSPAux reports
+            //   (and SpeexDSPAux's VAD is currently disabled). A future
+            //   iteration that re-enables SpeexDSPAux VAD can drive DTX
+            //   from there.
+            opus_encoder_ctl(enc, OPUS_SET_INBAND_FEC(1));
+            opus_encoder_ctl(enc, OPUS_SET_PACKET_LOSS_PERC(0));
+            opus_encoder_ctl(enc, OPUS_SET_DTX(0));
+            encoder = enc;
+        }
+
+        OpusDecoder* dec = opus_decoder_create(sampleRate, 1, &err);
+        if (err != OPUS_OK || !dec) {
+            decoder = nullptr;
+        } else {
+            decoder = dec;
+        }
+    }
+
+    OpusCodec::~OpusCodec() {
+        if (encoder) opus_encoder_destroy(static_cast<OpusEncoder*>(encoder));
+        if (decoder) opus_decoder_destroy(static_cast<OpusDecoder*>(decoder));
+    }
+
+    void OpusCodec::reset() {
+        fallbackPLC.reset(frameSize);
+        // Flush the simulated transport state so a new "session" starts
+        // with an empty jitter buffer and aligned sequence numbers.
+        queue.clear();
+        nextSeq = 0;
+        playbackFrame = 0;
+        // Re-seed the LCG so the jitter pattern stays deterministic across
+        // reset() calls; this matters for repeatable tests.
+        jitterLcg = 0x9E3779B9u;
+        // The decoder has no OPUS_RESET_STATE; recreate it. The encoder has
+        // OPUS_RESET_STATE so we keep it and only flush its state.
+        if (encoder) {
+            opus_encoder_ctl(static_cast<OpusEncoder*>(encoder), OPUS_RESET_STATE);
+        }
+        if (decoder) {
+            opus_decoder_destroy(static_cast<OpusDecoder*>(decoder));
+            int err = 0;
+            decoder = opus_decoder_create(sampleRate, 1, &err);
+        }
+    }
+
+    int OpusCodec::basePlaybackDelay() const {
+        // 2 frames (40 ms) minimum, plus 0..4 frames extra driven by
+        // networkDegradation. Clamp so a heavily degraded path doesn't
+        // grow the buffer past the queue cap.
+        const int extra = (int)std::clamp(cfgNetworkDegradation * 4.0f, 0.0f, 4.0f);
+        return 2 + extra;
+    }
+
+    int OpusCodec::derivedPacketLossPercent() const {
+        // PACKET_LOSS_PERC takes an int in [0, 100]. Combine the user-supplied
+        // loss rate with a degradation-dependent boost so higher degradation
+        // also implies higher expected loss on the encoder side, mirroring
+        // what ChannelProcessor::shouldDropPacket() does on the caller side.
+        const float d = std::clamp(cfgNetworkDegradation, 0.0f, 1.0f);
+        const float combined = std::clamp(cfgPacketLossRate + d * d * 0.08f, 0.0f, 0.95f);
+        return (int)std::round(combined * 100.0f);
+    }
+
+    void OpusCodec::applyNetworkCtls() {
+        if (!encoder) return;
+        OpusEncoder* enc = static_cast<OpusEncoder*>(encoder);
+        opus_encoder_ctl(enc, OPUS_SET_INBAND_FEC(1));
+        opus_encoder_ctl(enc, OPUS_SET_PACKET_LOSS_PERC(derivedPacketLossPercent()));
+        // DTX stays off; see OpusCodec ctor comment.
+    }
+
+    int OpusCodec::arrivalFrameFor(uint32_t seq) {
+        // Linear congruential generator step (Numerical Recipes constants).
+        jitterLcg = jitterLcg * 1664525u + 1013904223u;
+        // Map the upper bits of the LCG state to a non-negative jitter
+        // offset in frames. degradation scales the magnitude so a clean
+        // network has jitter 0..1 and a heavily degraded one can drift
+        // several frames.
+        const float d = std::clamp(cfgNetworkDegradation, 0.0f, 1.0f);
+        const float maxJitter = 1.0f + d * 4.0f; // up to ~5 frames
+        const uint32_t r = (jitterLcg >> 8) & 0xFFFFu;
+        const float u = (float)r / 65535.0f;     // [0,1]
+        const int offset = (int)std::round(u * maxJitter);
+        // arrivalFrame is a non-negative playback-frame index. Each encoded
+        // packet is associated with the playback frame at which it should
+        // become available.
+        const int baseDelay = basePlaybackDelay();
+        return baseDelay + offset;
+    }
+
+    void OpusCodec::trimQueue() {
+        // Drop the oldest packets if we're at or above the cap. We compare
+        // against the highest sequence we've seen so a wraparound can't
+        // make stale packets look fresh.
+        if (queue.size() >= (size_t)kMaxQueueSize) {
+            // Sort by seq ascending then drop the head until under cap.
+            // Insertion order is already ascending (we only append), so the
+            // oldest packets live at the front.
+            size_t excess = queue.size() - (size_t)kMaxQueueSize + 1;
+            queue.erase(queue.begin(), queue.begin() + (std::ptrdiff_t)excess);
+        }
+    }
+
+    void OpusCodec::configureNetwork(float packetLossRate, float networkDegradation) {
+        cfgPacketLossRate = std::clamp(packetLossRate, 0.0f, 0.95f);
+        cfgNetworkDegradation = std::clamp(networkDegradation, 0.0f, 1.0f);
+        applyNetworkCtls();
+    }
+
+    void OpusCodec::processFrame(const int16_t* in, int16_t* out, bool packetLost) {
+        const int fs = frameSize;
+        OpusEncoder* enc = static_cast<OpusEncoder*>(encoder);
+        OpusDecoder* dec = static_cast<OpusDecoder*>(decoder);
+
+        // -----------------------------------------------------------------
+        // Stage 1: encode / drop on the send side of the simulated network.
+        // -----------------------------------------------------------------
+        // The caller already folds ChannelProcessor::shouldDropPacket() into
+        // `packetLost`, so we honor it here: if the caller says this frame's
+        // packet should not enter the transport, we skip encoding and the
+        // packet will simply never arrive at the receiver.
+        if (packetLost) {
+            // Reserve the sequence number anyway so the receiver-side target
+            // advances in lockstep with the encoder, which keeps the
+            // simulated jitter-buffer math deterministic.
+            (void)nextSeq++;
+        } else if (enc) {
+            int nbBytes = opus_encode(enc, in, fs, bitstream.data(), (opus_int32)bitstream.size());
+            if (nbBytes > 0) {
+                VoipPacket p;
+                p.seq = nextSeq++;
+                // arrivalFrame is computed against the packet's intended
+                // playback index (which equals p.seq for a steady, 1-in
+                // 1-out transport).
+                p.arrivalFrame = (int)(p.seq + basePlaybackDelay());
+                // Add a small deterministic jitter offset using the LCG.
+                // Subtract basePlaybackDelay here so the caller-visible
+                // arrivalFrame stays in terms of playbackFrame index.
+                int jitter = arrivalFrameFor(p.seq);
+                p.arrivalFrame = (int)p.seq + jitter;
+                p.data.assign(bitstream.begin(), bitstream.begin() + nbBytes);
+                queue.push_back(std::move(p));
+                trimQueue();
+            } else {
+                // Encode failure - reserve the seq number so timing stays in
+                // sync but don't put anything in the queue.
+                (void)nextSeq++;
+            }
+        } else {
+            // No encoder available; advance the seq counter so the receiver
+            // side keeps moving even in degenerate paths.
+            (void)nextSeq++;
+        }
+
+        // -----------------------------------------------------------------
+        // Stage 2: receive / decode on the playback side of the simulated
+        // network. We always emit exactly one output frame so the
+        // surrounding ChannelProcessor / ring-buffer contract stays the
+        // same; missing packets are concealed by Opus's PLC / FEC / our
+        // fallback concealer in that order.
+        // -----------------------------------------------------------------
+        const int targetFrame = playbackFrame;
+        bool decoded = false;
+
+        if (dec) {
+            // Walk the queue (it is sorted ascending by seq / arrival) and
+            // try, in order: exact match -> FEC of next available packet
+            // -> PLC if nothing else.
+            //
+            // Find the first packet whose arrivalFrame <= targetFrame.
+            // (queue is sorted by insertion order which matches arrivalFrame
+            // order because arrivalFrame grows with seq and jitter; in the
+            // rare case of jitter collapse the earliest-arrival packet
+            // wins.)
+            size_t idx = 0;
+            for (; idx < queue.size(); ++idx) {
+                if (queue[idx].arrivalFrame <= targetFrame) break;
+            }
+
+            if (idx < queue.size()) {
+                // The packet for this playback frame has arrived.
+                int n = opus_decode(dec, queue[idx].data.data(),
+                                    (opus_int32)queue[idx].data.size(),
+                                    out, fs, 0);
+                if (n == fs) {
+                    decoded = true;
+                }
+                // Drop the consumed packet. In the jitter-collapse case
+                // there could be additional packets with arrivalFrame <=
+                // targetFrame still in the queue; those represent future
+                // playback frames that arrived early. We leave them in
+                // place - they will be picked up at their target playback
+                // frame. The queue cap (kMaxQueueSize) keeps growth in
+                // check even if collapse happens repeatedly.
+                queue.erase(queue.begin() + (std::ptrdiff_t)idx);
+            } else if (!queue.empty()) {
+                // Target packet is missing but the next one is in flight;
+                // try in-band FEC recovery using decode_fec=1. The "next"
+                // packet is the one with the smallest seq, which is
+                // queue.front() because we insert in seq order.
+                int n = opus_decode(dec, queue.front().data.data(),
+                                    (opus_int32)queue.front().data.size(),
+                                    out, fs, 1);
+                if (n == fs) {
+                    decoded = true;
+                }
+                // Whether or not FEC succeeded, drop the consumed packet
+                // so the queue doesn't grow forever.
+                queue.erase(queue.begin());
+            }
+
+            if (!decoded) {
+                // Pure PLC: Opus's built-in concealment for missing frames.
+                int n = opus_decode(dec, nullptr, 0, out, fs, 0);
+                if (n == fs) {
+                    decoded = true;
+                }
+            }
+        }
+
+        if (!decoded) {
+            if (packetLost && !enc && !dec) {
+                // Encoder and decoder missing - pass-through path.
+                std::memcpy(out, in, fs * sizeof(int16_t));
+            } else {
+                // Last-resort concealer.
+                fallbackPLC.conceal(out, fs);
+            }
+        } else {
+            // Good output - feed the concealer so it has recent history
+            // if subsequent frames are lost.
+            fallbackPLC.storeGoodFrame(out, fs);
+        }
+
+        // Advance playback bookkeeping.
+        ++playbackFrame;
+    }
+#else
+    // Stub implementations keep TelephonyDSP compilable when the experimental
+    // libraries are disabled (e.g. distribution build). OpusCodec instances
+    // should never be created in that path; this is a defensive no-op.
+    OpusCodec::OpusCodec(int, int, int) : sampleRate(0), bitrateBps(0), frameSize(0), complexity(0), encoder(nullptr), decoder(nullptr) {
+        fallbackPLC.reset(0);
+    }
+    OpusCodec::~OpusCodec() {}
+    void OpusCodec::reset() { fallbackPLC.reset(frameSize); }
+    void OpusCodec::configureNetwork(float, float) {}
+    void OpusCodec::processFrame(const int16_t* in, int16_t* out, bool) {
+        const int fs = frameSize;
+        std::memcpy(out, in, fs * sizeof(int16_t));
+    }
+#endif
+
+    // ---------------------------------------------------------------------------
+    // SpeexDSPAux
+    // ---------------------------------------------------------------------------
+#if TELEPHONY_EXPERIMENTAL_NETWORK
+    SpeexDSPAux::SpeexDSPAux()
+ : state(nullptr), sampleRate(0), frameSize(0), configured(false), vadEnabled(false) {}
+
+ SpeexDSPAux::~SpeexDSPAux() {
+ if (state) speex_preprocess_state_destroy(static_cast<SpeexPreprocessState*>(state));
+ state = nullptr;
+ }
+
+ void SpeexDSPAux::configure(int sr, int fs) {
+ sampleRate = sr;
+ frameSize = fs;
+ if (state) {
+ speex_preprocess_state_destroy(static_cast<SpeexPreprocessState*>(state));
+ state = nullptr;
+ }
+ SpeexPreprocessState* s = speex_preprocess_state_init(frameSize, sampleRate);
+ if (!s) {
+ configured = false;
+ vadEnabled = false;
+ return;
+ }
+ int denoise =1;
+ speex_preprocess_ctl(s, SPEEX_PREPROCESS_SET_DENOISE, &denoise);
+ // AGC intentionally disabled: SPEEX_PREPROCESS_SET_AGC_LEVEL takes a
+ // float (not an int level). Conservative behavior keeps denoise only;
+ // callers can opt-in to AGC later via a float-based API.
+ //
+ // VAD intentionally disabled: SpeexDSP's VAD is a placeholder
+ // ("warning: The VAD has been replaced by a hack pending a complete
+ // rewrite") and SpeexDSPAux is currently a foundation/placeholder
+ // that does not drive audio behavior. Re-enable here (and plumb the
+ // probability into the audio path) once a proper VAD story lands.
+ // When re-enabling, flip vadEnabled = true here as well so
+ // getSpeechProbability() / lastFrameIsSpeech() start returning
+ // Speex-reported values instead of the "unknown" sentinel.
+ // speex_preprocess_ctl(s, SPEEX_PREPROCESS_SET_VAD, &vad);
+ vadEnabled = false;
+ state = s;
+ configured = true;
+ }
+
+ void SpeexDSPAux::reset() {
+ if (!state || !configured) return;
+ if (sampleRate >0 && frameSize >0) {
+ // SPEEX_PREPROCESS_RESET_STATE doesn't exist in this SpeexDSP
+ // build; recreate the state to flush internal buffers.
+ configure(sampleRate, frameSize);
+ }
+ }
+
+ float SpeexDSPAux::getSpeechProbability() const {
+ if (!state || !configured) return -1.0f;
+ // VAD is disabled by design (see configure()): SPEEX_PREPROCESS_GET_PROB
+ // would return whatever the underlying placeholder leaves behind
+ // (often 0 or stale), which is not a meaningful speech probability.
+ // Return the "-1 = unknown" sentinel so callers can distinguish
+ // "no signal" from "definitely not speech".
+ if (!vadEnabled) return -1.0f;
+ // SPEEX_PREPROCESS_GET_PROB returns speech probability as spx_int32_t
+ // (percent, [0,100]). SPEEX_PREPROCESS_GET_PSD is the power spectrum,
+ // not speech probability, so it can't be returned as a probability.
+ spx_int32_t prob = -1;
+ speex_preprocess_ctl(static_cast<SpeexPreprocessState*>(state), SPEEX_PREPROCESS_GET_PROB, &prob);
+ if (prob <0) return -1.0f;
+ return static_cast<float>(prob) /100.0f;
+ }
+
+ bool SpeexDSPAux::lastFrameIsSpeech() const {
+ if (!state || !configured) return false;
+ // VAD is disabled by design (see configure()); treat the result as
+ // "unknown" rather than reporting a false negative.
+ if (!vadEnabled) return false;
+ int vad =0;
+ speex_preprocess_ctl(static_cast<SpeexPreprocessState*>(state), SPEEX_PREPROCESS_GET_VAD, &vad);
+ return vad !=0;
+ }
+
+ void SpeexDSPAux::runPreprocess(int16_t* frame) {
+ if (!state || !configured || !frame) return;
+ speex_preprocess_run(static_cast<SpeexPreprocessState*>(state), (spx_int16_t*)frame);
+ }
+#else
+ SpeexDSPAux::SpeexDSPAux() : state(nullptr), sampleRate(0), frameSize(0), configured(false), vadEnabled(false) {}
+ SpeexDSPAux::~SpeexDSPAux() {}
+ void SpeexDSPAux::configure(int, int) { configured = false; vadEnabled = false; }
+ void SpeexDSPAux::reset() {}
+ float SpeexDSPAux::getSpeechProbability() const { return -1.0f; }
+ bool SpeexDSPAux::lastFrameIsSpeech() const { return false; }
+ void SpeexDSPAux::runPreprocess(int16_t*) {}
+#endif
 
     ChannelProcessor::ChannelProcessor(double hostSR)
         : hostSampleRate(hostSR), currentMode(EraMode::Bypass),
@@ -410,7 +808,7 @@ namespace TelephonyDSP {
         }
     }
 
-    void ChannelProcessor::configure(bool artifacts, float amount, float packetLossRate, float networkDegradation) {
+void ChannelProcessor::configure(bool artifacts, float amount, float packetLossRate, float networkDegradation) {
         const float clampedLoss = std::clamp(packetLossRate, 0.0f, 0.95f);
         const float clampedDegradation = std::clamp(networkDegradation, 0.0f, 1.0f);
         const bool networkChanged = std::fabs(paramNetworkDegradation - clampedDegradation) > 0.0001f;
@@ -421,17 +819,27 @@ namespace TelephonyDSP {
         if (networkChanged) {
             updateFilters();
         }
+        // Push the clamped values into the codec if one is currently
+        // attached. Codecs that don't model a network (the default ICodec
+        // base) treat this as a no-op; OpusCodec uses it to drive its
+        // encoder CTLs and internal jitter-buffer state.
+        if (codec) {
+            codec->configureNetwork(clampedLoss, clampedDegradation);
+        }
     }
 
-    void ChannelProcessor::reset() {
+void ChannelProcessor::reset() {
         ringCodecIn.reset(); ringCodecOut.reset(); outputBuffer.reset();
-        hpFilter1.reset(); hpFilter2.reset(); 
+        hpFilter1.reset(); hpFilter2.reset();
         lpFilter1.reset(); lpFilter2.reset();
         packetLossBurstFrames = 0;
         simulatedPathPLC.reset(640);
         if (resamplerDown) resamplerDown->clear();
         if (resamplerUp) resamplerUp->clear();
         if (codec) codec->reset();
+#if TELEPHONY_EXPERIMENTAL_NETWORK
+        if (speexAux) speexAux->reset();
+#endif
         updateFilters();
     }
 
@@ -469,6 +877,9 @@ namespace TelephonyDSP {
             case EraMode::AMR_WB_VOLTE: targetSR = 16000; break;
             case EraMode::EVS_LIKE: targetSR = 32000; break;
             case EraMode::EVS_NATIVE: targetSR = evsSampleRate; break;
+#if TELEPHONY_EXPERIMENTAL_NETWORK
+            case EraMode::OPUS_VOIP: targetSR = 48000; break;
+#endif
             default: targetSR = 0; break;
         }
 
@@ -537,7 +948,7 @@ namespace TelephonyDSP {
                 degradedFloorHz = 4000.0f;
                 applyBand();
                 break;
-            case EraMode::EVS_NATIVE:
+case EraMode::EVS_NATIVE:
                 if (paramNetworkDegradation <= 0.001f) {
                     // The real EVS already shapes its own bandwidth; skip the
                     // extra cascade unless the radio/path simulation asks for it.
@@ -558,6 +969,22 @@ namespace TelephonyDSP {
                     applyBand();
                 }
                 break;
+#if TELEPHONY_EXPERIMENTAL_NETWORK
+            case EraMode::OPUS_VOIP:
+                if (paramNetworkDegradation <= 0.001f) {
+                    // Opus already shapes its own bandwidth (up to 20 kHz FB);
+                    // skip the extra cascade unless the path simulation asks.
+                    hpFilter1.reset();
+                    lpFilter1.reset();
+                } else {
+                    sampleRate = 48000.0f;
+                    highpassHz = 50.0f;
+                    lowpassHz = 18000.0f;
+                    degradedFloorHz = 3400.0f;
+                    applyBand();
+                }
+                break;
+#endif
             default:
                 hpFilter1.reset();
                 lpFilter1.reset();
@@ -593,7 +1020,7 @@ namespace TelephonyDSP {
         return true;
     }
 
-    void ChannelProcessor::recreateCodec() {
+void ChannelProcessor::recreateCodec() {
         codec.reset();
         switch (currentMode) {
             case EraMode::PSTN_G711: codec = std::make_unique<G711Codec>(8000); break;
@@ -609,12 +1036,30 @@ namespace TelephonyDSP {
             case EraMode::EVS_NATIVE:
                 codec = std::make_unique<EVSCodec>(evsSampleRate, evsBitrateBps, evsMaxBandwidth);
                 break;
+#if TELEPHONY_EXPERIMENTAL_NETWORK
+            case EraMode::OPUS_VOIP:
+                // 48 kHz, 24 kbps, complexity 6 (moderate). See OpusCodec.
+                codec = std::make_unique<OpusCodec>(48000, 24000, 6);
+                break;
+#endif
             default: break;
         }
         if (codec) {
             int fs = codec->getFrameSize();
+            int sr = codec->getSampleRate();
             codecFrameF.resize(fs); codecFrameSIn.resize(fs); codecFrameSOut.resize(fs);
             simulatedPathPLC.reset(fs);
+            // Push the current clamped network parameters into the freshly
+            // created codec so its first packet already reflects the
+            // caller's loss/degradation settings rather than defaults.
+            codec->configureNetwork(paramPacketLossRate, paramNetworkDegradation);
+#if TELEPHONY_EXPERIMENTAL_NETWORK
+            // Bring the experimental SpeexDSP helper online with the same
+            // rate/frame as the codec. It does not change audio output yet
+            // (see SpeexDSPAux header comment for the follow-up plan).
+            if (!speexAux) speexAux = std::make_unique<SpeexDSPAux>();
+            speexAux->configure(sr, fs);
+#endif
         }
     }
 
