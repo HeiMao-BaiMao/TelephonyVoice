@@ -222,16 +222,29 @@ namespace TelephonyDSP {
     }
 
 #ifndef TELEPHONY_DISTRIBUTION_BUILD
-    AMRNBCodec::AMRNBCodec() : lastSerial(32, 0) {
-        encState = Encoder_Interface_init(0);
+    AMRNBCodec::AMRNBCodec(bool dtxEnabled) : dtxEnabled(dtxEnabled), lastSerial(32, 0) {
+        encState = Encoder_Interface_init(dtxEnabled ? 1 : 0);
         decState = Decoder_Interface_init();
         fallbackPLC.reset(getFrameSize());
     }
     AMRNBCodec::~AMRNBCodec() { Encoder_Interface_exit(encState); Decoder_Interface_exit(decState); }
+    void AMRNBCodec::setDtxEnabled(bool enable) {
+        if (dtxEnabled == enable) return;
+        // Allocate the replacement encoder first so we don't drop the
+        // existing state if init fails; on failure we keep both the old
+        // encoder and the previous dtxEnabled value.
+        void* newEnc = Encoder_Interface_init(enable ? 1 : 0);
+        if (!newEnc) return;
+        Encoder_Interface_exit(encState);
+        encState = newEnc;
+        dtxEnabled = enable;
+        std::fill(lastSerial.begin(), lastSerial.end(), 0);
+        fallbackPLC.reset(getFrameSize());
+    }
     void AMRNBCodec::reset() {
         Encoder_Interface_exit(encState);
         Decoder_Interface_exit(decState);
-        encState = Encoder_Interface_init(0);
+        encState = Encoder_Interface_init(dtxEnabled ? 1 : 0);
         decState = Decoder_Interface_init();
         std::fill(lastSerial.begin(), lastSerial.end(), 0);
         fallbackPLC.reset(getFrameSize());
@@ -248,13 +261,22 @@ namespace TelephonyDSP {
         fallbackPLC.storeGoodFrame(out, getFrameSize());
     }
 
-    AMRWBCodec::AMRWBCodec() : lastSerial(64, 0) {
+    AMRWBCodec::AMRWBCodec(bool dtxEnabled) : dtxEnabled(dtxEnabled), lastSerial(64, 0) {
         encState = E_IF_init();
         decState = D_IF_init();
         fallbackPLC.reset(getFrameSize());
     }
     AMRWBCodec::~AMRWBCodec() { E_IF_exit(encState); D_IF_exit(decState); }
+    void AMRWBCodec::setDtxEnabled(bool enable) {
+        // AMR-WB's E_IF_init() does not take a DTX flag; the DTX setting
+        // is the last (5th) argument of E_IF_encode(). We just remember
+        // the new flag here; the next processFrame() picks it up.
+        dtxEnabled = enable;
+    }
     void AMRWBCodec::reset() {
+        // dtxEnabled is preserved: AMR-WB DTX is supplied per E_IF_encode
+        // call, not during E_IF_init, so resetting the encoder state does
+        // not require re-asking the caller for the DTX preference.
         E_IF_exit(encState);
         D_IF_exit(decState);
         encState = E_IF_init();
@@ -269,15 +291,19 @@ namespace TelephonyDSP {
             return;
         }
 
-        E_IF_encode(encState, 2, in, lastSerial.data(), 0); // Mode 2: 12.65 kbit/s
+        E_IF_encode(encState, 2, in, lastSerial.data(), dtxEnabled ? 1 : 0); // Mode 2: 12.65 kbit/s
         D_IF_decode(decState, lastSerial.data(), out, 0);
         fallbackPLC.storeGoodFrame(out, getFrameSize());
     }
 #else
-    AMRNBCodec::AMRNBCodec() : encState(nullptr), decState(nullptr), lastSerial(32, 0) {
+    AMRNBCodec::AMRNBCodec(bool dtxEnabled) : encState(nullptr), decState(nullptr), dtxEnabled(dtxEnabled), lastSerial(32, 0) {
+        // Distribution stub: no external API calls. dtxEnabled is kept
+        // only to keep the constructor signature identical to the
+        // non-distribution build, and isDtxEnabled() reports it back.
         fallbackPLC.reset(getFrameSize());
     }
     AMRNBCodec::~AMRNBCodec() {}
+    void AMRNBCodec::setDtxEnabled(bool enable) { dtxEnabled = enable; }
     void AMRNBCodec::reset() { fallbackPLC.reset(getFrameSize()); }
     void AMRNBCodec::processFrame(const int16_t* in, int16_t* out, bool packetLost) {
         if (packetLost) {
@@ -288,10 +314,14 @@ namespace TelephonyDSP {
         fallbackPLC.storeGoodFrame(out, getFrameSize());
     }
 
-    AMRWBCodec::AMRWBCodec() : encState(nullptr), decState(nullptr), lastSerial(64, 0) {
+    AMRWBCodec::AMRWBCodec(bool dtxEnabled) : encState(nullptr), decState(nullptr), dtxEnabled(dtxEnabled), lastSerial(64, 0) {
+        // Distribution stub: no external API calls. dtxEnabled is kept
+        // only to keep the constructor signature identical to the
+        // non-distribution build, and isDtxEnabled() reports it back.
         fallbackPLC.reset(getFrameSize());
     }
     AMRWBCodec::~AMRWBCodec() {}
+    void AMRWBCodec::setDtxEnabled(bool enable) { dtxEnabled = enable; }
     void AMRWBCodec::reset() { fallbackPLC.reset(getFrameSize()); }
     void AMRWBCodec::processFrame(const int16_t* in, int16_t* out, bool packetLost) {
         if (packetLost) {

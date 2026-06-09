@@ -109,6 +109,18 @@ Internally those user-facing endpoints map to codec-era modes:
   AMR/AMR-WB/EVS reference libraries are not included or linked, the UI only
   exposes fixed line / 2G / 5G stand-in, and direct `EVS_NATIVE` requests are
   aliased to `EVS_LIKE`.
+* AMR-NB and AMR-WB encoders now enable their bundled 3GPP DTX/CNG path by
+  default in normal / personal builds. `AMRNBCodec` initializes
+  `Encoder_Interface_init(dtxEnabled ? 1 : 0)` (default `dtxEnabled = true`)
+  and `AMRWBCodec` passes `dtxEnabled ? 1 : 0` as the final `E_IF_encode`
+  argument (the AMR-WB init API does not take DTX). When DTX is enabled,
+  the encoded AMR frame payload size becomes SID/data-dependent inside the
+  3GPP reference encoder (it no longer matches a fixed per-mode byte count).
+  Both classes expose `setDtxEnabled(bool)` / `isDtxEnabled()` for callers
+  that need to override the default; the `EVS_NATIVE` DTX behaviour added
+  in the previous bullet is unchanged. The distribution build keeps its
+  pass-through AMR stubs with identical constructor signatures and does
+  not invoke any external encoder API, so it is unaffected.
 
 ### EVS Native Integration Status
 
