@@ -84,9 +84,17 @@ Internally those user-facing endpoints map to codec-era modes:
 * `TelephonyDSP` extended with an `EVS_NATIVE` mode, `EVSCodec` class
   wrapping the C API, EVS configuration plumbing on `ChannelProcessor` and
   `SignalProcessor`.  Default config: SWB 32 kHz / 13.2 kbps.
-* `TelephonyRunner` was wired up to call `setEVSConfig` for `EVS_NATIVE`.
-  After discovering the hang (below) the iteration was commented out so the
-  CLI ships in a usable state.
+* `TelephonyRunner` calls `setEVSConfig` for `EVS_NATIVE` and processes it
+  alongside the other era modes (personal/normal build). The integration
+  crash traced to two issues, both now resolved: EVS `wb_vad` symbol
+  collision with `vo-amrwbenc` (fixed at the parent-repo level by passing
+  `wb_vad=evs_wb_vad` / `wb_vad_init=evs_wb_vad_init` as compile
+  definitions to the EVS lib targets in `cmake/3gpp-evs.cmake` so the EVS
+  sources compile as if those symbols were renamed, without editing the
+  submodule) and r8brain `CDSPResampler24` `aMaxInLen=1024` overflow when
+  EVS-like/native 640-sample frames accumulated to >1024 samples (fixed
+  by chunking resampler calls). Distribution build still aliases
+  `EVS_NATIVE` to `EVS_LIKE` and omits it from the runner's mode list.
 * VST3 route selection now exposes `in`, `out`, and
   `degraded segment: in -> exchange -> out`. Normal/personal builds expose
   fixed line, 2G, 3G, 4G, 5G, and 5G precise/native. Distribution builds expose
@@ -101,68 +109,42 @@ Internally those user-facing endpoints map to codec-era modes:
   exposes fixed line / 2G / 5G stand-in, and direct `EVS_NATIVE` requests are
   aliased to `EVS_LIKE`.
 
-### Not Working Yet (Handoff)
+### EVS Native Integration Status
 
-**`EVS_NATIVE` hangs in `init_encoder` when called from `TelephonyRunner`
-with default config (32 kHz / 13.2 kbps / SWB).**  The same configuration
-works in the standalone test (`test_evs_direct.cpp`, since deleted) and
-the issue is therefore in the `SignalProcessor` / `ChannelProcessor`
-integration, not in the EVS library itself.
+**Status: the `EVS_NATIVE` integration crash that previously blocked the
+runner is resolved.** The standalone EVS API (`evs_api.c` over the
+`init_encoder` / `evs_enc` / `init_decoder` / `evs_dec` quartet) was
+working throughout; the `SignalProcessor` / `TelephonyRunner`
+integration was crashing because of two upstream issues that have both
+been fixed in this tree:
 
-What is known:
+1. **EVS `wb_vad` symbol collision with `vo-amrwbenc`.** Both libraries
+   export a `wb_vad` symbol; under `INTERFACE /FORCE:MULTIPLE` (MSVC) one
+   wins at link time and the other runs with the wrong implementation,
+   which corrupts encoder state. Resolved at the parent-repo level by
+   passing `wb_vad=evs_wb_vad` and `wb_vad_init=evs_wb_vad_init` as
+   `target_compile_definitions` to `evs-lib-com` / `evs-lib-enc` /
+   `evs-lib-dec` in `cmake/3gpp-evs.cmake`. The C preprocessor rewrites
+   the identifiers in the EVS headers, sources, and call sites so the
+   binary exposes `evs_wb_vad*` and `vo-amrwbenc` keeps its own
+   `wb_vad*`. The submodule is not modified.
+2. **r8brain `CDSPResampler24` `aMaxInLen=1024` overflow.** EVS-like and
+   EVS-native paths emit 640-sample frames; accumulating more than 1024
+   samples before a resampler call exceeded the resampler's per-call
+   input cap. Resolved by chunking resampler calls so each call stays
+   within the supported input length.
 
-* `evs_enc_create(32000, 13200, EVS_SWB)` returns a non-null encoder
-  successfully.
-* `evs_enc_process(...)` works on the standalone test (one frame at a
-  time, sine-wave input).
-* The runner output shows `recreateCodec` reaching
-  `creating EVSCodec sr=32000 br=13200` and then hanging in
-  `EVSCodec(...)` → `evs_enc_create` (or possibly `evs_dec_create`) on
-  the *first* `ensureChannels` call.  No exception, no crash, just a
-  silent hang.
-* The same configuration worked in the standalone test, so the
-  difference is environmental (state already in the ChannelProcessor /
-  SignalProcessor before the EVS codec is constructed) – not in the EVS
-  API call itself.
+**Current state:**
 
-Suspected root causes to investigate (in order):
-
-1. **Stack / heap corruption from earlier codecs.**  The runner's main
-   loop instantiates the EVS codec *after* processing G.711/GSM/AMR in
-   the same process.  Some of those libraries use large static buffers
-   or globals that the EVS init may be reading or aliasing.  Try
-   building a runner that processes *only* `EVS_NATIVE`.
-
-2. **`init_encoder` for SWB+13.2 k expects extra state.**  Looking at
-   `lib_enc/io_enc.c` lines 484–545, the CLI conditionally sets
-   `Opt_RF_ON`, `Opt_SC_VBR`, resets `rf_fec_indicator`, and may flip
-   `codec_mode` based on `total_brate` and `input_Fs`.  The current
-   wrapper only sets `Opt_RF_ON=0` and a hard-coded `MODE1`.  Some
-   paths inside `init_encoder` may branch on those flags.  Compare
-   `io_enc.c`'s full post-parse state against the wrapper's state and
-   pad the missing fields (especially `Opt_DTX_ON`, `Opt_RF_ON`,
-   `Opt_SC_VBR`, `var_SID_rate_flag`, `interval_SID`, `rf_fec_indicator`,
-   `codec_mode`, `last_codec_mode`).
-
-3. **`codec_mode` mismatch causes an infinite loop in encoder logic.**
-   13.2 kbps in MODE1 is the ACELP@13.2 case; in MODE2 it would route
-   to a different code path.  Try forcing `MODE2` (the wrapper used
-   to do this; switched to `MODE1` for testing – reverting to
-   `MODE2` did not help but did not get full coverage).
-
-4. **MSVC /O2 vs /O0 build mismatch.**  The EVS static libs are
-   compiled with `/O2` (required by `vo-amrwbenc` and now also applied
-   to `evs-lib-*`).  The wrapper sits inside `TelephonyDSP` which links
-   those libs but is itself compiled at the global project flags.  A
-   mixed-ABI issue between `/O2` (lib) and `/O2` (DSP) is unlikely
-   but worth ruling out with `/O0` for the libs as a sanity check.
-
-5. **r8brain resampler state on first call.**  The `CDSPResampler24`
-   ctor is invoked with `(48000, 32000, 1024)`.  If the ratio
-   calculation misbehaves it could request an out-of-range internal
-   buffer, but that would crash rather than hang.  More likely a
-   silent failure inside r8brain.  Try with a different input sample
-   rate (e.g. force 32 kHz host rate in the runner) to confirm.
+* The normal/personal build's `TelephonyRunner` now includes
+  `EVS_NATIVE` in its mode list and produces an `evs_native` output WAV
+  end-to-end.
+* The distribution build (`TELEPHONY_DISTRIBUTION_BUILD=ON`) still
+  aliases `EVS_NATIVE` to `EVS_LIKE` and omits it from the runner's
+  mode list, so the EVS reference is never linked or invoked in shipped
+  builds.
+* Fixed-point EVS (`TELEPHONY_USE_EVS_FX`) remains unimplemented and
+  untested; see `### CMake Build Option (Untested Path)` below.
 
 ### CMake Build Option (Untested Path)
 
@@ -221,7 +203,7 @@ Implemented path:
 │   ├── r8brain.cmake
 │   └── vo-amrwbenc.cmake
 ├── evs_api.h              # public C API for the 3GPP EVS wrapper
-├── evs_api.c              # float variant (working wrapper, see issue above)
+├── evs_api.c              # float variant (working wrapper)
 ├── evs_api_fx.c           # fixed-point variant stub
 ├── TelephonyDSP.h         # public C++ API of the route-aware SignalProcessor
 ├── TelephonyDSP.cpp       # two-leg path, codec emulations, PLC, resampler/filter chain
@@ -255,25 +237,20 @@ Ericsson, Nokia, etc.) apply to commercial distribution.  Use
 implementations.
 
 The normal/personal build exposes `5G mobile (precise)` / `EVS Native` in the
-VST3 UI for testing. It must not be shipped. `TelephonyRunner` still leaves
-`EVS_NATIVE` out of its automatic mode list because of the integration hang
-above.
+VST3 UI for testing. It must not be shipped. The distribution build keeps
+`EVS_NATIVE` aliased to `EVS_LIKE` and out of the runner's mode list, so
+the EVS reference is never linked or invoked in shipped builds.
 
 ## Open Questions for the Next Agent
 
-1. Why does `init_encoder` for `EVS_NATIVE` (32 kHz / 13.2 kbps / SWB)
-   hang in the integration test but not in the standalone test?  Likely
-   state-aliasing with the other codec libraries linked into the same
-   binary – reproduce with a runner that processes only `EVS_NATIVE`
-   to confirm.
-2. Finish fixed-point EVS and make `EVS_NATIVE` default to it. This requires
+1. Finish fixed-point EVS and make `EVS_NATIVE` default to it. This requires
    fixing the current FX header collision (`cnst_fx.h` plus float `cnst.h`) and
    replacing the `evs_api_fx.c` stub with a real wrapper.
-3. Should the `EVS_LIKE` mode be promoted to a proper `EVS_DIST`
+2. Should the `EVS_LIKE` mode be promoted to a proper `EVS_DIST`
    filter-only class for the distribution build, or stay as a single
    mode in `SignalProcessor`?
-4. Should a dedicated VSTGUI editor be added for a visual route diagram? The
+3. Should a dedicated VSTGUI editor be added for a visual route diagram? The
    current implementation exposes `in`, `out`, and `degraded segment` through
    the host's generic VST parameter UI.
-5. Are there other 3GPP EVS mirrors worth considering if the lem21h
+4. Are there other 3GPP EVS mirrors worth considering if the lem21h
    one stays unmaintained?  (AOSP branches, etc.)

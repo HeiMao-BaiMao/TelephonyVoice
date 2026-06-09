@@ -363,7 +363,8 @@ namespace TelephonyDSP {
           paramArtifactsEnabled(false), paramArtifactAmount(0.0f),
           paramPacketLossRate(0.0f), paramNetworkDegradation(0.0f),
           packetLossSeed(0x12345678u), packetLossBurstFrames(0),
-          evsSampleRate(32000), evsBitrateBps(EVS_BR_13200), evsMaxBandwidth(EVS_SWB)
+          evsSampleRate(32000), evsBitrateBps(EVS_BR_13200), evsMaxBandwidth(EVS_SWB),
+          downMaxInLen(0), upMaxInLen(0)
     {
         size_t bigSize = 131072;
         ringCodecIn.resize(bigSize);
@@ -458,6 +459,8 @@ namespace TelephonyDSP {
 
     void ChannelProcessor::recreateResamplers() {
         resamplerDown.reset(); resamplerUp.reset();
+        downMaxInLen = 0;
+        upMaxInLen = 0;
         int targetSR = 0;
         switch (currentMode) {
             case EraMode::PSTN_G711:
@@ -470,8 +473,15 @@ namespace TelephonyDSP {
         }
 
         if (targetSR > 0) {
-            resamplerDown = std::make_unique<r8b::CDSPResampler24>(hostSampleRate, targetSR, 1024);
-            resamplerUp = std::make_unique<r8b::CDSPResampler24>(targetSR, hostSampleRate, 1024);
+            // aMaxInLen is the maximum number of input samples that may be
+            // passed to a single r8brain::CDSPResampler24::process() call.
+            // We keep it at 1024 to match the historical buffer size, but
+            // processCodec now chunks its calls so callers are free to push
+            // more than this per pushInput().
+            downMaxInLen = 1024;
+            upMaxInLen = 1024;
+            resamplerDown = std::make_unique<r8b::CDSPResampler24>(hostSampleRate, targetSR, downMaxInLen);
+            resamplerUp = std::make_unique<r8b::CDSPResampler24>(targetSR, hostSampleRate, upMaxInLen);
         }
     }
 
@@ -615,30 +625,45 @@ namespace TelephonyDSP {
 
     // Process logic: Downsample -> Filter -> Codec -> Buffer (Wait for Upsample?)
     // Note: r8brain is streaming. Filters are streaming. Codec is block or sample based.
-    // 1. Downsample (Host SR -> Codec SR)
+    // 1. Downsample (Host SR -> Codec SR)   -- chunked to never exceed aMaxInLen
     // 2. Filter (at Codec SR)
     // 3. Codec (at Codec SR)
-    // 4. Upsample (Codec SR -> Host SR) -> outputBuffer
+    // 4. Upsample (Codec SR -> Host SR)     -- chunked to never exceed aMaxInLen
+    //    -> outputBuffer
     void ChannelProcessor::processCodec(int numSamples, const float* in) {
-         if (resampInBuf.size() < (size_t)numSamples) resampInBuf.resize(numSamples);
-         for(int i=0; i<numSamples; ++i) resampInBuf[i] = in[i];
-         double* dOutRaw;
-         int downCount = resamplerDown->process(resampInBuf.data(), numSamples, dOutRaw);
-         
-         if (tempProcessBuf.size() < (size_t)downCount) tempProcessBuf.resize(downCount);
-         
-         // Apply Filters (in place or copy)
-         for(int i=0; i<downCount; ++i) {
-             float x = (float)dOutRaw[i];
-             x = hpFilter1.process(x);
-             x = hpFilter2.process(x);
-             x = lpFilter1.process(x);
-             x = lpFilter2.process(x);
-             tempProcessBuf[i] = x;
-         }
-         
-         ringCodecIn.write(tempProcessBuf.data(), downCount);
+         if (numSamples <= 0) return;
 
+         // ---- Stage 1: downsample, chunked so each process() call receives
+         //               at most downMaxInLen input samples ----
+         if (downMaxInLen > 0) {
+             if (resampInBuf.size() < (size_t)downMaxInLen) resampInBuf.resize(downMaxInLen);
+             int inOffset = 0;
+             while (inOffset < numSamples) {
+                 const int inChunk = std::min(numSamples - inOffset, downMaxInLen);
+                 for (int i = 0; i < inChunk; ++i)
+                     resampInBuf[i] = (double)in[inOffset + i];
+
+                 double* dOutRaw = nullptr;
+                 const int downCount = resamplerDown->process(resampInBuf.data(), inChunk, dOutRaw);
+
+                 // The pointer returned by r8brain is owned by the resampler
+                 // and stays valid until the next process() call, so it is
+                 // safe to consume within this iteration of the chunk loop.
+                 if ((int)tempProcessBuf.size() < downCount) tempProcessBuf.resize(downCount);
+                 for (int i = 0; i < downCount; ++i) {
+                     float x = (float)dOutRaw[i];
+                     x = hpFilter1.process(x);
+                     x = hpFilter2.process(x);
+                     x = lpFilter1.process(x);
+                     x = lpFilter2.process(x);
+                     tempProcessBuf[i] = x;
+                 }
+                 ringCodecIn.write(tempProcessBuf.data(), downCount);
+                 inOffset += inChunk;
+             }
+         }
+
+         // ---- Stage 2: codec/EVS_LIKE processing (unchanged) ----
          if (currentMode == EraMode::EVS_LIKE) {
              const int frameSize = 32000 / 50;
              while (ringCodecIn.getReadAvailable() >= (size_t)frameSize) {
@@ -659,8 +684,7 @@ namespace TelephonyDSP {
                  }
                  ringCodecOut.write(codecFrameF.data(), frameSize);
              }
-         } else {
-             // Actual Codec
+         } else if (codec) {
              int frameSize = codec->getFrameSize();
              while (ringCodecIn.getReadAvailable() >= (size_t)frameSize) {
                  ringCodecIn.read(codecFrameF.data(), frameSize);
@@ -671,20 +695,34 @@ namespace TelephonyDSP {
              }
          }
 
+         // ---- Stage 3: upsample, chunked so each process() call receives
+         //               at most upMaxInLen input samples ----
          int codecOutAvail = (int)ringCodecOut.getReadAvailable();
-         if (codecOutAvail > 0) {
-             if (tempProcessBuf.size() < (size_t)codecOutAvail) tempProcessBuf.resize(codecOutAvail);
+         if (codecOutAvail > 0 && upMaxInLen > 0) {
+             if ((int)tempProcessBuf.size() < codecOutAvail) tempProcessBuf.resize(codecOutAvail);
              ringCodecOut.read(tempProcessBuf.data(), codecOutAvail);
-             
-             if (resampInBuf.size() < (size_t)codecOutAvail) resampInBuf.resize(codecOutAvail);
-             for(int i=0; i<codecOutAvail; ++i) resampInBuf[i] = tempProcessBuf[i];
-             
-             double* dUpOutRaw;
-             int upCount = resamplerUp->process(resampInBuf.data(), codecOutAvail, dUpOutRaw);
-             
-             if (tempProcessBuf.size() < (size_t)upCount) tempProcessBuf.resize(upCount);
-             for(int i=0; i<upCount; ++i) tempProcessBuf[i] = (float)dUpOutRaw[i];
-             outputBuffer.write(tempProcessBuf.data(), upCount);
+
+             if (resampInBuf.size() < (size_t)upMaxInLen) resampInBuf.resize(upMaxInLen);
+             int upOffset = 0;
+             while (upOffset < codecOutAvail) {
+                 const int upChunk = std::min(codecOutAvail - upOffset, upMaxInLen);
+                 for (int i = 0; i < upChunk; ++i)
+                     resampInBuf[i] = (double)tempProcessBuf[upOffset + i];
+
+                 double* dUpOutRaw = nullptr;
+                 const int upCount = resamplerUp->process(resampInBuf.data(), upChunk, dUpOutRaw);
+
+                 // r8brain's output pointer is invalidated by the next
+                 // process() call, so copy it into a member-scope scratch
+                 // buffer (resampUpOutBuf) and write to outputBuffer before
+                 // looping. Streaming order is preserved by chunking in input
+                 // order.
+                 if ((int)resampUpOutBuf.size() < upCount) resampUpOutBuf.resize(upCount);
+                 for (int i = 0; i < upCount; ++i)
+                     resampUpOutBuf[i] = (float)dUpOutRaw[i];
+                 outputBuffer.write(resampUpOutBuf.data(), upCount);
+                 upOffset += upChunk;
+             }
          }
     }
     

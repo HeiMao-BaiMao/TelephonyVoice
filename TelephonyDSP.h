@@ -262,12 +262,25 @@ namespace TelephonyDSP {
         std::unique_ptr<r8b::CDSPResampler24> resamplerUp;
         std::unique_ptr<ICodec> codec;
 
+        // Maximum input length that was used to construct the resamplers.
+        // Callers of resamplerDown/resamplerUp must never pass more than this
+        // many input samples in a single r8brain::CDSPResampler24::process()
+        // call, otherwise r8brain's pre-allocated internal buffers overflow.
+        // We track both values so we can chunk process() calls safely.
+        int downMaxInLen;
+        int upMaxInLen;
+
         // Buffers
         std::vector<double> resampInBuf;
         std::vector<float> codecFrameF;
         std::vector<int16_t> codecFrameSIn;
         std::vector<int16_t> codecFrameSOut;
         std::vector<float> tempProcessBuf;
+        // Per-chunk staging for the upsampler output. r8brain's process()
+        // returns a pointer to an internal buffer that is invalidated by the
+        // next process() call, so we must copy each chunk out before the
+        // next iteration of the chunking loop.
+        std::vector<float> resampUpOutBuf;
         WaveformConcealer simulatedPathPLC;
 
         // Filters for G.711 (Cascaded for 24dB/oct)

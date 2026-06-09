@@ -47,11 +47,39 @@ set(EVS_INCLUDE_DIRS
 )
 
 # ---------------------------------------------------------------------------
+# EVS `wb_vad` / `wb_vad_init` symbol collision with vo-amrwbenc
+#
+# Both `external/3gpp-evs` and `external/vo-amrwbenc` export C symbols
+# `wb_vad` and `wb_vad_init`. Under MSVC's `INTERFACE /FORCE:MULTIPLE` the
+# linker picks one implementation at link time, which corrupts encoder
+# state at runtime (the wrong VAD runs for the wrong codec).
+#
+# The submodule is read-only, so we cannot rename the EVS symbols in source.
+# Instead, apply object-like macro renames *at compile time* for every
+# translation unit that includes `lib_com/prot.h` (which is every .c file in
+# `lib_com`, `lib_enc`, and `lib_dec`). The C preprocessor rewrites every
+# whole-word occurrence of `wb_vad` / `wb_vad_init` to its `evs_wb_vad*`
+# counterpart during translation, so declarations in `prot.h`, the
+# definitions in `lib_enc/vad.c`, and the call sites in
+# `lib_enc/{amr_wb_enc,init_enc,pre_proc}.c` all line up.
+#
+# Comments containing those identifiers are not affected (comments are
+# tokenised as comments before preprocessing), so headers and source
+# documentation still read `wb_vad` to humans.
+# ---------------------------------------------------------------------------
+set(EVS_WB_VAD_RENAME_DEFS
+    "wb_vad=evs_wb_vad"
+    "wb_vad_init=evs_wb_vad_init"
+)
+
+# ---------------------------------------------------------------------------
 # Floating-point EVS (TS 26.443 v12.7.0/v13.3.0) - default
 # ---------------------------------------------------------------------------
 evs_collect_float_sources(EVS_LIB_COM_SOURCES "${EVS_ROOT}/lib_com")
 add_library(evs-lib-com STATIC ${EVS_LIB_COM_SOURCES})
 target_include_directories(evs-lib-com PUBLIC ${EVS_INCLUDE_DIRS})
+# Rename wb_vad / wb_vad_init to evs_wb_vad* (see header comment above)
+target_compile_definitions(evs-lib-com PRIVATE ${EVS_WB_VAD_RENAME_DEFS})
 if(MSVC)
     target_compile_definitions(evs-lib-com PRIVATE _CRT_SECURE_NO_WARNINGS)
     target_compile_options(evs-lib-com PRIVATE /wd4244 /wd4267 /wd4018 /wd4305)
@@ -67,6 +95,8 @@ evs_collect_float_sources(EVS_LIB_ENC_SOURCES "${EVS_ROOT}/lib_enc")
 add_library(evs-lib-enc STATIC ${EVS_LIB_ENC_SOURCES})
 target_link_libraries(evs-lib-enc PUBLIC evs-lib-com)
 target_include_directories(evs-lib-enc PUBLIC ${EVS_INCLUDE_DIRS})
+# Rename wb_vad / wb_vad_init to evs_wb_vad* (see header comment above)
+target_compile_definitions(evs-lib-enc PRIVATE ${EVS_WB_VAD_RENAME_DEFS})
 if(MSVC)
     target_compile_definitions(evs-lib-enc PRIVATE _CRT_SECURE_NO_WARNINGS)
     target_compile_options(evs-lib-enc PRIVATE /wd4244 /wd4267 /wd4018 /wd4305 /O2)
@@ -76,6 +106,8 @@ evs_collect_float_sources(EVS_LIB_DEC_SOURCES "${EVS_ROOT}/lib_dec")
 add_library(evs-lib-dec STATIC ${EVS_LIB_DEC_SOURCES})
 target_link_libraries(evs-lib-dec PUBLIC evs-lib-com)
 target_include_directories(evs-lib-dec PUBLIC ${EVS_INCLUDE_DIRS})
+# Rename wb_vad / wb_vad_init to evs_wb_vad* (see header comment above)
+target_compile_definitions(evs-lib-dec PRIVATE ${EVS_WB_VAD_RENAME_DEFS})
 if(MSVC)
     target_compile_definitions(evs-lib-dec PRIVATE _CRT_SECURE_NO_WARNINGS)
     target_compile_options(evs-lib-dec PRIVATE /wd4244 /wd4267 /wd4018 /wd4305 /O2)
@@ -88,6 +120,8 @@ if(TELEPHONY_USE_EVS_FX)
     evs_collect_fx_sources(EVS_LIB_COM_FX_SOURCES "${EVS_ROOT}/lib_com")
     add_library(evs-lib-com-fx STATIC ${EVS_LIB_COM_FX_SOURCES})
     target_include_directories(evs-lib-com-fx PUBLIC ${EVS_INCLUDE_DIRS})
+    # Rename wb_vad / wb_vad_init to evs_wb_vad* (see header comment above)
+    target_compile_definitions(evs-lib-com-fx PRIVATE ${EVS_WB_VAD_RENAME_DEFS})
     if(MSVC)
         target_compile_definitions(evs-lib-com-fx PRIVATE _CRT_SECURE_NO_WARNINGS)
         target_compile_options(evs-lib-com-fx PRIVATE /wd4244 /wd4267 /wd4018 /wd4305 /O2)
@@ -97,6 +131,8 @@ if(TELEPHONY_USE_EVS_FX)
     add_library(evs-lib-enc-fx STATIC ${EVS_LIB_ENC_FX_SOURCES})
     target_link_libraries(evs-lib-enc-fx PUBLIC evs-lib-com-fx)
     target_include_directories(evs-lib-enc-fx PUBLIC ${EVS_INCLUDE_DIRS})
+    # Rename wb_vad / wb_vad_init to evs_wb_vad* (see header comment above)
+    target_compile_definitions(evs-lib-enc-fx PRIVATE ${EVS_WB_VAD_RENAME_DEFS})
     if(MSVC)
         target_compile_definitions(evs-lib-enc-fx PRIVATE _CRT_SECURE_NO_WARNINGS)
         target_compile_options(evs-lib-enc-fx PRIVATE /wd4244 /wd4267 /wd4018 /wd4305 /O2)
@@ -106,6 +142,8 @@ if(TELEPHONY_USE_EVS_FX)
     add_library(evs-lib-dec-fx STATIC ${EVS_LIB_DEC_FX_SOURCES})
     target_link_libraries(evs-lib-dec-fx PUBLIC evs-lib-com-fx)
     target_include_directories(evs-lib-dec-fx PUBLIC ${EVS_INCLUDE_DIRS})
+    # Rename wb_vad / wb_vad_init to evs_wb_vad* (see header comment above)
+    target_compile_definitions(evs-lib-dec-fx PRIVATE ${EVS_WB_VAD_RENAME_DEFS})
     if(MSVC)
         target_compile_definitions(evs-lib-dec-fx PRIVATE _CRT_SECURE_NO_WARNINGS)
         target_compile_options(evs-lib-dec-fx PRIVATE /wd4244 /wd4267 /wd4018 /wd4305 /O2)

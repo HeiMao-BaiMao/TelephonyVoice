@@ -164,7 +164,7 @@ int main(int argc, char* argv[]) {
 #endif
         TelephonyDSP::EraMode::EVS_LIKE,
 #ifndef TELEPHONY_DISTRIBUTION_BUILD
-        // TelephonyDSP::EraMode::EVS_NATIVE  // see README: hangs in init_encoder
+        TelephonyDSP::EraMode::EVS_NATIVE  // validated integrated EVS path; see README
 #endif
     };
     for (auto mode : modes) processFile(inputFile, mode);
