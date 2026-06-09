@@ -44,6 +44,14 @@ EVS_Encoder* evs_enc_create(int sample_rate_hz, int bitrate_bps, EVS_Bandwidth m
     return NULL;
 }
 
+EVS_Encoder* evs_enc_create_ex(int sample_rate_hz, int bitrate_bps, EVS_Bandwidth max_bw,
+                               const EVS_EncOptions* opts) {
+    (void)opts;
+    // The fixed-point variant is still a stub: defer to evs_enc_create so
+    // the same diagnostic message is printed exactly once.
+    return evs_enc_create(sample_rate_hz, bitrate_bps, max_bw);
+}
+
 void evs_enc_destroy(EVS_Encoder* enc) {
     if (!enc) return;
     if (enc->st) {

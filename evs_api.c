@@ -73,8 +73,59 @@ int evs_max_bitstream_bytes(int sample_rate_hz) {
 // Encoder
 // ---------------------------------------------------------------------------
 EVS_Encoder* evs_enc_create(int sample_rate_hz, int bitrate_bps, EVS_Bandwidth max_bw) {
+    // Backward-compatible thin wrapper: historical behaviour had DTX / RF /
+    // SC-VBR all disabled, matching the reference CLI's no-extra-flag path.
+    return evs_enc_create_ex(sample_rate_hz, bitrate_bps, max_bw, NULL);
+}
+
+EVS_Encoder* evs_enc_create_ex(int sample_rate_hz, int bitrate_bps, EVS_Bandwidth max_bw,
+                               const EVS_EncOptions* opts) {
     if (sample_rate_to_index(sample_rate_hz) < 0) return NULL;
     if (bitrate_bps < 5900 || bitrate_bps > 128000) return NULL;
+
+    // Resolve the effective options (defaults match the historical
+    // evs_enc_create path: DTX / RF / SC-VBR all off, variable SID).
+    EVS_EncOptions local;
+    evs_enc_options_init(&local);
+    if (opts) local = *opts;
+
+    // ---- DTX validation: only specific intervals are acceptable ----
+    if (local.dtx_enable) {
+        if (local.dtx_sid_interval == 0) {
+            // variable SID update interval (codec picks per-frame)
+        } else if (local.dtx_sid_interval >= 3 && local.dtx_sid_interval <= 100) {
+            // fixed SID update interval
+        } else {
+            // Out-of-range: fail cleanly (mirrors io_enc.c usage_enc(), but
+            // without exiting the caller).
+            return NULL;
+        }
+    }
+
+    // ---- RF validation: only 13.2 kbps and >= 16 kHz input are accepted ----
+    if (local.rf_enable && (bitrate_bps != ACELP_13k20 || sample_rate_hz < 16000)) {
+        // Disabling safely matches io_enc.c's "Reset RF parameters if NB
+        // input_Fs" / "channel-aware mode is supported only at 13.20" paths.
+        // Emit the reference CLI's diagnostic so callers notice the silent
+        // downgrade of their request.
+        fprintf(stderr,
+                "Warning: Channel-aware mode only available for 13.2 kbps WB/SWB\n"
+                "Switched to normal mode!\n");
+        local.rf_enable = 0;
+    }
+    if (local.rf_enable && local.rf_fec_offset != 0) {
+        if (local.rf_fec_offset != 2 && local.rf_fec_offset != 3 &&
+            local.rf_fec_offset != 5 && local.rf_fec_offset != 7) {
+            return NULL;
+        }
+    }
+
+    // ---- SC-VBR validation: the reference CLI only enables it for 5.90 kbps
+    // and forces total_brate up to 7.20 kbps. Keep the caller's bitrate as-is
+    // here (we are a wrapper, not a CLI), but the encoder will still respect
+    // the bitrate we pass. We honour the flag conservatively: if enabled
+    // together with DTX we leave DTX as requested; the reference handles the
+    // interaction internally. ----
 
     EVS_Encoder* enc = (EVS_Encoder*)calloc(1, sizeof(EVS_Encoder));
     if (!enc) return NULL;
@@ -93,15 +144,44 @@ EVS_Encoder* evs_enc_create(int sample_rate_hz, int bitrate_bps, EVS_Bandwidth m
     enc->st->total_brate     = bitrate_bps;
     enc->st->max_bwidth      = (short)bandwidth_to_enum(max_bw);
     enc->st->Opt_AMR_WB      = 0;          // 0 = native EVS (not AMR-WB IO)
-    enc->st->Opt_DTX_ON      = 0;
-    enc->st->Opt_RF_ON       = 0;
-    enc->st->Opt_SC_VBR      = 0;
-    enc->st->rf_fec_offset   = 0;
-    enc->st->rf_fec_indicator= 1;
-    enc->st->interval_SID    = FIXED_SID_RATE;
-    enc->st->var_SID_rate_flag = 1;
     enc->st->bitstreamformat = G192;
     enc->st->ind_list        = enc->ind_buf;
+
+    // ---- Apply DTX/CNG options (must be set before init_encoder()) ----
+    enc->st->Opt_DTX_ON = local.dtx_enable ? 1 : 0;
+    if (enc->st->Opt_DTX_ON) {
+        if (local.dtx_sid_interval == 0) {
+            enc->st->var_SID_rate_flag = 1;
+            enc->st->interval_SID      = 0;
+        } else {
+            enc->st->var_SID_rate_flag = 0;
+            enc->st->interval_SID      = (short)local.dtx_sid_interval;
+        }
+    } else {
+        // Keep reference defaults for the disabled path; this matches what
+        // io_enc.c does when -DTX is not passed.
+        enc->st->var_SID_rate_flag = 1;
+        enc->st->interval_SID      = FIXED_SID_RATE;
+    }
+
+    // ---- Apply RF options ----
+    enc->st->Opt_RF_ON        = local.rf_enable ? 1 : 0;
+    // rf_fec_indicator only carries meaning when RF is on (it selects LO/HI
+    // for the channel-aware mode). When RF is off, match the legacy/reference
+    // default of 1 so the encoder state matches what io_ini_enc() would have
+    // produced for the no-RF path.
+    enc->st->rf_fec_indicator = enc->st->Opt_RF_ON ? (local.rf_fec_hi ? 1 : 0) : 1;
+    if (enc->st->Opt_RF_ON) {
+        // 0 in opts => fall back to the reference default (FEC_OFFSET, 3).
+        enc->st->rf_fec_offset = (local.rf_fec_offset == 0)
+                                 ? (short)FEC_OFFSET
+                                 : (short)local.rf_fec_offset;
+    } else {
+        enc->st->rf_fec_offset = 0;
+    }
+
+    // ---- Apply SC-VBR option ----
+    enc->st->Opt_SC_VBR = local.sc_vbr_enable ? 1 : 0;
 
     // Pick codec mode the way the CLI does. The values follow cnst.h.
     //   - 5.90k = SC-VBR (we treat as constant; not used here)

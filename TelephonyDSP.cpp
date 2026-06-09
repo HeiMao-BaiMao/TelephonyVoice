@@ -315,7 +315,25 @@ namespace TelephonyDSP {
     {
         fallbackPLC.reset(getFrameSize());
 #ifndef TELEPHONY_DISTRIBUTION_BUILD
-        enc = evs_enc_create(sampleRate, bitrateBps, maxBw);
+        // Non-distribution / personal build: enable the 3GPP EVS internal
+        // VAD/DTX/SID/CNG path. Variable SID update interval (0) lets the
+        // codec pick the per-frame interval, matching the reference CLI's
+        // default behaviour. Channel-aware mode (RF) and SC-VBR stay off:
+        // the EVS spec only allows RF at 13.2 kbps with >= 16 kHz input, and
+        // JBM/RTP-packet-loss handling remain future work (see README).
+        EVS_EncOptions opts;
+        evs_enc_options_init(&opts);
+        opts.dtx_enable       = 1;
+        opts.dtx_sid_interval = 0;     // variable SID (see evs_api.h)
+        opts.rf_enable        = 0;
+        opts.sc_vbr_enable    = 0;
+        enc = evs_enc_create_ex(sampleRate, bitrateBps, maxBw, &opts);
+        if (!enc) {
+            // Refuse cleanly: if DTX is rejected for some reason (e.g. an
+            // unsupported configuration we didn't anticipate) fall back to
+            // the legacy options so the codec still encodes.
+            enc = evs_enc_create(sampleRate, bitrateBps, maxBw);
+        }
         dec = evs_dec_create(sampleRate, bitrateBps);
         bitstream.resize(evs_max_bitstream_bytes(sampleRate));
 #endif
@@ -331,8 +349,20 @@ namespace TelephonyDSP {
     void EVSCodec::reset() {
         fallbackPLC.reset(getFrameSize());
 #ifndef TELEPHONY_DISTRIBUTION_BUILD
-        if (enc) { evs_enc_destroy(enc); enc = evs_enc_create(sampleRate, bitrateBps, maxBw); }
+        if (enc) { evs_enc_destroy(enc); }
         if (dec) { evs_dec_destroy(dec); dec = evs_dec_create(sampleRate, bitrateBps); }
+
+        // Re-create the encoder with the same DTX options used in the ctor.
+        EVS_EncOptions opts;
+        evs_enc_options_init(&opts);
+        opts.dtx_enable       = 1;
+        opts.dtx_sid_interval = 0;
+        opts.rf_enable        = 0;
+        opts.sc_vbr_enable    = 0;
+        enc = evs_enc_create_ex(sampleRate, bitrateBps, maxBw, &opts);
+        if (!enc) {
+            enc = evs_enc_create(sampleRate, bitrateBps, maxBw);
+        }
 #endif
     }
 

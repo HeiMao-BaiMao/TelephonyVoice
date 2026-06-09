@@ -60,11 +60,67 @@ static inline int evs_frame_size(int sample_rate_hz) {
 }
 
 // ---------------------------------------------------------------------------
+// Optional encoder configuration (DTX/CNG, RF channel-aware, SC-VBR).
+//
+// All fields are ignored when passed via evs_enc_create_ex with opts==NULL,
+// or when using the legacy evs_enc_create entry point. Defaults match the
+// reference CLI's no-extra-flag path: DTX off, RF off, SC-VBR off.
+// ---------------------------------------------------------------------------
+typedef struct EVS_EncOptions {
+    // ---- DTX / CNG (3GPP TS 26.443 VAD/DTX/SID/CNG) ----
+    //   0 = DTX disabled (default), 1 = DTX enabled
+    int  dtx_enable;
+    //   0          -> variable SID update interval (var_SID_rate_flag=1,
+    //                 interval_SID=0). This is a pre-init contract consumed
+    //                 by init_encoder(), which promotes 0 to an internal
+    //                 default (~12 frames) before evs_enc() ever sees it.
+    //   3..100     -> fixed SID update interval in 20 ms frames
+    //                 (var_SID_rate_flag=0, interval_SID=N)
+    //   other      -> evs_enc_create_ex returns NULL (caller-visible error)
+    int  dtx_sid_interval;
+
+    // ---- Channel-aware mode (RF, TS 26.443 Annex C) ----
+    //   0 = RF disabled (default), 1 = RF requested
+    //   Ignored safely when bitrate != 13200 bps or sample rate < 16000 Hz,
+    //   matching the reference CLI's validation in io_enc.c.
+    int  rf_enable;
+    //   0 -> use the reference default (FEC_OFFSET, currently 3)
+    //   2, 3, 5, 7 -> use the requested FEC offset
+    //   other -> evs_enc_create_ex returns NULL
+    int  rf_fec_offset;
+    //   0 = LO, 1 (non-zero) = HI. 1 is the reference default.
+    int  rf_fec_hi;
+
+    // ---- Source-controlled VBR (SC-VBR, 5.90 kbps mode) ----
+    //   0 = SC-VBR disabled (default). When enabled, the reference CLI
+    //     forces total_brate to 7.20 kbps and may override DTX settings.
+    //     Keep conservative: enabled only if explicitly requested.
+    int  sc_vbr_enable;
+} EVS_EncOptions;
+
+// Convenience initializer. Equivalent to a zero-initialised struct, but
+// keeps the "all disabled" defaults explicit and version-portable.
+static inline void evs_enc_options_init(EVS_EncOptions* opts) {
+    if (!opts) return;
+    opts->dtx_enable       = 0;
+    opts->dtx_sid_interval = 0;
+    opts->rf_enable        = 0;
+    opts->rf_fec_offset    = 0;
+    opts->rf_fec_hi        = 1;
+    opts->sc_vbr_enable    = 0;
+}
+
+// ---------------------------------------------------------------------------
 // Encoder lifecycle.
 // sample_rate_hz : 8000, 16000, 32000, 48000
 // bitrate_bps    : one of EVS_BR_*
 // max_bw         : bandwidth ceiling (encoder is allowed to drop below this)
+// opts           : optional encoder configuration; pass NULL to use the
+//                  legacy defaults (DTX/RF/SC-VBR all off, matching the
+//                  historical evs_enc_create behaviour).
 // ---------------------------------------------------------------------------
+EVS_Encoder* evs_enc_create_ex(int sample_rate_hz, int bitrate_bps, EVS_Bandwidth max_bw,
+                               const EVS_EncOptions* opts);
 EVS_Encoder* evs_enc_create(int sample_rate_hz, int bitrate_bps, EVS_Bandwidth max_bw);
 void         evs_enc_destroy(EVS_Encoder* enc);
 

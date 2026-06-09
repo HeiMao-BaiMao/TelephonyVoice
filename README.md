@@ -140,10 +140,21 @@ been fixed in this tree:
 * The normal/personal build's `TelephonyRunner` now includes
   `EVS_NATIVE` in its mode list and produces an `evs_native` output WAV
   end-to-end.
+* `EVS_NATIVE` (non-distribution) now exercises the 3GPP EVS internal
+  VAD/DTX/SID/CNG path by default. `EVSCodec` calls
+  `evs_enc_create_ex` with DTX enabled and a variable SID update
+  interval (`dtx_sid_interval=0`); the legacy `evs_enc_create` entry
+  point is preserved as a thin wrapper that maps to `_ex(..., NULL)`
+  and reproduces the historical "DTX off" behaviour. Channel-aware
+  mode (RF) and source-controlled VBR (SC-VBR) stay off; RF is
+  restricted by the EVS spec to 13.2 kbps with >= 16 kHz input, and
+  JBM/RTP-packet-loss handling remain future work.
 * The distribution build (`TELEPHONY_DISTRIBUTION_BUILD=ON`) still
   aliases `EVS_NATIVE` to `EVS_LIKE` and omits it from the runner's
   mode list, so the EVS reference is never linked or invoked in shipped
-  builds.
+  builds. The DTX/CNG wiring in `EVSCodec` is also compiled out under
+  `TELEPHONY_DISTRIBUTION_BUILD`, so the distribution path is
+  unaffected.
 * Fixed-point EVS (`TELEPHONY_USE_EVS_FX`) remains unimplemented and
   untested; see `### CMake Build Option (Untested Path)` below.
 
