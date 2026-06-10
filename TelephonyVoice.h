@@ -2,7 +2,7 @@
 
 #include "public.sdk/source/vst/vstaudioeffect.h"
 #include "public.sdk/source/vst/vsteditcontroller.h"
-#include "TelephonyDSP.h"
+#include "dsp/SignalProcessor.h"
 
 namespace Steinberg {
 namespace Vst {

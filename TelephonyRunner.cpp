@@ -8,7 +8,7 @@
 #include <cstring>
 #include <cmath>
 
-#include "TelephonyDSP.h"
+#include "dsp/SignalProcessor.h"
 #include "wavreader.h"
 #include "wavwriter.h"
 

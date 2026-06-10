@@ -96,7 +96,18 @@ else()
 endif()
 
 add_library(TelephonyDSP STATIC
-    TelephonyDSP.cpp
+    dsp/RingBuffer.cpp
+    dsp/WaveformConcealer.cpp
+    dsp/G711Codec.cpp
+    dsp/GsmCodec.cpp
+    dsp/AmrNbCodec.cpp
+    dsp/AmrWbCodec.cpp
+    dsp/EvsCodec.cpp
+    dsp/EvsCodecJbm.cpp
+    dsp/OpusCodec.cpp
+    dsp/SpeexDSPAux.cpp
+    dsp/ChannelProcessor.cpp
+    dsp/SignalProcessor.cpp
     ${EVS_API_SRC}
 )
 

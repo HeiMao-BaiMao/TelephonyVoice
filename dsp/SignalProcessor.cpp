@@ -1,0 +1,216 @@
+#define NOMINMAX
+#include "dsp/SignalProcessor.h"
+#include <cmath>
+#include <algorithm>
+#include <cstring>
+
+namespace TelephonyDSP {
+
+    SignalProcessor::SignalProcessor()
+        : hostSampleRate(44100.0), currentMode(EraMode::Bypass),
+          routeModelEnabled(false),
+          inputEndpoint(RouteEndpoint::FixedLine), outputEndpoint(RouteEndpoint::Mobile5G),
+          degradationSegment(DegradationSegment::Both),
+          paramDryWet(1.0f), paramOutGain(1.0f), paramArtifactsEnabled(false), paramArtifactAmount(0.0f),
+          paramPacketLossRate(0.0f), paramNetworkDegradation(0.0f),
+          simulateLatency(true),
+          evsSampleRate(32000), evsBitrateBps(EVS_BR_13200), evsMaxBandwidth(EVS_SWB),
+          targetLatencySamples(0), inTotalSamples(0), outTotalSamples(0)
+    {
+        updateLatency();
+    }
+
+    SignalProcessor::~SignalProcessor() {}
+
+    EraMode SignalProcessor::endpointToMode(RouteEndpoint endpoint) const {
+        switch (endpoint) {
+            case RouteEndpoint::FixedLine:       return EraMode::PSTN_G711;
+            case RouteEndpoint::Mobile2G:        return EraMode::GSM_FR;
+            case RouteEndpoint::Mobile3G:        return distributionSafeMode(EraMode::AMR_NB_3G);
+            case RouteEndpoint::Mobile4G:        return distributionSafeMode(EraMode::AMR_WB_VOLTE);
+            case RouteEndpoint::Mobile5G:        return EraMode::EVS_LIKE;
+            case RouteEndpoint::Mobile5GNative:  return distributionSafeMode(EraMode::EVS_NATIVE);
+#if TELEPHONY_USE_EVS_JBM
+            case RouteEndpoint::Mobile5GJbm:     return distributionSafeMode(EraMode::EVS_JBM);
+#endif
+            default:                             return EraMode::Bypass;
+        }
+    }
+
+    bool SignalProcessor::degradesInputLeg() const {
+        return degradationSegment == DegradationSegment::Both
+            || degradationSegment == DegradationSegment::InputToExchange;
+    }
+
+    bool SignalProcessor::degradesOutputLeg() const {
+        return degradationSegment == DegradationSegment::Both
+            || degradationSegment == DegradationSegment::ExchangeToOutput;
+    }
+
+    void SignalProcessor::applyRouteToChannels() {
+        for (size_t i = 0; i < outputLegs.size(); ++i) {
+            auto& inputLeg = inputLegs[i];
+            auto& outputLeg = outputLegs[i];
+            inputLeg->setEVSConfig(evsSampleRate, evsBitrateBps, evsMaxBandwidth);
+            outputLeg->setEVSConfig(evsSampleRate, evsBitrateBps, evsMaxBandwidth);
+
+            if (routeModelEnabled) {
+                inputLeg->setMode(endpointToMode(inputEndpoint));
+                outputLeg->setMode(endpointToMode(outputEndpoint));
+
+                const float inputLoss = degradesInputLeg() ? paramPacketLossRate : 0.0f;
+                const float inputDeg = degradesInputLeg() ? paramNetworkDegradation : 0.0f;
+                const float outputLoss = degradesOutputLeg() ? paramPacketLossRate : 0.0f;
+                const float outputDeg = degradesOutputLeg() ? paramNetworkDegradation : 0.0f;
+
+                inputLeg->configure(paramArtifactsEnabled, paramArtifactAmount, inputLoss, inputDeg);
+                outputLeg->configure(paramArtifactsEnabled, paramArtifactAmount, outputLoss, outputDeg);
+            } else {
+                inputLeg->setMode(EraMode::Bypass);
+                inputLeg->configure(false, 0.0f, 0.0f, 0.0f);
+                outputLeg->setMode(currentMode);
+                outputLeg->configure(paramArtifactsEnabled, paramArtifactAmount,
+                                     paramPacketLossRate, paramNetworkDegradation);
+            }
+        }
+    }
+
+    void SignalProcessor::setSampleRate(double sr) {
+        hostSampleRate = sr;
+        updateLatency();
+        for (auto& ch : inputLegs) ch->setSampleRate(sr);
+        for (auto& ch : outputLegs) ch->setSampleRate(sr);
+        reset();
+    }
+
+    void SignalProcessor::setMode(EraMode mode) {
+        mode = distributionSafeMode(mode);
+        routeModelEnabled = false;
+        currentMode = mode;
+        applyRouteToChannels();
+    }
+
+    void SignalProcessor::setRoute(RouteEndpoint input, RouteEndpoint output, DegradationSegment segment) {
+        routeModelEnabled = true;
+        inputEndpoint = input;
+        outputEndpoint = output;
+        degradationSegment = segment;
+        applyRouteToChannels();
+    }
+
+    void SignalProcessor::setEVSConfig(int sampleRateHz, int bitrateBps, EVS_Bandwidth maxBw) {
+        evsSampleRate   = sampleRateHz;
+        evsBitrateBps   = bitrateBps;
+        evsMaxBandwidth = maxBw;
+        for (auto& ch : inputLegs) ch->setEVSConfig(sampleRateHz, bitrateBps, maxBw);
+        for (auto& ch : outputLegs) ch->setEVSConfig(sampleRateHz, bitrateBps, maxBw);
+    }
+
+    void SignalProcessor::setParameters(float dryWet, float outGaindB, bool artifacts, float artifactAmount,
+                                        float packetLossRate, float networkDegradation) {
+        paramDryWet = dryWet;
+        paramOutGain = std::pow(10.0f, outGaindB / 20.0f);
+        paramArtifactsEnabled = artifacts;
+        paramArtifactAmount = artifactAmount;
+        paramPacketLossRate = std::clamp(packetLossRate, 0.0f, 0.95f);
+        paramNetworkDegradation = std::clamp(networkDegradation, 0.0f, 1.0f);
+        applyRouteToChannels();
+    }
+
+    void SignalProcessor::setSimulateLatency(bool enable) {
+        simulateLatency = enable;
+        updateLatency();
+    }
+
+    void SignalProcessor::reset() {
+        inTotalSamples = 0;
+        outTotalSamples = 0;
+        for (auto& ch : inputLegs) ch->reset();
+        for (auto& ch : outputLegs) ch->reset();
+        for (auto& db : dryBuffers) db->reset();
+        applyRouteToChannels();
+    }
+
+    void SignalProcessor::updateLatency() {
+        if (simulateLatency) targetLatencySamples = (int)std::round(0.1 * hostSampleRate);
+        else targetLatencySamples = 0;
+    }
+
+    int SignalProcessor::getLatencySamples() const {
+        return targetLatencySamples;
+    }
+
+    void SignalProcessor::ensureChannels(int count) {
+        if (outputLegs.size() != (size_t)count) {
+            inputLegs.clear();
+            outputLegs.clear();
+            dryBuffers.clear();
+            for (int i=0; i<count; ++i) {
+                inputLegs.push_back(std::make_unique<ChannelProcessor>(hostSampleRate));
+                outputLegs.push_back(std::make_unique<ChannelProcessor>(hostSampleRate));
+                dryBuffers.push_back(std::make_unique<RingBuffer>(131072));
+            }
+            applyRouteToChannels();
+        }
+    }
+
+    void SignalProcessor::process(float** inputs, int numIns, float** outputs, int numOuts, int numSamples) {
+        ensureChannels(numIns);
+        inTotalSamples += numSamples;
+
+        for (int i=0; i<numIns; ++i) {
+            dryBuffers[i]->write(inputs[i], numSamples);
+            if (routeModelEnabled) {
+                std::vector<float> exchange(numSamples, 0.0f);
+                inputLegs[i]->pushInput(inputs[i], numSamples);
+                inputLegs[i]->pullOutput(exchange.data(), numSamples);
+                outputLegs[i]->pushInput(exchange.data(), numSamples);
+            } else {
+                outputLegs[i]->pushInput(inputs[i], numSamples);
+            }
+        }
+
+        int64_t readable = (inTotalSamples - targetLatencySamples) - outTotalSamples;
+        int samplesToWrite = numSamples;
+        int outputOffset = 0;
+
+        if (readable < 0) {
+            int silence = (int)(std::min)((int64_t)samplesToWrite, -readable);
+            for (int ch=0; ch<numOuts; ++ch) {
+                std::memset(outputs[ch], 0, silence * sizeof(float));
+            }
+            samplesToWrite -= silence;
+            outputOffset += silence;
+            outTotalSamples += silence;
+        }
+
+        if (samplesToWrite > 0) {
+            std::vector<std::vector<float>> processedChannels(numIns, std::vector<float>(samplesToWrite));
+            
+            for (int i=0; i<numIns; ++i) {
+                std::vector<float> d(samplesToWrite);
+                if (dryBuffers[i]->getReadAvailable() >= (size_t)samplesToWrite) {
+                    dryBuffers[i]->read(d.data(), samplesToWrite);
+                } else {
+                    dryBuffers[i]->read(d.data(), dryBuffers[i]->getReadAvailable());
+                }
+
+                std::vector<float> w(samplesToWrite);
+                outputLegs[i]->pullOutput(w.data(), samplesToWrite);
+                
+                for (int s=0; s<samplesToWrite; ++s) {
+                    processedChannels[i][s] = (d[s] * (1.0f - paramDryWet) + w[s] * paramDryWet) * paramOutGain;
+                }
+            }
+
+            for (int ch=0; ch<numOuts; ++ch) {
+                int inCh = (ch < numIns) ? ch : 0;
+                float* dest = outputs[ch] + outputOffset;
+                std::memcpy(dest, processedChannels[inCh].data(), samplesToWrite * sizeof(float));
+            }
+            
+            outTotalSamples += samplesToWrite;
+        }
+    }
+
+} // namespace TelephonyDSP
