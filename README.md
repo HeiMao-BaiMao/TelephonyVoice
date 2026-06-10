@@ -348,17 +348,25 @@ What is wired up in this step:
   next packet is available, otherwise by Opus's built-in PLC; DTX stays
   enabled via Opus's internal VAD.
 * `TelephonyDSP::SpeexDSPAux` wraps `speex_preprocess` so the denoise (and
-  in the future VAD / AGC) primitives can be reached from
-  `ChannelProcessor`. In this first step it is wired into `recreateCodec`
-  / `reset` so it compiles and links correctly but does **not** alter the
-  audio path yet. Only `SPEEX_PREPROCESS_SET_DENOISE` is enabled in
-  `configure()`; the explicit `SPEEX_PREPROCESS_SET_VAD` ctl is left
-  commented out because SpeexDSP's VAD is still a placeholder that prints
-  `The VAD has been replaced by a hack pending a complete rewrite` every
-  time it is enabled, and `SpeexDSPAux` is not yet driving audio behavior
-  so the noisy runner output serves no purpose. A follow-up pass can
-  drive DTX/CNG for `OPUS_VOIP` / `EVS_LIKE` based on the speech
-  probability it reports (re-enable the ctl at that point).
+   in the future AGC) primitives can be reached from `ChannelProcessor`,
+ and now also provides a local energy-based VAD that drives
+ `getSpeechProbability()` / `lastFrameIsSpeech()`. In this step it is
+ wired into `recreateCodec` / `reset` so it compiles and links correctly
+ but does **not** alter the audio path yet. Only
+ `SPEEX_PREPROCESS_SET_DENOISE` is enabled on the Speex state; the
+ explicit `SPEEX_PREPROCESS_SET_VAD` ctl is left commented out because
+ SpeexDSP's VAD is still a placeholder that prints
+ `The VAD has been replaced by a hack pending a complete rewrite` every
+ time it is enabled. To still give callers a meaningful speech
+ probability, `SpeexDSPAux` runs a simple RMS-based VAD on the
+ post-denoise frame in `runPreprocess()` and caches the result;
+ `configure()` auto-scales the threshold by `sqrt(frameSize/160)` so
+ longer frames aren't penalized, and `setEnergyVadEnabled()` lets
+ callers opt out or override the threshold. The energy VAD is on by
+ default, so `getSpeechProbability()` returns a value in [0,1] and
+ `lastFrameIsSpeech()` returns `lastEnergyVadProb >0.5` instead of
+ the legacy `-1.0f / false` "unknown" sentinel. A follow-up pass can
+ drive DTX/CNG for `OPUS_VOIP` / `EVS_LIKE` based on that probability.
 
 VST3 UI: the `OPUS_VOIP` mode is intentionally **not** exposed as a new
 endpoint in this step, to avoid changing the existing route string list
@@ -379,11 +387,11 @@ What is deliberately still **not** in scope:
   `osmo-*` / `srsRAN` / `OAI` is GPL or AGPL and would force the whole
   project onto those licenses; we are not pulling those in.
 * SpeexDSP-backed PLC / DTX integration into the audio path. The
-  SpeexDSPAux class compiles and is configured (denoise on, VAD off for
-  now — see the SpeexDSPAux bullet above); a future iteration can
-  re-enable the VAD ctl and use its speech probability to drop frames for
-  `EVS_LIKE` / `OPUS_VOIP` and optionally fill with low-level comfort
-  noise.
+   SpeexDSPAux class compiles and is configured (denoise on, energy-based
+ VAD on by default — see the SpeexDSPAux bullet above); a future
+ iteration can use the energy-VAD's speech probability to drop frames
+ for `EVS_LIKE` / `OPUS_VOIP` and optionally fill with low-level
+ comfort noise.
 
 ## Open Questions for the Next Agent
 

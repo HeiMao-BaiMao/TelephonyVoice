@@ -528,54 +528,75 @@ class ICodec {
     };
 
     // ---------------------------------------------------------------------------
-    // SpeexDSPAux (experimental, non-distribution)
-    //
-    // Lightweight helper around the BSD-licensed speex_preprocess / jitter
-    // buffer APIs. The point of this first step is to compile SpeexDSP into
-    // TelephonyDSP and prove the headers / link line; it does not change
-    // audio output yet. A follow-up step can:
-    //   - use speex_preprocess_run() to compute VAD probability and decide
-    //     when to emit DTX/SID frames for OPUS_VOIP / EVS_LIKE
-    //   - drive a SpeexJitter wrapper around OPUS_VOIP packets
-    //   - generate low-level comfort noise for SILENCE frames
-    //
-    // Exposed here so future iterations can plumb it into ChannelProcessor
-    // without re-dealing with CMake / include paths.
-    // ---------------------------------------------------------------------------
-    class SpeexDSPAux {
-    public:
-        SpeexDSPAux();
-        ~SpeexDSPAux();
-        void configure(int sampleRate, int frameSize);
-        void reset();
-        // Returns speex_preprocess_ctl(SPEEX_PREPROCESS_GET_PROB) - speech
-        // probability in [0,1] (SpeexDSP reports it as a percent in [0,100]
-        // and we rescale). Returns -1.0 when SpeexDSP is not compiled in or
-        // when no frame has been processed yet. Currently only meaningful
-        // if SPEEX_PREPROCESS_SET_VAD has been enabled in configure(); with
-        // VAD disabled, the underlying value is not populated and callers
-        // should treat the result as "unknown".
-        float getSpeechProbability() const;
-        // Returns true if the last run() call detected voice activity.
-        // Always returns false when SpeexDSP is not compiled in, when the
-        // helper is not configured, or while SPEEX_PREPROCESS_SET_VAD is
-        // disabled in configure().
-        bool lastFrameIsSpeech() const;
-        void runPreprocess(int16_t* frame); // in-place, no-op when disabled
-    private:
+ // SpeexDSPAux (experimental, non-distribution)
+ //
+ // Lightweight helper around the BSD-licensed speex_preprocess / jitter
+ // buffer APIs. Two responsibilities today:
+ //1) Run SpeexDSP denoise on each frame before it hits the codec.
+ //2) Provide a voice-activity decision for callers that need it.
+ // SpeexDSP's own VAD is a broken placeholder that prints
+ // "The VAD has been replaced by a hack pending a complete rewrite"
+ // every time it is enabled, so we leave SPEEX_PREPROCESS_SET_VAD off
+ // and instead drive `getSpeechProbability()` / `lastFrameIsSpeech()`
+ // from a simple energy-based VAD computed on the post-denoise frame
+ // (frame RMS vs. an RMS threshold, squashed through a soft ramp to
+ // [0,1]).
+ //
+ // Exposed here so future iterations can plumb it into ChannelProcessor
+ // without re-dealing with CMake / include paths.
+ // ---------------------------------------------------------------------------
+ class SpeexDSPAux {
+ public:
+ SpeexDSPAux();
+ ~SpeexDSPAux();
+ void configure(int sampleRate, int frameSize);
+ void reset();
+ // Enable / disable the local energy-based VAD. `threshold` is the
+ // RMS (over int16 sample magnitudes) at which the VAD reports
+ // probability ~0.5; values below that map to <0.5, above to >0.5.
+ // Defaults to500.0f (~-36 dBFS RMS for a sine, a sensible floor
+ // for voiced speech on a typical handset mic). `configure()` also
+ // auto-scales the threshold by sqrt(frameSize/160) so longer
+ // frames don't bias the decision downward. No-op when SpeexDSP is
+ // not compiled in (the no-experimental stub keeps the flag but
+ // ignores it).
+ void setEnergyVadEnabled(bool enable, float threshold =500.0f);
+ // Returns the cached energy-VAD probability in [0,1] for the last
+ // frame processed by runPreprocess(). Returns -1.0f ("unknown")
+ // when SpeexDSP is not compiled in, when the helper is not
+ // configured, when no frame has been processed yet, or when the
+ // energy VAD is disabled (so callers can distinguish "no signal"
+ // from "definitely not speech").
+ float getSpeechProbability() const;
+ // Returns true if the last run() call was classified as speech by
+ // the energy VAD (lastEnergyVadProb >0.5). Always returns false
+ // when SpeexDSP is not compiled in, when the helper is not
+ // configured, or when the energy VAD is disabled.
+ bool lastFrameIsSpeech() const;
+ void runPreprocess(int16_t* frame); // in-place, no-op when disabled
+ private:
  void* state; // SpeexPreprocessState* kept void* to avoid speex headers here
  int sampleRate;
  int frameSize;
  bool configured;
-// Tracks whether SPEEX_PREPROCESS_SET_VAD is enabled on `state`.
-  // SpeexDSP's VAD is currently a placeholder that logs
-  // "The VAD has been replaced by a hack pending a complete rewrite"
-  // every time it is enabled, so we leave it off and expose it as a
-  // separate flag rather than a derived state. While this is false,
-  // getSpeechProbability() returns -1.0f ("unknown") and
-  // lastFrameIsSpeech() returns false, instead of a `0.0f / false`
-  // pair that would falsely imply "definitely not speech".
+ // Tracks whether SPEEX_PREPROCESS_SET_VAD is enabled on `state`.
+ // SpeexDSP's VAD is currently a placeholder that logs
+ // "The VAD has been replaced by a hack pending a complete rewrite"
+ // every time it is enabled, so we leave it off and expose it as a
+ // separate flag rather than a derived state. While this is false,
+ // getSpeechProbability() returns -1.0f ("unknown") and
+ // lastFrameIsSpeech() returns false, instead of a `0.0f / false`
+ // pair that would falsely imply "definitely not speech".
  bool vadEnabled;
+ // Local energy-based VAD (replaces the disabled SpeexDSP VAD).
+ // When `energyVadEnabled` is true, runPreprocess() computes the
+ // frame RMS, divides by `energyVadThreshold`, and squashes the
+ // ratio to [0,1] via a soft ramp; the result is cached in
+ // `lastEnergyVadProb` and exposed through getSpeechProbability()
+ // / lastFrameIsSpeech().
+ bool energyVadEnabled;
+ float energyVadThreshold;
+ float lastEnergyVadProb;
  };
 
     class ChannelProcessor {
