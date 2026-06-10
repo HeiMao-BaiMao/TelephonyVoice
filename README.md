@@ -109,6 +109,16 @@ Internally those user-facing endpoints map to codec-era modes:
   AMR/AMR-WB/EVS reference libraries are not included or linked, the UI only
   exposes fixed line / 2G / 5G stand-in, and direct `EVS_NATIVE` requests are
   aliased to `EVS_LIKE`.
+* `evs_api_rx.h` / `evs_api_rx.c` add a Stage-1 parent adapter around the 3GPP
+  `EvsRXlib` (`EVS_RX_*`) for the JBM/VoIP receive path. It is **OFF by
+  default** via the `TELEPHONY_USE_EVS_JBM` build option, float EVS only,
+  non-distribution only, and is not yet wired into `TelephonyDSP` /
+  `TelephonyRunner` modes.
+  * Raw AU contract: callers feed compact EVS access unit bytes
+    (the same bit-packed payload the encoder produces); `au_bits_count` is
+    in **bits** (not bytes) and must already be aligned to the codec frame
+    size; RTP timestamps from the wire must be converted to the JBM's 1 ms
+    timeline before being fed into the receive adapter.
 * AMR-NB and AMR-WB encoders now enable their bundled 3GPP DTX/CNG path by
   default in normal / personal builds. `AMRNBCodec` initializes
   `Encoder_Interface_init(dtxEnabled ? 1 : 0)` (default `dtxEnabled = true`)
@@ -253,6 +263,7 @@ Implemented path:
 | Option                     | Default | Effect                                                                 |
 | -------------------------- | ------- | ---------------------------------------------------------------------- |
 | `TELEPHONY_USE_EVS_FX`     | OFF     | Build fixed-point EVS (TS 26.442) instead of float (TS 26.443).         |
+| `TELEPHONY_USE_EVS_JBM`    | OFF     | Build the experimental EVS Stage-1 JBM/VoIP receive adapter (`evs_api_rx`) around 3GPP `EvsRXlib`. Incompatible with `TELEPHONY_DISTRIBUTION_BUILD` and with `TELEPHONY_USE_EVS_FX`. |
 | `TELEPHONY_DISTRIBUTION_BUILD` | OFF | Strip AMR/AMR-WB/EVS references and expose only distributable modes. |
 | `TELEPHONY_EXPERIMENTAL_NETWORK` | ON (forced OFF in distribution builds) | Build SpeexDSP + Opus and expose `OPUS_VOIP` mode (BSD-licensed). |
 

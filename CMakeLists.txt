@@ -13,6 +13,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # ---------------------------------------------------------------------------
 option(TELEPHONY_USE_EVS_FX "Use 3GPP EVS fixed-point reference (v16.4.0) instead of floating-point (v13.3.0)" OFF)
 option(TELEPHONY_DISTRIBUTION_BUILD "Strip AMR/AMR-WB/EVS reference codecs and use distributable stand-ins only" OFF)
+option(TELEPHONY_USE_EVS_JBM "Build the experimental EVS Stage-1 JBM/VoIP receive adapter (float EVS, non-distribution only)" OFF)
 # ---------------------------------------------------------------------------
 # Experimental / non-distribution additions
 #
@@ -33,6 +34,14 @@ endif()
 
 if(TELEPHONY_DISTRIBUTION_BUILD AND TELEPHONY_USE_EVS_FX)
     message(FATAL_ERROR "TELEPHONY_USE_EVS_FX is not available in TELEPHONY_DISTRIBUTION_BUILD")
+endif()
+
+if(TELEPHONY_USE_EVS_JBM AND TELEPHONY_DISTRIBUTION_BUILD)
+    message(FATAL_ERROR "TELEPHONY_USE_EVS_JBM is not available in TELEPHONY_DISTRIBUTION_BUILD")
+endif()
+
+if(TELEPHONY_USE_EVS_JBM AND TELEPHONY_USE_EVS_FX)
+    message(FATAL_ERROR "TELEPHONY_USE_EVS_JBM is only implemented for the floating-point EVS variant (TELEPHONY_USE_EVS_FX must be OFF)")
 endif()
 
 # ---------------------------------------------------------------------------
@@ -80,6 +89,9 @@ elseif(TELEPHONY_USE_EVS_FX)
     set(EVS_API_LIBS evs-lib-enc-fx evs-lib-dec-fx)
 else()
     set(EVS_API_SRC "${CMAKE_CURRENT_SOURCE_DIR}/evs_api.c")
+    if(TELEPHONY_USE_EVS_JBM)
+        list(APPEND EVS_API_SRC "${CMAKE_CURRENT_SOURCE_DIR}/evs_api_rx.c")
+    endif()
     set(EVS_API_LIBS evs-lib-enc evs-lib-dec)
 endif()
 
@@ -94,6 +106,12 @@ target_link_libraries(TelephonyDSP PUBLIC
     gsm
     ${EVS_API_LIBS}
 )
+
+if(TELEPHONY_USE_EVS_JBM)
+    target_compile_definitions(TelephonyDSP PUBLIC TELEPHONY_USE_EVS_JBM=1)
+else()
+    target_compile_definitions(TelephonyDSP PUBLIC TELEPHONY_USE_EVS_JBM=0)
+endif()
 
 if(NOT TELEPHONY_DISTRIBUTION_BUILD)
     target_link_libraries(TelephonyDSP PUBLIC
