@@ -30,12 +30,21 @@ namespace TelephonyDSP {
 
 #ifdef TELEPHONY_DISTRIBUTION_BUILD
  static EraMode distributionSafeMode(EraMode mode) {
- // Defense-in-depth: experimental codecs (EVS_NATIVE, OPUS_VOIP) are
- // disabled in distribution builds, but their enum entries remain
- // reachable. Map both to the safe EVS_LIKE profile.
+ // Defense-in-depth: experimental codecs (EVS_NATIVE, OPUS_VOIP, and - if
+ // it is exposed in this build - EVS_JBM) are disabled in distribution
+ // builds, but their enum entries remain reachable. Map them to the
+ // safe EVS_LIKE profile.
+#if TELEPHONY_USE_EVS_JBM
+ return (mode == EraMode::EVS_NATIVE
+         || mode == EraMode::OPUS_VOIP
+         || mode == EraMode::EVS_JBM)
+        ? EraMode::EVS_LIKE
+        : mode;
+#else
  return (mode == EraMode::EVS_NATIVE || mode == EraMode::OPUS_VOIP)
  ? EraMode::EVS_LIKE
  : mode;
+#endif
  }
 #else
     static EraMode distributionSafeMode(EraMode mode) {
@@ -430,6 +439,208 @@ void EVSCodec::processFrame(const int16_t* in, int16_t* out, bool packetLost) {
         fallbackPLC.storeGoodFrame(out, fs);
 #endif
     }
+
+    // ---------------------------------------------------------------------------
+    // EVSCodecJbm (experimental, float EVS only, non-distribution only)
+    //
+    // Encoder + Stage-1 JBM/VoIP adapter in one ICodec. See the header
+    // comment for the full design. The implementation follows
+    // EVSCodec's DTX/RF/SC-VBR options and uses the public
+    // evs_api_rx / evs_api_rx_smoke-compatible helpers; no submodule
+    // edits are required.
+    // ---------------------------------------------------------------------------
+#if TELEPHONY_USE_EVS_JBM
+#if !defined(TELEPHONY_DISTRIBUTION_BUILD)
+    EVSCodecJbm::EVSCodecJbm(int sampleRate, int bitrateBps, EVS_Bandwidth maxBw)
+        : sampleRate(sampleRate)
+        , bitrateBps(bitrateBps)
+        , maxBw(maxBw)
+        , enc(nullptr)
+        , rx(nullptr)
+        , frameIndex(0)
+        , rtpSeq(0)
+    {
+        fallbackPLC.reset(getFrameSize());
+
+        // Match EVSCodec's DTX options. The JBM does not see DTX/SID
+        // frames specially (they are still valid AUs in the JBM's MSB-
+        // first compact format), so the encoder's DTX/CNG output is
+        // pushed through unchanged.
+        EVS_EncOptions opts;
+        evs_enc_options_init(&opts);
+        opts.dtx_enable       = 1;
+        opts.dtx_sid_interval = 0;     // variable SID (see evs_api.h)
+        opts.rf_enable        = 0;
+        opts.sc_vbr_enable    = 0;
+        enc = evs_enc_create_ex(sampleRate, bitrateBps, maxBw, &opts);
+        if (!enc) {
+            // Fall back to the legacy entry point on configuration
+            // rejection so the codec still encodes.
+            enc = evs_enc_create(sampleRate, bitrateBps, maxBw);
+        }
+
+        // Stage-1 JBM/VoIP receive adapter. jbm_safety_margin_ms=0 is
+        // clamped to the reference default (60 ms) inside the adapter.
+        rx = evs_rx_jbm_create(sampleRate, bitrateBps, 0);
+
+        // Encoder bitstream scratch (G.192 short-stream), sized to the
+        // worst-case AU at the configured sample rate.
+        bitstream.resize(evs_max_bitstream_bytes(sampleRate));
+        // Compact MSB-first AU scratch: 320 bytes covers the 2560-bit
+        // worst case (MAX_BITS_PER_FRAME). The helper's own
+        // EVS_RX_G192_MAX_AU_BYTES is 320, so we match that exactly.
+        compactAu.assign(320, 0);
+    }
+
+    EVSCodecJbm::~EVSCodecJbm() {
+        if (enc) { evs_enc_destroy(enc); enc = nullptr; }
+        if (rx)  { evs_rx_jbm_destroy(rx); rx = nullptr; }
+    }
+
+    void EVSCodecJbm::reset() {
+        fallbackPLC.reset(getFrameSize());
+        frameIndex = 0;
+        rtpSeq     = 0;
+
+        // Tear down + recreate the encoder (with the same DTX options
+        // used in the ctor).
+        if (enc) { evs_enc_destroy(enc); enc = nullptr; }
+        EVS_EncOptions opts;
+        evs_enc_options_init(&opts);
+        opts.dtx_enable       = 1;
+        opts.dtx_sid_interval = 0;
+        opts.rf_enable        = 0;
+        opts.sc_vbr_enable    = 0;
+        enc = evs_enc_create_ex(sampleRate, bitrateBps, maxBw, &opts);
+        if (!enc) {
+            enc = evs_enc_create(sampleRate, bitrateBps, maxBw);
+        }
+
+        // Tear down + recreate the JBM. EVS_RX_Close destroys the
+        // embedded Decoder_State contents; the adapter frees its
+        // own Decoder_State allocation, so this is a full reset.
+        if (rx) { evs_rx_jbm_destroy(rx); rx = nullptr; }
+        rx = evs_rx_jbm_create(sampleRate, bitrateBps, 0);
+    }
+
+    void EVSCodecJbm::processFrame(const int16_t* in, int16_t* out, bool packetLost) {
+        const int fs = getFrameSize();
+
+        // Deterministic 20 ms timeline, advanced exactly once per
+        // input frame (not per successful encode) so the JBM sees a
+        // gap-free RTP timestamp stream even when a packet is dropped.
+        const uint32_t t_ms = frameIndex * 20u;
+        const uint16_t seq  = (uint16_t)rtpSeq;
+
+        // Always advance the timeline + sequence number, even on
+        // packet loss: the JBM/decoder needs to know which slot was
+        // missed in order to conceal it deterministically.
+        frameIndex++;
+        rtpSeq++;
+
+        // ----- Encode side -----
+        // Only feed the JBM a new AU when the caller's network model
+        // did not drop this frame. If we have no encoder handle (e.g.
+        // both _ex and legacy create failed) we fall through to the
+        // "no feed" path and let the JBM conceal.
+        int nb_bits = 0;
+        bool have_au = false;
+        if (!packetLost && enc && rx) {
+            int used = 0;
+            if (evs_enc_process(enc, in, fs, bitstream.data(),
+                                (int)bitstream.size(), &used) == EVS_OK) {
+                nb_bits = evs_rx_jbm_g192_to_compact_au(
+                    bitstream.data(), used,
+                    compactAu.data(), (int)compactAu.size());
+                if (nb_bits > 0) {
+                    have_au = true;
+                }
+            }
+        }
+
+        // ----- JBM feed (only when we have a real AU) -----
+        if (have_au) {
+            // Use the same deterministic, zero-jitter 20 ms clock that the
+            // reference voip_client loop and EVSJbmSmoke use: RTP timestamp,
+            // receive time, and system playout time are all expressed on the
+            // JBM's 1000 Hz (ms) timeline. The JBM still applies its own
+            // safety-margin / buffering policy internally; we do not read a
+            // real wall clock so offline renders remain deterministic.
+            const unsigned int sys_ms = (unsigned int)t_ms;
+            const unsigned long  ts_ms = (unsigned long)t_ms;
+            if (evs_rx_jbm_feed_frame(rx, compactAu.data(), nb_bits,
+                                      seq, ts_ms, sys_ms) != EVS_OK) {
+                // Feed failed; the JBM will conceal this slot.
+                have_au = false;
+            }
+        }
+
+        // ----- JBM pull (always one 20 ms output frame) -----
+        // We always pull, even on packet loss, so the contract
+        // (one input frame in, one output frame out) is preserved.
+        // The JBM conceals the missing slot internally when no AU
+        // was fed; if rx is missing or errors out, we fall back to
+        // the waveform concealer.
+        short pcmBuf[4096];
+        if ((int)(sizeof(pcmBuf) / sizeof(pcmBuf[0])) < fs) {
+            // Defensive: should never happen for the supported
+            // sample rates (max 48 kHz -> 960 samples/frame).
+            fallbackPLC.conceal(out, fs);
+            return;
+        }
+
+        if (rx) {
+            int n = 0;
+            if (evs_rx_jbm_get_samples(rx, pcmBuf, fs,
+                                       (unsigned int)t_ms, &n) == EVS_OK
+                && n == fs) {
+                std::memcpy(out, pcmBuf, fs * sizeof(int16_t));
+                fallbackPLC.storeGoodFrame(out, fs);
+                return;
+            }
+        }
+
+        // Last-resort concealment: no JBM output (missing handle or
+        // pull failure). On packet loss we conceal; otherwise we
+        // pass the input through to avoid an audible click.
+        if (packetLost) {
+            fallbackPLC.conceal(out, fs);
+        } else {
+            std::memcpy(out, in, fs * sizeof(int16_t));
+            fallbackPLC.storeGoodFrame(out, fs);
+        }
+    }
+#else // TELEPHONY_DISTRIBUTION_BUILD
+    // Distribution-build stub: keeps the symbol table clean while the
+    // experimental mode is hidden by distributionSafeMode. The stub
+    // mirrors EVSCodec's distribution path: no external API calls,
+    // pass-through behaviour, no JBM handle, no encoder handle.
+    EVSCodecJbm::EVSCodecJbm(int sampleRate, int, EVS_Bandwidth)
+        : sampleRate(sampleRate), bitrateBps(0), maxBw(EVS_SWB),
+          enc(nullptr), rx(nullptr), frameIndex(0), rtpSeq(0) {
+        fallbackPLC.reset(getFrameSize());
+    }
+    EVSCodecJbm::~EVSCodecJbm() {}
+    void EVSCodecJbm::reset() {
+        fallbackPLC.reset(getFrameSize());
+        frameIndex = 0;
+        rtpSeq = 0;
+    }
+    void EVSCodecJbm::processFrame(const int16_t* in, int16_t* out, bool packetLost) {
+        const int fs = getFrameSize();
+        // Advance the timeline so the JBM-side state stays consistent
+        // if this stub is ever reached (e.g. via a stale currentMode).
+        frameIndex++;
+        rtpSeq++;
+        if (packetLost) {
+            fallbackPLC.conceal(out, fs);
+        } else {
+            std::memcpy(out, in, fs * sizeof(int16_t));
+            fallbackPLC.storeGoodFrame(out, fs);
+        }
+    }
+#endif // !TELEPHONY_DISTRIBUTION_BUILD
+#endif // TELEPHONY_USE_EVS_JBM
 
     // ---------------------------------------------------------------------------
     // OpusCodec
@@ -861,7 +1072,16 @@ void EVSCodec::processFrame(const int16_t* in, int16_t* out, bool packetLost) {
         evsSampleRate    = sampleRateHz;
         evsBitrateBps    = bitrateBps;
         evsMaxBandwidth  = maxBw;
-        if (changed && currentMode == EraMode::EVS_NATIVE) {
+#if TELEPHONY_USE_EVS_JBM
+        // EVS_JBM uses the same EVS configuration knobs as EVS_NATIVE
+        // (sample rate / bitrate / max bandwidth), so the same
+        // change-detection path applies.
+        const bool rebuildForEvs = (currentMode == EraMode::EVS_NATIVE
+                                    || currentMode == EraMode::EVS_JBM);
+#else
+        const bool rebuildForEvs = (currentMode == EraMode::EVS_NATIVE);
+#endif
+        if (changed && rebuildForEvs) {
             recreateResamplers();
             recreateCodec();
             ringCodecIn.reset(); ringCodecOut.reset();
@@ -937,6 +1157,11 @@ void ChannelProcessor::reset() {
             case EraMode::AMR_WB_VOLTE: targetSR = 16000; break;
             case EraMode::EVS_LIKE: targetSR = 32000; break;
             case EraMode::EVS_NATIVE: targetSR = evsSampleRate; break;
+#if TELEPHONY_USE_EVS_JBM
+            // EVS_JBM drives the EVS encoder+JBM at the configured
+            // sample rate, so the resampler target mirrors EVS_NATIVE.
+            case EraMode::EVS_JBM: targetSR = evsSampleRate; break;
+#endif
 #if TELEPHONY_EXPERIMENTAL_NETWORK
             case EraMode::OPUS_VOIP: targetSR = 48000; break;
 #endif
@@ -1008,7 +1233,7 @@ void ChannelProcessor::reset() {
                 degradedFloorHz = 4000.0f;
                 applyBand();
                 break;
-case EraMode::EVS_NATIVE:
+            case EraMode::EVS_NATIVE:
                 if (paramNetworkDegradation <= 0.001f) {
                     // The real EVS already shapes its own bandwidth; skip the
                     // extra cascade unless the radio/path simulation asks for it.
@@ -1029,6 +1254,30 @@ case EraMode::EVS_NATIVE:
                     applyBand();
                 }
                 break;
+#if TELEPHONY_USE_EVS_JBM
+            case EraMode::EVS_JBM:
+                // EVS_JBM runs the real EVS encoder + JBM at the
+                // configured sample rate, so its filter profile
+                // matches EVS_NATIVE.
+                if (paramNetworkDegradation <= 0.001f) {
+                    hpFilter1.reset();
+                    lpFilter1.reset();
+                } else {
+                    sampleRate = (float)evsSampleRate;
+                    highpassHz = 50.0f;
+                    switch (evsMaxBandwidth) {
+                        case EVS_NB:  lowpassHz = 3400.0f; break;
+                        case EVS_WB:  lowpassHz = 7000.0f; break;
+                        case EVS_SWB: lowpassHz = 14000.0f; break;
+                        case EVS_FB:  lowpassHz = 20000.0f; break;
+                        default:      lowpassHz = 14000.0f; break;
+                    }
+                    lowpassHz = (std::min)(lowpassHz, sampleRate * 0.45f);
+                    degradedFloorHz = 3400.0f;
+                    applyBand();
+                }
+                break;
+#endif
 #if TELEPHONY_EXPERIMENTAL_NETWORK
             case EraMode::OPUS_VOIP:
                 if (paramNetworkDegradation <= 0.001f) {
@@ -1096,6 +1345,14 @@ void ChannelProcessor::recreateCodec() {
             case EraMode::EVS_NATIVE:
                 codec = std::make_unique<EVSCodec>(evsSampleRate, evsBitrateBps, evsMaxBandwidth);
                 break;
+#if TELEPHONY_USE_EVS_JBM
+            case EraMode::EVS_JBM:
+                // EVSCodecJbm runs the real EVS encoder + Stage-1 JBM
+                // in one ICodec. See the class header comment in
+                // TelephonyDSP.h for the full design.
+                codec = std::make_unique<EVSCodecJbm>(evsSampleRate, evsBitrateBps, evsMaxBandwidth);
+                break;
+#endif
 #if TELEPHONY_EXPERIMENTAL_NETWORK
             case EraMode::OPUS_VOIP:
                 // 48 kHz, 24 kbps, complexity 6 (moderate). See OpusCodec.

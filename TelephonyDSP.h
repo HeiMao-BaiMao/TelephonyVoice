@@ -10,6 +10,12 @@
 // External Libraries
 #include "CDSPResampler.h"
 #include "evs_api.h"
+#if TELEPHONY_USE_EVS_JBM
+// Stage-1 JBM/VoIP receive adapter (experimental, float EVS only).
+// Only the public C API is pulled in here; the rest of the JBM is sealed
+// inside evs_api_rx.c / external/3gpp-evs.
+#include "evs_api_rx.h"
+#endif
 
 extern "C" {
     unsigned char linear2ulaw(int pcm_val);
@@ -30,7 +36,13 @@ enum class EraMode {
         Bypass,
         // Experimental additions (BSD-licensed; non-distribution only).
         // Inserted at the end so existing numeric values remain stable.
-        OPUS_VOIP    // Opus encoder/decoder at VOIP-tuned settings (non-distribution)
+        OPUS_VOIP,   // Opus encoder/decoder at VOIP-tuned settings (non-distribution)
+#if TELEPHONY_USE_EVS_JBM
+        // EVS_NATIVE plus the Stage-1 JBM/VoIP receive adapter
+        // (evs_api_rx / 3GPP EvsRXlib). Off by default; enabled when
+        // TELEPHONY_USE_EVS_JBM=ON. Non-distribution, float EVS only.
+        EVS_JBM
+#endif
     };
 
     enum class RouteEndpoint {
@@ -249,6 +261,81 @@ class ICodec {
         std::vector<unsigned char> bitstream;
         WaveformConcealer fallbackPLC;
     };
+
+#if TELEPHONY_USE_EVS_JBM
+    // ---------------------------------------------------------------------------
+    // EVSCodecJbm (experimental, float EVS only, non-distribution only)
+    //
+    // Sibling of EVSCodec that runs the EVS encoder + Stage-1 JBM/VoIP
+    // receive adapter (evs_api_rx) end-to-end inside one ICodec instance.
+    //
+    // Differences from EVSCodec:
+    //   * No standalone EVS_Decoder. Decoding is performed inside the
+    //     JBM's embedded decoder state, which also handles jitter, packet
+    //     loss concealment, and time-scaling.
+    //   * The encoder feeds the JBM via evs_rx_jbm_feed_frame, with the
+    //     G.192 short-stream first converted to a compact MSB-first AU
+    //     by evs_rx_jbm_g192_to_compact_au. The packet sequence number
+    //     and the 1 ms JBM timestamp are derived from a deterministic
+    //     20 ms timeline (`frameIndex * 20`).
+    //   * Output is pulled per call from evs_rx_jbm_get_samples so the
+    //     surrounding ChannelProcessor / ring-buffer contract (one input
+    //     frame in, one output frame out) is preserved. The
+    //     WaveformConcealer is the last-resort fallback for missing
+    //     handles or decode errors.
+    //   * DTX/CNG options match EVSCodec (dtx_enable=1, dtx_sid_interval=0,
+    //     RF off, SC-VBR off). The legacy evs_enc_create entry point is
+    //     the fallback if evs_enc_create_ex rejects the options.
+    //
+    // Only compiled when TELEPHONY_USE_EVS_JBM=ON.
+    // ---------------------------------------------------------------------------
+    class EVSCodecJbm : public ICodec {
+    public:
+        EVSCodecJbm(int sampleRate = 32000,
+                    int bitrateBps = EVS_BR_13200,
+                    EVS_Bandwidth maxBw = EVS_SWB);
+        ~EVSCodecJbm() override;
+        void reset() override;
+        int getSampleRate() const override { return sampleRate; }
+        int getFrameSize() const override { return sampleRate / 50; }
+        void processFrame(const int16_t* in, int16_t* out, bool packetLost) override;
+
+        int getBitrate() const { return bitrateBps; }
+        EVS_Bandwidth getMaxBandwidth() const { return maxBw; }
+
+    private:
+        int sampleRate;
+        int bitrateBps;
+        EVS_Bandwidth maxBw;
+
+        // EVS encoder (real 3GPP reference via evs_api.c).
+        EVS_Encoder* enc;
+        // Stage-1 JBM/VoIP receive adapter (evs_api_rx.c).
+        EVS_RxJbm*    rx;
+
+        // Encoder bitstream scratch. Sized to evs_max_bitstream_bytes()
+        // for the configured sample rate. Holds the G.192 short-stream
+        // output of evs_enc_process.
+        std::vector<unsigned char> bitstream;
+        // Compact MSB-first AU scratch; max 320 bytes covers the
+        // 2560-bit worst case (MAX_BITS_PER_FRAME). Reused across
+        // processFrame() calls.
+        std::vector<unsigned char> compactAu;
+
+        // Last-resort PLC. Stores every good decoded frame and falls
+        // back to waveform repetition if the JBM or decoder is
+        // unavailable / errors out.
+        WaveformConcealer fallbackPLC;
+
+        // Deterministic 20 ms timeline + RTP sequence number, both
+        // advanced exactly once per input frame so the JBM sees a
+        // steady, gap-free stream of packet metadata even when a
+        // frame is dropped (in which case we still advance the
+        // timeline but do not feed an AU).
+        uint32_t frameIndex;
+        uint32_t rtpSeq;
+    };
+#endif // TELEPHONY_USE_EVS_JBM
 
     // ---------------------------------------------------------------------------
     // OpusCodec (experimental, non-distribution)

@@ -277,3 +277,67 @@ int evs_rx_jbm_is_empty(EVS_RxJbm* rx) {
     if (!rx || !rx->h_rx) return EVS_ERROR;
     return EVS_RX_IsEmpty(rx->h_rx) ? 1 : 0;
 }
+
+// ---------------------------------------------------------------------------
+// G.192 short-stream -> compact MSB-first EVS AU helper.
+//
+// Local constants; kept private to this translation unit so the parent
+// smoke executable and any future caller can rely on the same numbers
+// without re-declaring them.
+// ---------------------------------------------------------------------------
+
+// Good-frame sync word used by the 3GPP EVS reference's G.192
+// short-stream output. The helper is intentionally for encoder-produced
+// good frames, not arbitrary G.192/bad-frame streams.
+#define EVS_RX_G192_SYNC_GOOD_FRAME 0x6B21u
+
+// Payload-word encoding used by the 3GPP EVS reference's G.192
+// short-stream: 0x0081 means "bit is 1", 0x007F means "bit is 0".
+#define EVS_RX_G192_BIT1 0x0081u
+
+// Maximum payload size we accept on the convert path, in bits. Matches
+// the reference decoder's hard cap (MAX_BITS_PER_FRAME = 2560 in cnst.h)
+// and is the same number MAX_BITS_PER_FRAME is derived from in the EVS
+// reference. The compact buffer must accommodate (2560 + 7) / 8 = 320
+// bytes; callers should size accordingly.
+#define EVS_RX_G192_MAX_AU_BITS  2560
+#define EVS_RX_G192_MAX_AU_BYTES 320
+
+int evs_rx_jbm_g192_to_compact_au(const unsigned char* bitstream,
+                                  int bitstream_used,
+                                  unsigned char* compact,
+                                  int compact_capacity) {
+    if (!bitstream || !compact) return EVS_ERROR;
+    if (bitstream_used < (int)(2 * sizeof(unsigned short))) return EVS_ERROR;
+
+    // The G.192 short-stream is laid out as a native-endian array of
+    // uint16 words: word[0] = SYNC_WORD, word[1] = nb_bits, then the
+    // payload bit words. The EVS reference writes the bitstream as
+    // sizeof(unsigned short) per element, so the bit-count math is in
+    // multiples of that.
+    const unsigned short* words = (const unsigned short*)bitstream;
+    int nwords = bitstream_used / (int)sizeof(unsigned short);
+
+    if (words[0] != EVS_RX_G192_SYNC_GOOD_FRAME) return EVS_ERROR;
+
+    unsigned int nb_bits = (unsigned int)words[1];
+    if (nb_bits < 1u || nb_bits > EVS_RX_G192_MAX_AU_BITS) return EVS_ERROR;
+    if (nwords < 2 + (int)nb_bits) return EVS_ERROR;
+
+    int compact_bytes = (int)((nb_bits + 7u) / 8u);
+    if (compact_bytes > EVS_RX_G192_MAX_AU_BYTES) return EVS_ERROR;
+    if (compact_capacity < compact_bytes) return EVS_ERROR;
+
+    // Walk the payload words, set bit i in the compact output MSB-first
+    // whenever word[2+i] == 0x0081. Zero-initialise first so a sparse
+    // payload (lots of 0x007F words) does not leave stale bits behind.
+    memset(compact, 0, (size_t)compact_bytes);
+    for (unsigned int i = 0; i < nb_bits; ++i) {
+        if (words[2u + i] != EVS_RX_G192_BIT1) continue;
+        int byte_index = (int)(i >> 3);
+        int bit_index  = 7 - (int)(i & 0x7u);
+        compact[byte_index] |= (unsigned char)(1u << bit_index);
+    }
+
+    return (int)nb_bits;
+}

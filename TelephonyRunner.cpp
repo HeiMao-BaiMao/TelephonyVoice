@@ -25,6 +25,9 @@ const char* getModeSuffix(TelephonyDSP::EraMode mode) {
         case TelephonyDSP::EraMode::EVS_LIKE: return "evs_like";
         case TelephonyDSP::EraMode::EVS_NATIVE: return "evs_native";
         case TelephonyDSP::EraMode::Bypass: return "bypass";
+#if TELEPHONY_USE_EVS_JBM
+        case TelephonyDSP::EraMode::EVS_JBM: return "evs_jbm";
+#endif
 #if TELEPHONY_EXPERIMENTAL_NETWORK
         case TelephonyDSP::EraMode::OPUS_VOIP: return "opus_voip";
 #endif
@@ -70,6 +73,12 @@ void processFile(const std::string& inputFile, TelephonyDSP::EraMode mode) {
         // Default: SWB 32 kHz, 13.2 kbps (most common VoLTE voice config)
         dsp.setEVSConfig(32000, EVS_BR_13200, EVS_SWB);
     }
+#if TELEPHONY_USE_EVS_JBM
+    if (mode == TelephonyDSP::EraMode::EVS_JBM) {
+        // Same default config as EVS_NATIVE: SWB 32 kHz, 13.2 kbps.
+        dsp.setEVSConfig(32000, EVS_BR_13200, EVS_SWB);
+    }
+#endif
     dsp.setParameters(1.0f, 0.0f, false, 0.0f);
     dsp.setSimulateLatency(false); // Disable artificial 100ms latency for runner
 
@@ -168,6 +177,11 @@ int main(int argc, char* argv[]) {
         TelephonyDSP::EraMode::EVS_LIKE,
 #ifndef TELEPHONY_DISTRIBUTION_BUILD
         TelephonyDSP::EraMode::EVS_NATIVE,  // validated integrated EVS path; see README
+#endif
+#if TELEPHONY_USE_EVS_JBM && !defined(TELEPHONY_DISTRIBUTION_BUILD)
+        // EVS_NATIVE plus the Stage-1 JBM/VoIP receive adapter. Off
+        // by default; only emitted when TELEPHONY_USE_EVS_JBM=ON.
+        TelephonyDSP::EraMode::EVS_JBM,
 #endif
 #if TELEPHONY_EXPERIMENTAL_NETWORK && !defined(TELEPHONY_DISTRIBUTION_BUILD)
         TelephonyDSP::EraMode::OPUS_VOIP    // experimental, BSD-licensed Opus (non-distribution)

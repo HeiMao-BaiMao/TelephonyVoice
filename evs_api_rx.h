@@ -164,6 +164,37 @@ int evs_rx_jbm_get_fec_offset(EVS_RxJbm* rx, int* offset, int* fec_hi);
 // ---------------------------------------------------------------------------
 int evs_rx_jbm_is_empty(EVS_RxJbm* rx);
 
+// ---------------------------------------------------------------------------
+// Convert a G.192 short-stream (the format produced by the reference
+// encoder's evs_enc_process bitstream output) into the compact MSB-first
+// EVS access-unit bytes that evs_rx_jbm_feed_frame expects.
+//
+// bitstream         : the raw bytes returned by evs_enc_process, treated as
+//                     a native-endian array of unsigned short (uint16).
+// bitstream_used    : number of valid bytes in `bitstream`.
+// compact           : caller-allocated output buffer for the compact AU.
+// compact_capacity  : capacity of `compact` in bytes.
+//
+// On success returns the number of valid bits in the AU (1..MAX_BITS_PER_FRAME,
+// matching the second uint16 word in the G.192 short-stream). Returns
+// EVS_ERROR if the input is malformed, nb_bits is out of range, or the
+// compact buffer is too small (must be at least 320 bytes to cover the
+// 2560-bit worst case).
+//
+// Semantics: the G.192 short-stream layout is
+//   word[0] = SYNC_WORD (0x6B21, validated)
+//   word[1] = nb_bits  (number of payload bits that follow)
+//   word[2..2+nb_bits-1] = payload bits as 0x007F (zero) / 0x0081 (one)
+// This helper walks the payload words, sets bit i in the output MSB-first
+// whenever word[2+i] == 0x0081, and returns nb_bits. The output's byte
+// count is therefore ceil(nb_bits / 8); the caller passes that count (in
+// bits) to evs_rx_jbm_feed_frame.
+// ---------------------------------------------------------------------------
+int evs_rx_jbm_g192_to_compact_au(const unsigned char* bitstream,
+                                  int bitstream_used,
+                                  unsigned char* compact,
+                                  int compact_capacity);
+
 #ifdef __cplusplus
 }
 #endif

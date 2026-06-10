@@ -63,6 +63,7 @@ Internally those user-facing endpoints map to codec-era modes:
 | `EVS_NATIVE`             | 8/16/32/48  | 3GPP EVS reference     | ✅ (3GPP TS 26.443 v12.7.0/v13.3.0)   |
 | `Bypass`                 | host        | –                      | –                                     |
 | `OPUS_VOIP` *(experimental)* | 48 kHz   | Opus (VOIP application, 24 kbps) | ✅ (opus, BSD) — non-distribution only |
+| `EVS_JBM` *(experimental)*   | 8/16/32/48 | EVS + Stage-1 JBM/VoIP adapter | ✅ (3GPP EVS + `EvsRXlib`) — non-distribution, `TELEPHONY_USE_EVS_JBM=ON` only |
 
 ## Current State of Work
 
@@ -112,8 +113,13 @@ Internally those user-facing endpoints map to codec-era modes:
 * `evs_api_rx.h` / `evs_api_rx.c` add a Stage-1 parent adapter around the 3GPP
   `EvsRXlib` (`EVS_RX_*`) for the JBM/VoIP receive path. It is **OFF by
   default** via the `TELEPHONY_USE_EVS_JBM` build option, float EVS only,
-  non-distribution only, and is not yet wired into `TelephonyDSP` /
-  `TelephonyRunner` modes.
+  non-distribution only. The adapter now exposes a public
+  `evs_rx_jbm_g192_to_compact_au` helper, and a new `EVSCodecJbm` class
+  (sibling of `EVSCodec`) wires the encoder and the JBM together as a
+  single `ICodec`. The `EVS_JBM` mode is now reachable from
+  `TelephonyRunner` (suffix `evs_jbm`) when `TELEPHONY_USE_EVS_JBM=ON`,
+  gated by the same CMake option. The mode is **not** exposed in the VST
+  UI.
   * Raw AU contract: callers feed compact EVS access unit bytes
     (the same bit-packed payload the encoder produces); `au_bits_count` is
     in **bits** (not bytes) and must already be aligned to the codec frame

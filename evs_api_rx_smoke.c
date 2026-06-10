@@ -15,8 +15,6 @@
 #define SMOKE_NUM_FRAMES   50
 #define SMOKE_DRAIN_TICKS  20
 #define SMOKE_MAX_AU_BYTES 320
-#define SMOKE_MAX_AU_BITS  2560
-#define G192_BIT1          0x0081u
 
 static int fail(const char* msg) {
     fprintf(stderr, "evs_api_rx_smoke: %s\n", msg);
@@ -38,36 +36,6 @@ static void accumulate_energy(const short* pcm, int n_samples, unsigned long lon
         int v = (int)pcm[i];
         *energy += (unsigned long long)(v < 0 ? -v : v);
     }
-}
-
-// Convert the G.192 short-stream returned by evs_enc_process into the compact
-// MSB-first EVS AU bytes expected by evs_rx_jbm_feed_frame.
-static int g192_to_compact_au(const unsigned char* bitstream,
-                              int bitstream_used,
-                              unsigned char* compact,
-                              int compact_capacity) {
-    if (!bitstream || !compact) return -1;
-    if (bitstream_used < (int)(2 * sizeof(unsigned short))) return -1;
-
-    const unsigned short* words = (const unsigned short*)bitstream;
-    int nwords = bitstream_used / (int)sizeof(unsigned short);
-    unsigned int nb_bits = (unsigned int)words[1];
-    if (nb_bits < 1u || nb_bits > SMOKE_MAX_AU_BITS) return -1;
-    if (nwords < 2 + (int)nb_bits) return -1;
-
-    int compact_bytes = (int)((nb_bits + 7u) / 8u);
-    if (compact_bytes > SMOKE_MAX_AU_BYTES) return -1;
-    if (compact_capacity < compact_bytes) return -1;
-
-    memset(compact, 0, (size_t)compact_bytes);
-    for (unsigned int i = 0; i < nb_bits; ++i) {
-        if (words[2u + i] != G192_BIT1) continue;
-        int byte_index = (int)(i >> 3);
-        int bit_index = 7 - (int)(i & 0x7u);
-        compact[byte_index] |= (unsigned char)(1u << bit_index);
-    }
-
-    return (int)nb_bits;
 }
 
 int main(void) {
@@ -116,8 +84,8 @@ int main(void) {
             break;
         }
 
-        int nb_bits = g192_to_compact_au(bitstream, bitstream_used,
-                                         compact, (int)sizeof(compact));
+        int nb_bits = evs_rx_jbm_g192_to_compact_au(bitstream, bitstream_used,
+                                                    compact, (int)sizeof(compact));
         if (nb_bits <= 0) {
             fprintf(stderr, "evs_api_rx_smoke: G.192 to compact AU conversion failed at frame %d\n", i);
             failed = 1;
