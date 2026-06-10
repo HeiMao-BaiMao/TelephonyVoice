@@ -14,10 +14,13 @@ namespace TelephonyDSP {
     // ---------------------------------------------------------------------------
 #if TELEPHONY_USE_EVS_JBM
 #if !defined(TELEPHONY_DISTRIBUTION_BUILD)
-    EVSCodecJbm::EVSCodecJbm(int sampleRate, int bitrateBps, EVS_Bandwidth maxBw)
+    EVSCodecJbm::EVSCodecJbm(int sampleRate, int bitrateBps, EVS_Bandwidth maxBw,
+                             int dtxSidInterval, bool scVbrEnabled)
         : sampleRate(sampleRate)
         , bitrateBps(bitrateBps)
         , maxBw(maxBw)
+        , dtxSidInterval(0)
+        , scVbrEnabled(scVbrEnabled)
         , enc(nullptr)
         , rx(nullptr)
         , frameIndex(0)
@@ -29,6 +32,12 @@ namespace TelephonyDSP {
     {
         fallbackPLC.reset(getFrameSize());
 
+        // Normalize the requested SID interval to the set evs_enc_create_ex
+        // accepts (0 or 3..100). Any other value is clamped to 0 to keep
+        // the legacy behaviour and to avoid a configuration rejection.
+        dtxSidInterval = (dtxSidInterval == 0) ? 0
+                       : ((dtxSidInterval >= 3 && dtxSidInterval <= 100) ? dtxSidInterval : 0);
+
         // Reserve queue capacity so the FIFO never reallocates during
         // steady-state operation. Bounded by kMaxQueueSize.
         jbmQueue.reserve(kMaxQueueSize);
@@ -36,13 +45,15 @@ namespace TelephonyDSP {
         // Match EVSCodec's DTX options. The JBM does not see DTX/SID
         // frames specially (they are still valid AUs in the JBM's MSB-
         // first compact format), so the encoder's DTX/CNG output is
-        // pushed through unchanged.
+        // pushed through unchanged. SC-VBR (Source-Controlled VBR) is
+        // opt-in via the ctor flag and is also re-applied in reset()
+        // below.
         EVS_EncOptions opts;
         evs_enc_options_init(&opts);
         opts.dtx_enable       = 1;
-        opts.dtx_sid_interval = 0;     // variable SID (see evs_api.h)
+        opts.dtx_sid_interval = dtxSidInterval;  // 0 = variable SID (see evs_api.h)
         opts.rf_enable        = 0;  // RF enabled later via evs_enc_set_rf
-        opts.sc_vbr_enable    = 0;
+        opts.sc_vbr_enable    = scVbrEnabled ? 1 : 0;
         rfActive = (bitrateBps == EVS_BR_13200 && sampleRate >= 16000);
         lastAppliedFecOffset = -1;
         lastAppliedFecHi     = -1;
@@ -90,11 +101,11 @@ namespace TelephonyDSP {
         EVS_EncOptions opts;
         evs_enc_options_init(&opts);
         opts.dtx_enable       = 1;
-        opts.dtx_sid_interval = 0;
+        opts.dtx_sid_interval = dtxSidInterval;
         opts.rf_enable        = (bitrateBps == EVS_BR_13200 && sampleRate >= 16000) ? 1 : 0;
         opts.rf_fec_offset   = 0;     // use FEC_OFFSET default (3)
         opts.rf_fec_hi       = 1;
-        opts.sc_vbr_enable    = 0;
+        opts.sc_vbr_enable    = scVbrEnabled ? 1 : 0;
         const bool rfOk = (opts.rf_enable == 1);
         rfActive             = rfOk;
         lastAppliedFecOffset = -1;    // force first apply
@@ -120,6 +131,24 @@ namespace TelephonyDSP {
         // API does not expose a packet-loss-percent or FEC-offset
         // control, and the queue already observes loss via the
         // caller's `packetLost` flag.
+    }
+
+    void EVSCodecJbm::setDtxSidInterval(int interval) {
+        // Same normalization as the ctor: 0 (variable) or 3..100 (fixed
+        // frames). Anything else collapses to 0 so evs_enc_create_ex never
+        // rejects the new configuration.
+        const int normalized = (interval == 0) ? 0
+                              : ((interval >= 3 && interval <= 100) ? interval : 0);
+        if (normalized == dtxSidInterval) {
+            return;
+        }
+        dtxSidInterval = normalized;
+        // The encoder was created with the previous dtx_sid_interval; the
+        // only way to push a new value is to tear it down and recreate it
+        // through reset(), which re-reads dtxSidInterval. reset() also
+        // rebuilds the JBM, which is fine because dtx_sid_interval does
+        // not feed any JBM state.
+        reset();
     }
 
     int EVSCodecJbm::jbmArrivalOffsetMs() {
@@ -320,12 +349,16 @@ namespace TelephonyDSP {
     // experimental mode is hidden by distributionSafeMode. The stub
     // mirrors EVSCodec's distribution path: no external API calls,
     // pass-through behaviour, no JBM handle, no encoder handle.
-    EVSCodecJbm::EVSCodecJbm(int sampleRate, int, EVS_Bandwidth)
+    EVSCodecJbm::EVSCodecJbm(int sampleRate, int, EVS_Bandwidth, int dtxSidInterval, bool scVbrEnabled)
         : sampleRate(sampleRate), bitrateBps(0), maxBw(EVS_SWB),
+          dtxSidInterval(0), scVbrEnabled(scVbrEnabled),
           enc(nullptr), rx(nullptr), frameIndex(0), rtpSeq(0),
           jbmQueue(), jbmLcg(0x9E3779B9u),
           cfgPacketLossRate(0.0f), cfgNetworkDegradation(0.0f),
           rfActive(false), lastAppliedFecOffset(-1), lastAppliedFecHi(-1) {
+        // Same normalization as the real path: 0 or 3..100 only.
+        dtxSidInterval = (dtxSidInterval == 0) ? 0
+                       : ((dtxSidInterval >= 3 && dtxSidInterval <= 100) ? dtxSidInterval : 0);
         fallbackPLC.reset(getFrameSize());
         jbmQueue.reserve(kMaxQueueSize);
     }
@@ -346,6 +379,13 @@ namespace TelephonyDSP {
         // Distribution stub: clamp + store only, no queue behaviour.
         cfgPacketLossRate     = std::clamp(packetLossRate, 0.0f, 0.95f);
         cfgNetworkDegradation = std::clamp(networkDegradation, 0.0f, 1.0f);
+    }
+    void EVSCodecJbm::setDtxSidInterval(int interval) {
+        // Distribution stub: no encoder to push into, but keep the
+        // stored value in sync with the real path so a build-flipped
+        // binary state stays consistent.
+        dtxSidInterval = (interval == 0) ? 0
+                       : ((interval >= 3 && interval <= 100) ? interval : 0);
     }
     void EVSCodecJbm::processFrame(const int16_t* in, int16_t* out, bool packetLost) {
         const int fs = getFrameSize();

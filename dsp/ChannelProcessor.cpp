@@ -19,7 +19,10 @@ namespace TelephonyDSP {
           paramPacketLossRate(0.0f), paramNetworkDegradation(0.0f),
           packetLossSeed(0x12345678u), packetLossBurstFrames(0),
           evsSampleRate(32000), evsBitrateBps(EVS_BR_13200), evsMaxBandwidth(EVS_SWB),
-          downMaxInLen(0), upMaxInLen(0)
+          evsDtxSidInterval(0),
+          downMaxInLen(0), upMaxInLen(0),
+          amrWbMode(2), // 12.65 kbps; matches AMRWBCodec's own default.
+          evsOpusBitrateBps(24000) // default Opus target bitrate (24 kbps).
     {
         size_t bigSize = 131072;
         ringCodecIn.resize(bigSize);
@@ -74,7 +77,149 @@ namespace TelephonyDSP {
         }
     }
 
-void ChannelProcessor::configure(bool artifacts, float amount, float packetLossRate, float networkDegradation) {
+    void ChannelProcessor::setOpusBandwidth(int bw) {
+        // Cache first so mode changes that haven't rebuilt an OpusCodec
+        // yet (and therefore can't push the value into a live encoder)
+        // still pick the caller's preference up on the next recreateCodec()
+        // pass. If we do have a live OpusCodec right now, push the new
+        // cap directly so the change takes effect on the very next frame.
+        opusBandwidth = bw;
+        if (codec) {
+            OpusCodec* oc = dynamic_cast<OpusCodec*>(codec.get());
+            if (oc) {
+                oc->setMaxBandwidth(opusBandwidth);
+            }
+        }
+    }
+
+    void ChannelProcessor::setEvsDtxSidInterval(int interval) {
+        // Mirror the codec's own validation: 0 (variable) or 3..100
+        // (fixed frames). Anything else collapses to 0 to keep the legacy
+        // behaviour and to avoid a configuration rejection.
+        const int normalized = (interval == 0) ? 0
+                              : ((interval >= 3 && interval <= 100) ? interval : 0);
+        evsDtxSidInterval = normalized;
+        // Push the new value into the live codec if it is an EVS variant.
+        // dynamic_cast is safe because EVSCodec / EVSCodecJbm are the only
+        // codecs that expose setDtxSidInterval(); other codecs (AMR, G.711,
+        // GSM, Opus) keep their previous behaviour.
+        if (codec) {
+            if (auto* evs = dynamic_cast<EVSCodec*>(codec.get())) {
+                evs->setDtxSidInterval(normalized);
+            }
+#if TELEPHONY_USE_EVS_JBM
+            else if (auto* evsJbm = dynamic_cast<EVSCodecJbm*>(codec.get())) {
+                evsJbm->setDtxSidInterval(normalized);
+            }
+#endif
+        }
+    }
+
+    void ChannelProcessor::setEvsScVbrEnabled(bool enable) {
+        evsScVbrEnabled = enable;
+        if (auto* evs = dynamic_cast<EVSCodec*>(codec.get())) {
+            evs->setScVbrEnabled(enable);
+        }
+#if TELEPHONY_USE_EVS_JBM
+        if (auto* evsJbm = dynamic_cast<EVSCodecJbm*>(codec.get())) {
+            evsJbm->setScVbrEnabled(enable);
+        }
+#endif
+    }
+
+    void ChannelProcessor::setAmrNbMode(int mode) {
+        // Clamp here too so the stashed value is always in range, even if
+        // a future caller bypasses AMRNBCodec's own clamping.
+        const int clamped = mode < 0 ? 0 : (mode > 7 ? 7 : mode);
+        if (amrNbMode == clamped) return;
+        amrNbMode = clamped;
+        // Always rebuild the active AMR_NB_3G codec so the freshly
+        // constructed AMRNBCodec picks up the new mode. The change is
+        // stashed for non-AMR_NB_3G modes and applied the next time
+        // recreateCodec() builds an AMRNBCodec.
+        if (currentMode == EraMode::AMR_NB_3G) {
+            recreateCodec();
+            ringCodecIn.reset(); ringCodecOut.reset();
+        }
+    }
+
+    void ChannelProcessor::setG711Law(int law) {
+        evsG711Law = law;
+        // If the active codec is a G.711 codec, push the new law flag through
+        // in place; otherwise the change is remembered in evsG711Law and picked
+        // up the next time recreateCodec() builds a G.711 codec.
+        if (codec) {
+            G711Codec* g711 = dynamic_cast<G711Codec*>(codec.get());
+            if (g711) {
+                g711->setLaw(law > 0);
+            }
+        }
+        if (currentMode == EraMode::PSTN_G711) {
+            // Rebuild so the freshly-created G711Codec is constructed with the
+            // new evsG711Law flag and resampler/buffer state is consistent.
+            recreateCodec();
+        }
+    }
+
+    void ChannelProcessor::setAmrWbMode(int mode) {
+        // Clamp here too so the stashed value is always in range, even if
+        // a future caller bypasses AMRWBCodec's own clamping.
+        const int clamped = mode < 0 ? 0 : (mode > 8 ? 8 : mode);
+        if (amrWbMode == clamped) return;
+        amrWbMode = clamped;
+        // If the active codec is an AMR-WB codec, push the new mode
+        // through in place (its setMode() also resets encoder state);
+        // otherwise the change is remembered in amrWbMode and picked up
+        // the next time recreateCodec() builds an AMRWBCodec.
+        if (codec) {
+            AMRWBCodec* amrWb = dynamic_cast<AMRWBCodec*>(codec.get());
+            if (amrWb) {
+                amrWb->setMode(amrWbMode);
+            }
+        }
+        if (currentMode == EraMode::AMR_WB_VOLTE) {
+            // Rebuild so the freshly-created AMRWBCodec is constructed
+            // with the new amrWbMode and resampler/buffer state is
+            // consistent. AMRWBCodec::setMode() already resets the
+            // encoder state for the in-place path above, so we only
+            // need the full recreateCodec() for the case where no live
+            // codec was attached.
+            recreateCodec();
+            ringCodecIn.reset(); ringCodecOut.reset();
+        }
+    }
+
+    void ChannelProcessor::setOpusBitrate(int bps) {
+        // Cache first so mode changes that haven't rebuilt an OpusCodec
+        // yet (and therefore can't push the value into a live encoder)
+        // still pick the caller's preference up on the next recreateCodec()
+        // pass. Clamp here so the stashed value is always within Opus's
+        // legal OPUS_BITRATE_MIN..OPUS_BITRATE_MAX (6..510000) range.
+        const int clamped = bps < 6 ? 6 : (bps > 510000 ? 510000 : bps);
+        evsOpusBitrateBps = clamped;
+        // If a live OpusCodec is attached, push the new bitrate through
+        // OpusCodec::setBitrate() so the change takes effect on the very
+        // next frame (and OPUS_SET_BITRATE is re-issued on the encoder).
+        if (codec) {
+            OpusCodec* oc = dynamic_cast<OpusCodec*>(codec.get());
+            if (oc) {
+                oc->setBitrate(evsOpusBitrateBps);
+            }
+        }
+        if (currentMode == EraMode::OPUS_VOIP) {
+            // The current OpusCodec's bitstream buffer is sized in the
+            // ctor against the original sample rate and an assumed upper
+            // bitrate; for a small (e.g. 6 kbps) target the existing
+            // buffer is still comfortably oversized. We rebuild anyway
+            // so a future rate change can't strand a too-small buffer
+            // and so the encoder state is consistent with the new
+            // target bitrate.
+            recreateCodec();
+            ringCodecIn.reset(); ringCodecOut.reset();
+        }
+    }
+
+ void ChannelProcessor::configure(bool artifacts, float amount, float packetLossRate, float networkDegradation) {
         const float clampedLoss = std::clamp(packetLossRate, 0.0f, 0.95f);
         const float clampedDegradation = std::clamp(networkDegradation, 0.0f, 1.0f);
         const bool networkChanged = std::fabs(paramNetworkDegradation - clampedDegradation) > 0.0001f;
@@ -323,10 +468,10 @@ void ChannelProcessor::reset() {
 void ChannelProcessor::recreateCodec() {
         codec.reset();
         switch (currentMode) {
-            case EraMode::PSTN_G711: codec = std::make_unique<G711Codec>(8000); break;
+            case EraMode::PSTN_G711: codec = std::make_unique<G711Codec>(8000, evsG711Law > 0); break;
             case EraMode::GSM_FR: codec = std::make_unique<GSMCodec>(); break;
-            case EraMode::AMR_NB_3G: codec = std::make_unique<AMRNBCodec>(); break;
-            case EraMode::AMR_WB_VOLTE: codec = std::make_unique<AMRWBCodec>(); break;
+            case EraMode::AMR_NB_3G: codec = std::make_unique<AMRNBCodec>(true, amrNbMode); break;
+            case EraMode::AMR_WB_VOLTE: codec = std::make_unique<AMRWBCodec>(true, amrWbMode); break;
             case EraMode::EVS_LIKE:
                 codecFrameF.resize(32000 / 50);
                 codecFrameSIn.resize(32000 / 50);
@@ -334,20 +479,25 @@ void ChannelProcessor::recreateCodec() {
                 simulatedPathPLC.reset(32000 / 50);
                 return;
             case EraMode::EVS_NATIVE:
-                codec = std::make_unique<EVSCodec>(evsSampleRate, evsBitrateBps, evsMaxBandwidth);
+                codec = std::make_unique<EVSCodec>(evsSampleRate, evsBitrateBps, evsMaxBandwidth,
+                                                   evsScVbrEnabled, evsDtxSidInterval);
                 break;
 #if TELEPHONY_USE_EVS_JBM
             case EraMode::EVS_JBM:
                 // EVSCodecJbm runs the real EVS encoder + Stage-1 JBM
                 // in one ICodec. See the class header comment in
                 // TelephonyDSP.h for the full design.
-                codec = std::make_unique<EVSCodecJbm>(evsSampleRate, evsBitrateBps, evsMaxBandwidth);
+                codec = std::make_unique<EVSCodecJbm>(evsSampleRate, evsBitrateBps, evsMaxBandwidth,
+                                                     evsDtxSidInterval);
                 break;
 #endif
 #if TELEPHONY_EXPERIMENTAL_NETWORK
             case EraMode::OPUS_VOIP:
                 // 48 kHz, 24 kbps, complexity 6 (moderate). See OpusCodec.
-                codec = std::make_unique<OpusCodec>(48000, 24000, 6);
+                // The 4th argument carries the caller's OPUS_BANDWIDTH_*
+                // cap (default 1105 = FB) so a live setOpusBandwidth()
+                // change is honored on the very next codec rebuild.
+                codec = std::make_unique<OpusCodec>(48000, 24000, 6, opusBandwidth);
                 break;
 #endif
             default: break;

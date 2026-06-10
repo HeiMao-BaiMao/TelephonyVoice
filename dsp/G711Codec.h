@@ -14,13 +14,19 @@ namespace TelephonyDSP {
 
     class G711Codec : public ICodec {
     public:
-        G711Codec(int sampleRate);
+        // useAlaw: false (default) selects G.711 mu-law, true selects G.711 A-law.
+        G711Codec(int sampleRate, bool useAlaw = false);
+        // Switch between mu-law (false) and A-law (true) without recreating the codec.
+        void setLaw(bool useAlaw);
+        // Returns true if the codec is currently configured to use A-law.
+        bool isAlaw() const { return useAlaw; }
         void reset() override;
         int getSampleRate() const override { return sampleRate; }
         int getFrameSize() const override { return sampleRate / 50; }
         void processFrame(const int16_t* in, int16_t* out, bool packetLost) override;
     private:
         int sampleRate;
+        bool useAlaw;
         WaveformConcealer plc;
     };
 

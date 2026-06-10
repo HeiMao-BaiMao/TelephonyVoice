@@ -21,7 +21,14 @@ namespace Vst {
         kParamEvsSampleRate,
         kParamEvsBitrate,
         kParamEvsMaxBw,
-        kParamDegradationSegment
+        kParamDegradationSegment,
+        kParamAmrWbMode,
+        kParamOpusBandwidth,         // OPUS_BANDWIDTH_* (1101..1105); default FB
+        kParamAmrNbMode,             // AMR-NB mode 0..7; default 7 (12.2 kbps)
+        kParamG711Law,               // 0 = mu-law, 1 = A-law
+        kParamEvsDtxSidInterval,     // 0 = variable SID, 3..100 = fixed frames
+        kParamEvsScVbr,              // EVS Source-Controlled VBR toggle
+        kParamOpusBitrate            // Opus target bitrate in bps (6..510000)
     };
 
     // --------------------------------------------------------------------------
@@ -59,6 +66,13 @@ namespace Vst {
         int32 currentEvsSampleRate;
         int32 currentEvsBitrate;
         int32 currentEvsMaxBw;
+        int32 currentOpusBandwidth;  // OPUS_BANDWIDTH_* (1101..1105); default FB
+        int32 currentOpusBitrate;    // Opus target bitrate in bps; default 24000
+        int32 currentAmrNbMode;       // AMR-NB mode 0..7; default 7 (12.2 kbps)
+        int32 currentAmrWbMode;       // AMR-WB mode 0..8; default 2 (12.65 kbps)
+        int32 currentG711Law;         // 0 = mu-law (default), 1 = A-law
+        int32 currentEvsDtxSidInterval; // 0 = variable SID (default), 3..100 = fixed frames
+        int32 currentEvsScVbr;        // 0 = SC-VBR off (default), 1 = SC-VBR on
         float currentDryWet;
         float currentOutGain;
         bool currentArtifactsEnabled;

@@ -38,7 +38,9 @@ const char* getModeSuffix(TelephonyDSP::EraMode mode) {
 }
 
 void processFile(const std::string& inputFile, TelephonyDSP::EraMode mode,
-                 int evsSr, int evsBr, EVS_Bandwidth evsBw) {
+                 int evsSr, int evsBr, EVS_Bandwidth evsBw, int amrNbMode,
+                 int amrWbMode, int dtxSidInterval, int g711Law, bool evsScVbr,
+                 int opusBw, int opusBr) {
     std::string outputFile = getOutputFilename(inputFile, getModeSuffix(mode));
     std::cout << "Processing " << getModeSuffix(mode) << " -> " << outputFile << "..." << std::endl;
 
@@ -76,12 +78,42 @@ void processFile(const std::string& inputFile, TelephonyDSP::EraMode mode,
         // EVS config driven by CLI flags (defaults: SWB 32 kHz, 13.2 kbps).
         dsp.setEVSConfig(evsSr, evsBr, evsBw);
     }
+    // EVS DTX SID update interval (0 = variable, 3..100 = fixed frames).
+    // Pushed for every mode: ChannelProcessor::setEvsDtxSidInterval is a
+    // no-op for non-EVS modes, so the worst that happens is the value
+    // gets cached and applied next time the user switches to EVS.
+    dsp.setEvsDtxSidInterval(dtxSidInterval);
+    // Push the AMR-NB mode regardless of the active mode: the value is
+    // stashed in every ChannelProcessor and picked up next time the
+    // processor is in AMR_NB_3G mode. This way the user can combine
+    // --amr-nb-mode with --mode 3g, but it also doesn't hurt to set it
+    // for other modes (ChannelProcessor clamps and ignores it).
+    dsp.setAmrNbMode(amrNbMode);
+    // Same logic for the AMR-WB mode (0..8): cached in every
+    // ChannelProcessor and applied the next time the user picks
+    // AMR_WB_VOLTE. Safe to set regardless of the active mode.
+    dsp.setAmrWbMode(amrWbMode);
+
 #if TELEPHONY_USE_EVS_JBM
     if (mode == TelephonyDSP::EraMode::EVS_JBM) {
         // Same CLI-driven config as EVS_NATIVE.
         dsp.setEVSConfig(evsSr, evsBr, evsBw);
     }
 #endif
+    dsp.setG711Law(g711Law);
+    // EVS Source-Controlled VBR. Cached on every ChannelProcessor and
+    // applied the next time EVS_NATIVE / EVS_JBM rebuilds its codec.
+    // No-op for non-EVS modes.
+    dsp.setEvsScVbrEnabled(evsScVbr);
+    // Push the OPUS_BANDWIDTH_* cap regardless of the active mode: the
+    // value is cached in every ChannelProcessor and picked up next time
+    // the processor is in OPUS_VOIP mode. Safe for non-Opus modes
+    // because the value is just stashed.
+    dsp.setOpusBandwidth(opusBw);
+    // Same for the Opus target bitrate (6..510000 bps): cached in
+    // every ChannelProcessor and applied the next time the user
+    // picks OPUS_VOIP. No-op for non-Opus modes.
+    dsp.setOpusBitrate(opusBr);
     dsp.setParameters(1.0f, 0.0f, false, 0.0f);
     dsp.setSimulateLatency(false); // Disable artificial 100ms latency for runner
 
@@ -187,6 +219,30 @@ static bool parseBandwidth(const char* s, EVS_Bandwidth& out) {
     return false;
 }
 
+// String -> OPUS_BANDWIDTH_* constant. The Opus bandwidth values
+// (1101..1105) are part of the stable public ABI, so we hard-code them
+// here to avoid pulling <opus.h> into the CLI parser. Returns false for
+// any unrecognized token.
+static bool parseOpusBandwidth(const char* s, int& out) {
+    if (std::strcmp(s, "NB")  == 0) { out = 1101; return true; } // OPUS_BANDWIDTH_NARROWBAND
+    if (std::strcmp(s, "MB")  == 0) { out = 1102; return true; } // OPUS_BANDWIDTH_MEDIUMBAND
+    if (std::strcmp(s, "WB")  == 0) { out = 1103; return true; } // OPUS_BANDWIDTH_WIDEBAND
+    if (std::strcmp(s, "SWB") == 0) { out = 1104; return true; } // OPUS_BANDWIDTH_SUPERWIDEBAND
+    if (std::strcmp(s, "FB")  == 0) { out = 1105; return true; } // OPUS_BANDWIDTH_FULLBAND
+    return false;
+}
+
+static const char* opusBandwidthToString(int bw) {
+    switch (bw) {
+        case 1101: return "NB";
+        case 1102: return "MB";
+        case 1103: return "WB";
+        case 1104: return "SWB";
+        case 1105: return "FB";
+        default:   return "FB";
+    }
+}
+
 static bool parseModeString(const char* s, TelephonyDSP::EraMode& out) {
     if (std::strcmp(s, "g711")      == 0) { out = TelephonyDSP::EraMode::PSTN_G711;     return true; }
     if (std::strcmp(s, "gsm")       == 0) { out = TelephonyDSP::EraMode::GSM_FR;        return true; }
@@ -224,8 +280,24 @@ static void printUsage(const char* prog) {
         << "  --evs-br 5900|7200|8000|9600|13200|16400|24400|32000|48000|64000|96000|128000\n"
         << "                                      EVS bitrate in bps (default 13200)\n"
         << "  --evs-bw NB|WB|SWB|FB              EVS max bandwidth (default SWB)\n"
+        << "  --evs-dtx-sid-interval N            EVS DTX SID update interval in 20 ms frames\n"
+        << "                                      (0 = variable [default], 3..100 = fixed).\n"
+        << "                                      Only affects evs_native and evs_jbm.\n"
+        << "  --evs-sc-vbr                        Enable EVS Source-Controlled VBR (default off).\n"
+        << "                                      Only affects evs_native and evs_jbm.\n"
         << "  --mode g711|gsm|3g|volte|evs_like|evs_native|evs_jbm|opus_voip\n"
         << "                                      Process only this single mode (default: all)\n"
+        << "  --g711-law ulaw|alaw                G.711 companding law for the g711 mode\n"
+        << "                                      (default: ulaw). Only affects the g711 path.\n"
+        << "  --amr-nb-mode N                     AMR-NB bitrate mode 0..7 (default 7 = 12.2 kbps).\n"
+        << "                                      Only affects the 3g path.\n"
+        << "  --amr-wb-mode N                     AMR-WB bitrate mode 0..8 (default 2 = 12.65 kbps).\n"
+        << "                                      Only affects the volte path.\n"
+        << "  --opus-bw NB|MB|WB|SWB|FB           Opus max bandwidth cap (default FB)\n"
+        << "                                      (NB=4kHz, MB=6kHz, WB=8kHz, SWB=12kHz, FB=20kHz).\n"
+        << "                                      Only affects the opus_voip path.\n"
+        << "  --opus-bitrate BPS                  Opus target bitrate in bps (6..510000,\n"
+        << "                                      default 24000). Only affects opus_voip.\n"
         << "  --help                              Show this help and exit\n"
         << "\n"
         << "If no --mode is given, all available modes are processed in order.\n"
@@ -242,6 +314,16 @@ int main(int argc, char* argv[]) {
     int evsSr = 32000;
     int evsBr = 13200; // EVS_BR_13200
     EVS_Bandwidth evsBw = EVS_SWB;
+    int g711Law = 0; // 0 = mu-law, 1 = A-law
+    // Opus OPUS_BANDWIDTH_* cap; defaults to FB (20 kHz) which matches
+    // Opus's own default. The values are the public Opus bandwidth
+    // constants (1101..1105).
+    int opusBw = 1105; // OPUS_BANDWIDTH_FULLBAND
+    int opusBr = 24000; // Opus target bitrate in bps; matches Opus's own default.
+    int amrNbMode = 7;  // AMR-NB 12.2 kbps (MR122); matches AMRNBCodec's default.
+    int amrWbMode = 2;  // AMR-WB 12.65 kbps; matches AMRWBCodec's default.
+    int dtxSidInterval = 0; // 0 = variable SID (codec default).
+    bool evsScVbr = false;  // EVS Source-Controlled VBR is opt-in.
     bool modeFilterSet = false;
     TelephonyDSP::EraMode modeFilter = TelephonyDSP::EraMode::PSTN_G711;
     std::string inputFile;
@@ -290,6 +372,28 @@ int main(int argc, char* argv[]) {
                 return 1;
             }
         }
+        else if (std::strcmp(a, "--evs-dtx-sid-interval") == 0) {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: --evs-dtx-sid-interval requires a value\n";
+                printUsage(argv[0]);
+                return 1;
+            }
+            dtxSidInterval = std::atoi(argv[++i]);
+            // 0 = variable SID; 3..100 = fixed frames. The codec
+            // implementation also accepts 1..2 but normalizes them to
+            // 0 (no DTX) -- reject them here so the CLI is explicit
+            // about that behavior.
+            if (dtxSidInterval < 0 || dtxSidInterval > 100
+                || (dtxSidInterval >= 1 && dtxSidInterval <= 2)) {
+                std::cerr << "Error: invalid --evs-dtx-sid-interval value: "
+                          << dtxSidInterval
+                          << " (allowed: 0 or 3..100; 1..2 is rejected)\n";
+                return 1;
+            }
+        }
+        else if (std::strcmp(a, "--evs-sc-vbr") == 0) {
+            evsScVbr = true;
+        }
         else if (std::strcmp(a, "--mode") == 0) {
             if (i + 1 >= argc) {
                 std::cerr << "Error: --mode requires a value\n";
@@ -302,6 +406,73 @@ int main(int argc, char* argv[]) {
                 return 1;
             }
             modeFilterSet = true;
+        }
+        else if (std::strcmp(a, "--g711-law") == 0) {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: --g711-law requires a value\n";
+                printUsage(argv[0]);
+                return 1;
+            }
+            const char* lawArg = argv[++i];
+            if (std::strcmp(lawArg, "ulaw") == 0 || std::strcmp(lawArg, "mu-law") == 0 || std::strcmp(lawArg, "mulaw") == 0) {
+                g711Law = 0;
+            } else if (std::strcmp(lawArg, "alaw") == 0 || std::strcmp(lawArg, "A-law") == 0) {
+                g711Law = 1;
+            } else {
+                std::cerr << "Error: invalid --g711-law value: " << lawArg
+                          << " (allowed: ulaw, alaw)\n";
+                return 1;
+            }
+        }
+        else if (std::strcmp(a, "--amr-nb-mode") == 0) {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: --amr-nb-mode requires a value\n";
+                printUsage(argv[0]);
+                return 1;
+            }
+            amrNbMode = std::atoi(argv[++i]);
+            if (amrNbMode < 0 || amrNbMode > 7) {
+                std::cerr << "Error: invalid --amr-nb-mode value: " << amrNbMode
+                          << " (allowed: 0..7)\n";
+                return 1;
+            }
+        }
+        else if (std::strcmp(a, "--amr-wb-mode") == 0) {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: --amr-wb-mode requires a value\n";
+                printUsage(argv[0]);
+                return 1;
+            }
+            amrWbMode = std::atoi(argv[++i]);
+            if (amrWbMode < 0 || amrWbMode > 8) {
+                std::cerr << "Error: invalid --amr-wb-mode value: " << amrWbMode
+                          << " (allowed: 0..8)\n";
+                return 1;
+            }
+        }
+        else if (std::strcmp(a, "--opus-bw") == 0) {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: --opus-bw requires a value\n";
+                printUsage(argv[0]);
+                return 1;
+            }
+            if (!parseOpusBandwidth(argv[++i], opusBw)) {
+                std::cerr << "Error: invalid --opus-bw value (allowed: NB, MB, WB, SWB, FB)\n";
+                return 1;
+            }
+        }
+        else if (std::strcmp(a, "--opus-bitrate") == 0) {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: --opus-bitrate requires a value\n";
+                printUsage(argv[0]);
+                return 1;
+            }
+            opusBr = std::atoi(argv[++i]);
+            if (opusBr < 6 || opusBr > 510000) {
+                std::cerr << "Error: invalid --opus-bitrate value: " << opusBr
+                          << " (allowed: 6..510000)\n";
+                return 1;
+            }
         }
         else if (a[0] == '-' && a[1] == '-') {
             std::cerr << "Error: unknown flag: " << a << "\n";
@@ -349,7 +520,8 @@ int main(int argc, char* argv[]) {
 
     for (auto mode : modes) {
         if (modeFilterSet && mode != modeFilter) continue;
-        processFile(inputFile, mode, evsSr, evsBr, evsBw);
+        processFile(inputFile, mode, evsSr, evsBr, evsBw, amrNbMode, amrWbMode,
+                    dtxSidInterval, g711Law, evsScVbr, opusBw, opusBr);
     }
     return 0;
 }

@@ -11,7 +11,9 @@ namespace TelephonyDSP {
     public:
         EVSCodecJbm(int sampleRate = 32000,
                     int bitrateBps = EVS_BR_13200,
-                    EVS_Bandwidth maxBw = EVS_SWB);
+                    EVS_Bandwidth maxBw = EVS_SWB,
+                    int dtxSidInterval = 0,
+                    bool scVbrEnabled = false);
         ~EVSCodecJbm() override;
         void reset() override;
         int getSampleRate() const override { return sampleRate; }
@@ -29,10 +31,33 @@ namespace TelephonyDSP {
         int getBitrate() const { return bitrateBps; }
         EVS_Bandwidth getMaxBandwidth() const { return maxBw; }
 
+        // Update the DTX SID update interval. 0 = variable (codec default,
+        // promoted internally to ~12 frames by init_encoder). 3..100 = fixed
+        // SID update interval in 20 ms frames. Values outside the supported
+        // set are clamped to 0 to avoid evs_enc_create_ex rejecting the
+        // configuration. The new value is applied immediately by tearing
+        // down and re-creating the encoder through reset().
+        void setDtxSidInterval(int interval);
+
+        // Toggle EVS Source-Controlled VBR (sc_vbr_enable). The value is
+        // persisted on the instance and applied the next time reset() (or
+        // the ctor) builds the encoder, so callers do not need to time
+        // the call against the audio thread.
+        void setScVbrEnabled(bool enable) { scVbrEnabled = enable; reset(); }
+        bool getScVbrEnabled() const { return scVbrEnabled; }
+
     private:
         int sampleRate;
         int bitrateBps;
         EVS_Bandwidth maxBw;
+        // 0 = variable SID interval (default), 3..100 = fixed frames.
+        int dtxSidInterval;
+
+        // EVS Source-Controlled VBR toggle. Mirrored into the encoder's
+        // EVS_EncOptions every time the encoder is (re)created. Persisted
+        // across reset() so a later setScVbrEnabled() survives a session
+        // restart.
+        bool scVbrEnabled;
 
         // EVS encoder (real 3GPP reference via evs_api.c).
         EVS_Encoder* enc;

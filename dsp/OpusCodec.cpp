@@ -10,11 +10,12 @@ namespace TelephonyDSP {
     // OpusCodec
     // ---------------------------------------------------------------------------
 #if TELEPHONY_EXPERIMENTAL_NETWORK
-    OpusCodec::OpusCodec(int sr, int bitrate, int complexity)
+    OpusCodec::OpusCodec(int sr, int bitrate, int complexity, int maxBw)
         : sampleRate(sr)
         , bitrateBps(bitrate)
         , frameSize(sr / 50) // 20 ms
         , complexity(complexity)
+        , maxBandwidth(maxBw)
         , encoder(nullptr)
         , decoder(nullptr)
         , queue()
@@ -48,6 +49,10 @@ namespace TelephonyDSP {
             opus_encoder_ctl(enc, OPUS_SET_INBAND_FEC(1));
             opus_encoder_ctl(enc, OPUS_SET_PACKET_LOSS_PERC(0));
             opus_encoder_ctl(enc, OPUS_SET_DTX(1));
+            // Cap the audio bandwidth the encoder is allowed to use. Without
+            // this Opus defaults to FB (20 kHz) at 48 kHz input; we honor the
+            // caller's preference (typically set via setMaxBandwidth()).
+            opus_encoder_ctl(enc, OPUS_SET_MAX_BANDWIDTH(maxBandwidth));
             encoder = enc;
         }
 
@@ -109,7 +114,40 @@ namespace TelephonyDSP {
         OpusEncoder* enc = static_cast<OpusEncoder*>(encoder);
         opus_encoder_ctl(enc, OPUS_SET_INBAND_FEC(1));
         opus_encoder_ctl(enc, OPUS_SET_PACKET_LOSS_PERC(derivedPacketLossPercent()));
+        // Re-apply the user's chosen max bandwidth in case it changed
+        // (e.g. live setMaxBandwidth() call) and to keep this in lockstep
+        // with the other network-driven CTLs.
+        opus_encoder_ctl(enc, OPUS_SET_MAX_BANDWIDTH(maxBandwidth));
+        // Re-apply the cached target bitrate so a later setBitrate() call is
+        // honored even if applyNetworkCtls() runs for an unrelated reason
+        // (e.g. after configureNetwork() or recreateCodec()).
+        opus_encoder_ctl(enc, OPUS_SET_BITRATE(bitrateBps));
         // DTX stays off; see OpusCodec ctor comment.
+    }
+
+    void OpusCodec::setBitrate(int bps) {
+        // Opus's legal range per opus_defines.h is OPUS_BITRATE_MIN
+        // (6000) .. OPUS_BITRATE_MAX (510000). Clamp to that range so an
+        // out-of-range caller value (e.g. from automation or a typo in
+        // the host UI) cannot trigger an OPUS_BAD_ARG error from
+        // OPUS_SET_BITRATE.
+        const int clamped = std::clamp(bps, 6000, 510000);
+        bitrateBps = clamped;
+        if (encoder) {
+            opus_encoder_ctl(static_cast<OpusEncoder*>(encoder),
+                             OPUS_SET_BITRATE(bitrateBps));
+        }
+    }
+
+    void OpusCodec::setMaxBandwidth(int bw) {
+        // Cache the new value first so a subsequent encoder creation
+        // (e.g. reset() path) picks it up. If the encoder already exists
+        // we push the change immediately.
+        maxBandwidth = bw;
+        if (encoder) {
+            opus_encoder_ctl(static_cast<OpusEncoder*>(encoder),
+                             OPUS_SET_MAX_BANDWIDTH(maxBandwidth));
+        }
     }
 
     int OpusCodec::arrivalFrameFor(uint32_t seq) {
@@ -282,12 +320,14 @@ namespace TelephonyDSP {
     // Stub implementations keep TelephonyDSP compilable when the experimental
     // libraries are disabled (e.g. distribution build). OpusCodec instances
     // should never be created in that path; this is a defensive no-op.
-    OpusCodec::OpusCodec(int, int, int) : sampleRate(0), bitrateBps(0), frameSize(0), complexity(0), encoder(nullptr), decoder(nullptr) {
+    OpusCodec::OpusCodec(int, int, int, int maxBw) : sampleRate(0), bitrateBps(0), frameSize(0), complexity(0), maxBandwidth(maxBw), encoder(nullptr), decoder(nullptr) {
         fallbackPLC.reset(0);
     }
     OpusCodec::~OpusCodec() {}
     void OpusCodec::reset() { fallbackPLC.reset(frameSize); }
     void OpusCodec::configureNetwork(float, float) {}
+    void OpusCodec::setMaxBandwidth(int bw) { maxBandwidth = bw; }
+    void OpusCodec::setBitrate(int bps) { bitrateBps = bps; }
     void OpusCodec::processFrame(const int16_t* in, int16_t* out, bool) {
         const int fs = frameSize;
         std::memcpy(out, in, fs * sizeof(int16_t));

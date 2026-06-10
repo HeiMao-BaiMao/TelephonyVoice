@@ -15,6 +15,13 @@ namespace TelephonyDSP {
           paramPacketLossRate(0.0f), paramNetworkDegradation(0.0f),
           simulateLatency(true),
           evsSampleRate(32000), evsBitrateBps(EVS_BR_13200), evsMaxBandwidth(EVS_SWB),
+          opusBandwidth(1105), // OPUS_BANDWIDTH_FULLBAND; matches Opus's own default
+          opusBitrate(24000), // Opus target bitrate; matches Opus's own default.
+          amrNbMode(7),       // 12.2 kbps (MR122); matches AMRNBCodec's own default.
+          amrWbMode(2),       // 12.65 kbps; matches AMRWBCodec's own default.
+          g711Law(0),         // 0 = mu-law (US/Japan default).
+          evsScVbrEnabled(false), // SC-VBR is opt-in.
+          evsDtxSidInterval(0),   // 0 = variable SID (codec default).
           targetLatencySamples(0), inTotalSamples(0), outTotalSamples(0)
     {
         updateLatency();
@@ -53,6 +60,25 @@ namespace TelephonyDSP {
             auto& outputLeg = outputLegs[i];
             inputLeg->setEVSConfig(evsSampleRate, evsBitrateBps, evsMaxBandwidth);
             outputLeg->setEVSConfig(evsSampleRate, evsBitrateBps, evsMaxBandwidth);
+            // Keep the per-channel EVS DTX SID interval in sync so a later
+            // recreateCodec() (e.g. after a setMode) bakes the right value
+            // into the next EVS encoder.
+            inputLeg->setEvsDtxSidInterval(evsDtxSidInterval);
+            outputLeg->setEvsDtxSidInterval(evsDtxSidInterval);
+            // Mirror every other cached configuration knob to the new
+            // legs so ensureChannels() pickers up the current values.
+            inputLeg->setOpusBandwidth(opusBandwidth);
+            outputLeg->setOpusBandwidth(opusBandwidth);
+            inputLeg->setOpusBitrate(opusBitrate);
+            outputLeg->setOpusBitrate(opusBitrate);
+            inputLeg->setAmrNbMode(amrNbMode);
+            outputLeg->setAmrNbMode(amrNbMode);
+            inputLeg->setAmrWbMode(amrWbMode);
+            outputLeg->setAmrWbMode(amrWbMode);
+            inputLeg->setG711Law(g711Law);
+            outputLeg->setG711Law(g711Law);
+            inputLeg->setEvsScVbrEnabled(evsScVbrEnabled);
+            outputLeg->setEvsScVbrEnabled(evsScVbrEnabled);
 
             if (routeModelEnabled) {
                 inputLeg->setMode(endpointToMode(inputEndpoint));
@@ -104,6 +130,70 @@ namespace TelephonyDSP {
         evsMaxBandwidth = maxBw;
         for (auto& ch : inputLegs) ch->setEVSConfig(sampleRateHz, bitrateBps, maxBw);
         for (auto& ch : outputLegs) ch->setEVSConfig(sampleRateHz, bitrateBps, maxBw);
+    }
+
+    void SignalProcessor::setOpusBandwidth(int bw) {
+        // Cache at the SignalProcessor level so new legs created later
+        // (e.g. by ensureChannels) pick it up via the next applyRouteToChannels
+        // sweep. Existing legs get the value pushed immediately.
+        opusBandwidth = bw;
+        for (auto& ch : inputLegs) ch->setOpusBandwidth(bw);
+        for (auto& ch : outputLegs) ch->setOpusBandwidth(bw);
+    }
+
+    void SignalProcessor::setEvsDtxSidInterval(int interval) {
+        // Cache the value (applyRouteToChannels() will read it on the next
+        // pass) and forward it to every live ChannelProcessor so the value
+        // is applied to the currently attached codec (if any) immediately.
+        evsDtxSidInterval = interval;
+        for (auto& ch : inputLegs) ch->setEvsDtxSidInterval(interval);
+        for (auto& ch : outputLegs) ch->setEvsDtxSidInterval(interval);
+    }
+
+    void SignalProcessor::setAmrNbMode(int mode) {
+        // Clamp at the SignalProcessor boundary so the in-flight value is
+        // always within AMRNBCodec's 0..7 range; each ChannelProcessor
+        // also clamps independently. Cache the clamped value so new
+        // legs created later (via ensureChannels) pick it up.
+        const int clamped = mode < 0 ? 0 : (mode > 7 ? 7 : mode);
+        amrNbMode = clamped;
+        for (auto& ch : inputLegs)  ch->setAmrNbMode(clamped);
+        for (auto& ch : outputLegs) ch->setAmrNbMode(clamped);
+    }
+
+    void SignalProcessor::setAmrWbMode(int mode) {
+        // Clamp at the SignalProcessor boundary so the in-flight value is
+        // always within AMRWBCodec's 0..8 range; each ChannelProcessor
+        // also clamps independently. Cache the clamped value so new
+        // legs created later (via ensureChannels) pick it up.
+        const int clamped = mode < 0 ? 0 : (mode > 8 ? 8 : mode);
+        amrWbMode = clamped;
+        for (auto& ch : inputLegs)  ch->setAmrWbMode(clamped);
+        for (auto& ch : outputLegs) ch->setAmrWbMode(clamped);
+    }
+
+    void SignalProcessor::setG711Law(int law) {
+        // Cache so new legs created later (via ensureChannels) pick
+        // it up via applyRouteToChannels().
+        g711Law = law;
+        for (auto& ch : inputLegs) ch->setG711Law(law);
+        for (auto& ch : outputLegs) ch->setG711Law(law);
+    }
+
+    void SignalProcessor::setOpusBitrate(int bps) {
+        // Clamp here so the cached value is always within Opus's
+        // OPUS_BITRATE_MIN..OPUS_BITRATE_MAX (6..510000) range, even
+        // if a future caller bypasses the per-leg clamping.
+        const int clamped = bps < 6 ? 6 : (bps > 510000 ? 510000 : bps);
+        opusBitrate = clamped;
+        for (auto& ch : inputLegs)  ch->setOpusBitrate(clamped);
+        for (auto& ch : outputLegs) ch->setOpusBitrate(clamped);
+    }
+
+    void SignalProcessor::setEvsScVbrEnabled(bool enable) {
+        evsScVbrEnabled = enable;
+        for (auto& ch : inputLegs)  ch->setEvsScVbrEnabled(enable);
+        for (auto& ch : outputLegs) ch->setEvsScVbrEnabled(enable);
     }
 
     void SignalProcessor::setParameters(float dryWet, float outGaindB, bool artifacts, float artifactAmount,

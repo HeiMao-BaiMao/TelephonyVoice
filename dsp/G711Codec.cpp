@@ -2,8 +2,11 @@
 
 namespace TelephonyDSP {
 
-    G711Codec::G711Codec(int sr) : sampleRate(sr) {
+    G711Codec::G711Codec(int sr, bool useAlawFlag) : sampleRate(sr), useAlaw(useAlawFlag) {
         plc.reset(getFrameSize());
+    }
+    void G711Codec::setLaw(bool useAlawFlag) {
+        useAlaw = useAlawFlag;
     }
     void G711Codec::reset() {
         plc.reset(getFrameSize());
@@ -16,8 +19,13 @@ namespace TelephonyDSP {
         }
 
         for (int i = 0; i < fs; ++i) {
-            unsigned char u = linear2ulaw(in[i]);
-            out[i] = (int16_t)ulaw2linear(u);
+            if (useAlaw) {
+                unsigned char a = linear2alaw(in[i]);
+                out[i] = (int16_t)alaw2linear(a);
+            } else {
+                unsigned char u = linear2ulaw(in[i]);
+                out[i] = (int16_t)ulaw2linear(u);
+            }
         }
         plc.storeGoodFrame(out, fs);
     }

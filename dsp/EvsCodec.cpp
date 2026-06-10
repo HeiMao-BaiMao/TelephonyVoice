@@ -2,27 +2,32 @@
 
 namespace TelephonyDSP {
 
-    EVSCodec::EVSCodec(int sampleRate, int bitrateBps, EVS_Bandwidth maxBw)
+    EVSCodec::EVSCodec(int sampleRate, int bitrateBps, EVS_Bandwidth maxBw,
+                       bool scVbrEnabled, int dtxSidInterval)
         : sampleRate(sampleRate)
         , bitrateBps(bitrateBps)
         , maxBw(maxBw)
+        , scVbrEnabled(scVbrEnabled)
+        , dtxSidInterval(dtxSidInterval)
         , enc(nullptr)
         , dec(nullptr)
     {
         fallbackPLC.reset(getFrameSize());
 #ifndef TELEPHONY_DISTRIBUTION_BUILD
         // Non-distribution / personal build: enable the 3GPP EVS internal
-        // VAD/DTX/SID/CNG path. Variable SID update interval (0) lets the
-        // codec pick the per-frame interval, matching the reference CLI's
-        // default behaviour. Channel-aware mode (RF) and SC-VBR stay off:
-        // the EVS spec only allows RF at 13.2 kbps with >= 16 kHz input, and
-        // JBM/RTP-packet-loss handling remain future work (see README).
+        // VAD/DTX/SID/CNG path with a variable SID update interval (0 lets
+        // the codec pick the per-frame interval, matching the reference
+        // CLI's default behaviour). Channel-aware mode (RF) stays off: the
+        // EVS spec only allows RF at 13.2 kbps with >= 16 kHz input.
+        // SC-VBR (Source-Controlled VBR) is opt-in via the constructor
+        // flag and is also re-applied in reset() below. JBM/RTP-packet-loss
+        // handling remain future work (see README).
         EVS_EncOptions opts;
         evs_enc_options_init(&opts);
         opts.dtx_enable       = 1;
-        opts.dtx_sid_interval = 0;     // variable SID (see evs_api.h)
+        opts.dtx_sid_interval = dtxSidInterval;     // 0 = variable SID (see evs_api.h)
         opts.rf_enable        = 0;
-        opts.sc_vbr_enable    = 0;
+        opts.sc_vbr_enable    = scVbrEnabled ? 1 : 0;
         enc = evs_enc_create_ex(sampleRate, bitrateBps, maxBw, &opts);
         if (!enc) {
             // Refuse cleanly: if DTX is rejected for some reason (e.g. an
@@ -52,14 +57,30 @@ namespace TelephonyDSP {
         EVS_EncOptions opts;
         evs_enc_options_init(&opts);
         opts.dtx_enable       = 1;
-        opts.dtx_sid_interval = 0;
+        opts.dtx_sid_interval = dtxSidInterval;
         opts.rf_enable        = 0;
-        opts.sc_vbr_enable    = 0;
+        opts.sc_vbr_enable    = scVbrEnabled ? 1 : 0;
         enc = evs_enc_create_ex(sampleRate, bitrateBps, maxBw, &opts);
         if (!enc) {
             enc = evs_enc_create(sampleRate, bitrateBps, maxBw);
         }
 #endif
+    }
+
+    void EVSCodec::setDtxSidInterval(int interval) {
+        // Same normalization as the ctor: 0 (variable) or 3..100 (fixed
+        // frames). Anything else collapses to 0 so evs_enc_create_ex never
+        // rejects the new configuration.
+        const int normalized = (interval == 0) ? 0
+                              : ((interval >= 3 && interval <= 100) ? interval : 0);
+        if (normalized == dtxSidInterval) {
+            return;
+        }
+        dtxSidInterval = normalized;
+        // The encoder was created with the previous dtx_sid_interval; the
+        // only way to push a new value is to tear it down and recreate it
+        // through reset(), which re-reads dtxSidInterval.
+        reset();
     }
 
 void EVSCodec::processFrame(const int16_t* in, int16_t* out, bool packetLost) {
