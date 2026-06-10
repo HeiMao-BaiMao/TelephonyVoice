@@ -119,7 +119,17 @@ Internally those user-facing endpoints map to codec-era modes:
   single `ICodec`. The `EVS_JBM` mode is now reachable from
   `TelephonyRunner` (suffix `evs_jbm`) when `TELEPHONY_USE_EVS_JBM=ON`,
   gated by the same CMake option. The mode is **not** exposed in the VST
-  UI.
+  UI. `EVSCodecJbm` now also runs a small deterministic
+  packet-arrival / jitter queue between the encoder and the JBM: each
+  encoded AU is stamped with a `recvMs = rtpTsMs + offset` where the
+  offset comes from an LCG seeded from
+  `configureNetwork(networkDegradation)`; queue cap is 16, jitter window
+  scales linearly with `networkDegradation` (0 => no jitter, preserving
+  the previous direct-feed behaviour), and the queue is fed into the JBM
+  with its deterministic recv time exactly as the adapter's per-packet
+  wall clock. Offline renders remain deterministic (no real wall clock is
+  read), and no encoder CTLs are issued yet — only the queue +
+  `configureNetwork` plumbing. Still **not** exposed in the VST UI.
   * Raw AU contract: callers feed compact EVS access unit bytes
     (the same bit-packed payload the encoder produces); `au_bits_count` is
     in **bits** (not bytes) and must already be aligned to the codec frame
