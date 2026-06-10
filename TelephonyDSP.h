@@ -613,6 +613,15 @@ class ICodec {
         size_t getAvailableOutput() const;
         void configure(bool artifacts, float amount, float packetLossRate, float networkDegradation);
 
+        // Returns the cached energy-VAD speech probability in [0,1] for the
+        // most recent frame processed by SpeexDSPAux::runPreprocess(), or
+        // -1.0f ("unknown") when SpeexDSPAux is not present (e.g. in
+        // distribution builds or when the experimental helper was never
+        // configured for this codec). Forwards SpeexDSPAux's own "unknown"
+        // sentinel unchanged, so callers cannot accidentally treat a
+        // disabled VAD as "definitely not speech".
+        float getLastVadProb() const;
+
     private:
         double hostSampleRate;
         EraMode currentMode;

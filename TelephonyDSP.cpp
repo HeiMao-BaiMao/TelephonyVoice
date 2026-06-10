@@ -1387,6 +1387,11 @@ void ChannelProcessor::reset() {
         return outputBuffer.getReadAvailable();
     }
 
+    float ChannelProcessor::getLastVadProb() const {
+        if (!speexAux) return -1.0f;
+        return speexAux->getSpeechProbability();
+    }
+
     void ChannelProcessor::pushInput(const float* in, int numSamples) {
         if (currentMode == EraMode::Bypass) {
             outputBuffer.write(in, numSamples);
@@ -1685,7 +1690,15 @@ void ChannelProcessor::recreateCodec() {
              }
          }
 
-         // ---- Stage 2: codec/EVS_LIKE processing (unchanged) ----
+         // ---- Stage 2: codec/EVS_LIKE processing ----
+         // The SpeexDSPAux energy VAD now drives DTX for OPUS_VOIP and
+         // EVS_LIKE: when it classifies the current frame as silence, the
+         // effective `packetLost` flag is forced true so the codec path
+         // emits comfort noise (Opus's own CNG via DTX, the simulated
+         // path PLC for EVS_LIKE) instead of transmitting the silent
+         // frame. EVS_NATIVE / EVS_JBM have their own 3GPP VAD and are
+         // intentionally left alone; AMR / G.711 / GSM are not in the
+         // experimental network scope and are not touched here either.
          if (currentMode == EraMode::EVS_LIKE) {
              const int frameSize = 32000 / 50;
              while (ringCodecIn.getReadAvailable() >= (size_t)frameSize) {
@@ -1694,7 +1707,14 @@ void ChannelProcessor::recreateCodec() {
                      codecFrameSIn[i] = clampToInt16(codecFrameF[i] * 32767.0f);
                  }
 
-                 if (shouldDropPacket()) {
+                 // Run SpeexDSPAux (denoise + cached energy-VAD) on the
+                 // freshly-quantized int16 frame so lastFrameIsSpeech()
+                 // reflects *this* frame, not a previous one.
+                 if (speexAux) speexAux->runPreprocess(codecFrameSIn.data());
+                 const bool energyVadSilence =
+                     speexAux && !speexAux->lastFrameIsSpeech();
+
+                 if (shouldDropPacket() || energyVadSilence) {
                      simulatedPathPLC.conceal(codecFrameSOut.data(), frameSize);
                  } else {
                      std::memcpy(codecFrameSOut.data(), codecFrameSIn.data(), frameSize * sizeof(int16_t));
@@ -1711,7 +1731,21 @@ void ChannelProcessor::recreateCodec() {
              while (ringCodecIn.getReadAvailable() >= (size_t)frameSize) {
                  ringCodecIn.read(codecFrameF.data(), frameSize);
                  for(int i=0; i<frameSize; ++i) codecFrameSIn[i] = clampToInt16(codecFrameF[i] * 32767.0f);
-                 codec->processFrame(codecFrameSIn.data(), codecFrameSOut.data(), shouldDropPacket());
+
+                 bool packetLost = shouldDropPacket();
+                 // Energy-VAD-driven DTX is only wired into the
+                 // experimental OPUS_VOIP mode here; other codecs in the
+                 // generic branch (AMR, G.711, GSM) keep their existing
+                 // packet-loss-only behavior. EVS_NATIVE / EVS_JBM never
+                 // reach this branch (they have their own dispatch).
+                 if (currentMode == EraMode::OPUS_VOIP && speexAux) {
+                     speexAux->runPreprocess(codecFrameSIn.data());
+                     if (!speexAux->lastFrameIsSpeech()) {
+                         packetLost = true; // force Opus DTX/CNG
+                     }
+                 }
+
+                 codec->processFrame(codecFrameSIn.data(), codecFrameSOut.data(), packetLost);
                  for(int i=0; i<frameSize; ++i) codecFrameF[i] = codecFrameSOut[i] / 32768.0f;
                  ringCodecOut.write(codecFrameF.data(), frameSize);
              }
