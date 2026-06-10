@@ -346,7 +346,7 @@ What is wired up in this step:
   simulates packet arrivals with a base + degradation-dependent delay.
   Missing packets are concealed by in-band FEC (`decode_fec=1`) when the
   next packet is available, otherwise by Opus's built-in PLC; DTX stays
-  off until a real VAD story lands.
+  enabled via Opus's internal VAD.
 * `TelephonyDSP::SpeexDSPAux` wraps `speex_preprocess` so the denoise (and
   in the future VAD / AGC) primitives can be reached from
   `ChannelProcessor`. In this first step it is wired into `recreateCodec`

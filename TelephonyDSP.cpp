@@ -822,14 +822,12 @@ void EVSCodec::processFrame(const int16_t* in, int16_t* out, bool packetLost) {
             //   via in-band FEC when the next packet arrives.
             // - Packet loss percent starts at 0; configureNetwork() updates
             //   it from the network parameters.
-            // - DTX is intentionally OFF: Opus's DTX is driven by its own
-            //   internal VAD, which doesn't match what SpeexDSPAux reports
-            //   (and SpeexDSPAux's VAD is currently disabled). A future
-            //   iteration that re-enables SpeexDSPAux VAD can drive DTX
-            //   from there.
+            // - DTX is enabled via Opus's own internal VAD, which is
+            //   self-contained and well-tested, and independent of
+            //   SpeexDSPAux.
             opus_encoder_ctl(enc, OPUS_SET_INBAND_FEC(1));
             opus_encoder_ctl(enc, OPUS_SET_PACKET_LOSS_PERC(0));
-            opus_encoder_ctl(enc, OPUS_SET_DTX(0));
+            opus_encoder_ctl(enc, OPUS_SET_DTX(1));
             encoder = enc;
         }
 
