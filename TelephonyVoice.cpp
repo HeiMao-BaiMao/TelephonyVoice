@@ -23,8 +23,8 @@ namespace Vst {
 constexpr int32 kMaxExposedEndpoint = 2;
 constexpr int32 kDefaultOutputEndpoint = 2;
 #else
-constexpr int32 kMaxExposedEndpoint = 5;
-constexpr int32 kDefaultOutputEndpoint = 4;
+constexpr int32 kMaxExposedEndpoint = 6;
+constexpr int32 kDefaultOutputEndpoint = 5;
 #endif
 constexpr int32 kMaxDegradationSegment = 3;
 
@@ -46,6 +46,9 @@ TelephonyDSP::RouteEndpoint endpointFromParameter(int32 endpoint)
         case 3: return TelephonyDSP::RouteEndpoint::Mobile4G;
         case 4: return TelephonyDSP::RouteEndpoint::Mobile5G;
         case 5: return TelephonyDSP::RouteEndpoint::Mobile5GNative;
+#if TELEPHONY_USE_EVS_JBM
+        case 6: return TelephonyDSP::RouteEndpoint::Mobile5GJbm;
+#endif
         default: return TelephonyDSP::RouteEndpoint::FixedLine;
     }
 #endif
@@ -266,6 +269,9 @@ tresult PLUGIN_API TelephonyVoiceController::initialize(FUnknown* context)
         param->appendString(STR16("5G\u643a\u5e2f"));
 #ifndef TELEPHONY_DISTRIBUTION_BUILD
         param->appendString(STR16("5G\u643a\u5e2f (\u7cbe\u5bc6)"));
+#if TELEPHONY_USE_EVS_JBM
+        param->appendString(STR16("5G\u643a\u5e2f (JBM)"));
+#endif
 #endif
     };
 

@@ -1665,6 +1665,9 @@ void ChannelProcessor::recreateCodec() {
             case RouteEndpoint::Mobile4G:        return distributionSafeMode(EraMode::AMR_WB_VOLTE);
             case RouteEndpoint::Mobile5G:        return EraMode::EVS_LIKE;
             case RouteEndpoint::Mobile5GNative:  return distributionSafeMode(EraMode::EVS_NATIVE);
+#if TELEPHONY_USE_EVS_JBM
+            case RouteEndpoint::Mobile5GJbm:     return distributionSafeMode(EraMode::EVS_JBM);
+#endif
             default:                             return EraMode::Bypass;
         }
     }

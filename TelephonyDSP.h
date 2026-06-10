@@ -51,7 +51,10 @@ enum class EraMode {
         Mobile3G,
         Mobile4G,
         Mobile5G,
-        Mobile5GNative
+        Mobile5GNative,
+#if TELEPHONY_USE_EVS_JBM
+        Mobile5GJbm
+#endif
     };
 
     enum class DegradationSegment {
