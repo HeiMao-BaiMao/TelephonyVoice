@@ -119,6 +119,11 @@ Internally those user-facing endpoints map to codec-era modes:
     in **bits** (not bytes) and must already be aligned to the codec frame
     size; RTP timestamps from the wire must be converted to the JBM's 1 ms
     timeline before being fed into the receive adapter.
+  * When `TELEPHONY_USE_EVS_JBM=ON`, CMake also builds `EVSJbmSmoke`. It
+    validates the G.192 short-stream to compact MSB-first AU conversion through
+    `evs_rx_jbm_feed_frame` / `evs_rx_jbm_get_samples`, drains with
+    `evs_rx_jbm_is_empty` only at end-of-stream, checks non-zero decoded
+    energy and `evs_rx_jbm_get_fec_offset`, and uses only public parent APIs.
 * AMR-NB and AMR-WB encoders now enable their bundled 3GPP DTX/CNG path by
   default in normal / personal builds. `AMRNBCodec` initializes
   `Encoder_Interface_init(dtxEnabled ? 1 : 0)` (default `dtxEnabled = true`)
@@ -263,7 +268,7 @@ Implemented path:
 | Option                     | Default | Effect                                                                 |
 | -------------------------- | ------- | ---------------------------------------------------------------------- |
 | `TELEPHONY_USE_EVS_FX`     | OFF     | Build fixed-point EVS (TS 26.442) instead of float (TS 26.443).         |
-| `TELEPHONY_USE_EVS_JBM`    | OFF     | Build the experimental EVS Stage-1 JBM/VoIP receive adapter (`evs_api_rx`) around 3GPP `EvsRXlib`. Incompatible with `TELEPHONY_DISTRIBUTION_BUILD` and with `TELEPHONY_USE_EVS_FX`. |
+| `TELEPHONY_USE_EVS_JBM`    | OFF     | Build the experimental EVS Stage-1 JBM/VoIP receive adapter (`evs_api_rx`) around 3GPP `EvsRXlib` plus the `EVSJbmSmoke` smoke executable. Incompatible with `TELEPHONY_DISTRIBUTION_BUILD` and with `TELEPHONY_USE_EVS_FX`. |
 | `TELEPHONY_DISTRIBUTION_BUILD` | OFF | Strip AMR/AMR-WB/EVS references and expose only distributable modes. |
 | `TELEPHONY_EXPERIMENTAL_NETWORK` | ON (forced OFF in distribution builds) | Build SpeexDSP + Opus and expose `OPUS_VOIP` mode (BSD-licensed). |
 

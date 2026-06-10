@@ -113,6 +113,30 @@ else()
     target_compile_definitions(TelephonyDSP PUBLIC TELEPHONY_USE_EVS_JBM=0)
 endif()
 
+# ---------------------------------------------------------------------------
+# EVSJbmSmoke (experimental, float EVS only)
+#
+# Standalone smoke executable that proves the parent-repo evs_api_rx
+# adapter can receive compact AU data produced by the existing
+# evs_enc_process G.192 short-stream output. It uses only public parent
+# APIs (evs_api.h, evs_api_rx.h) and does not wire into TelephonyDSP
+# modes/runner/UI.
+#
+# Built only when TELEPHONY_USE_EVS_JBM=ON (which already implies
+# TELEPHONY_USE_EVS_FX=OFF and TELEPHONY_DISTRIBUTION_BUILD=OFF, so the
+# float EVS reference libraries are linked and available here).
+# ---------------------------------------------------------------------------
+if(TELEPHONY_USE_EVS_JBM)
+    add_executable(EVSJbmSmoke
+        "${CMAKE_CURRENT_SOURCE_DIR}/evs_api_rx_smoke.c"
+    )
+    target_link_libraries(EVSJbmSmoke PRIVATE TelephonyDSP)
+    if(MSVC)
+        target_compile_options(EVSJbmSmoke PRIVATE /W3)
+        target_compile_definitions(EVSJbmSmoke PRIVATE _CRT_SECURE_NO_WARNINGS)
+    endif()
+endif()
+
 if(NOT TELEPHONY_DISTRIBUTION_BUILD)
     target_link_libraries(TelephonyDSP PUBLIC
         vo-amrwbenc
