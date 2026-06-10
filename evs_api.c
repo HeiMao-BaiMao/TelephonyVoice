@@ -213,6 +213,30 @@ void evs_enc_destroy(EVS_Encoder* enc) {
     free(enc);
 }
 
+void evs_enc_set_rf(EVS_Encoder* enc, int rf_on, int rf_fec_offset, int rf_fec_indicator) {
+    if (!enc || !enc->st) return;
+
+    if (rf_on && (enc->st->total_brate != ACELP_13k20 || enc->st->input_Fs < 16000)) {
+        rf_on = 0;
+    }
+
+    enc->st->Opt_RF_ON = rf_on ? 1 : 0;
+
+    if (rf_on) {
+        enc->st->rf_fec_indicator = rf_fec_indicator ? 1 : 0;
+
+        if (rf_fec_offset == 0 || rf_fec_offset == 2 || rf_fec_offset == 3 ||
+            rf_fec_offset == 5 || rf_fec_offset == 7) {
+            enc->st->rf_fec_offset = (short)((rf_fec_offset == 0)
+                                             ? FEC_OFFSET
+                                             : rf_fec_offset);
+        }
+    } else {
+        enc->st->rf_fec_offset   = 0;
+        enc->st->rf_fec_indicator = 1;
+    }
+}
+
 int evs_enc_process(EVS_Encoder* enc,
                     const short* pcm_in, int n_samples,
                     unsigned char* bitstream_out, int bitstream_max,

@@ -391,6 +391,11 @@ class ICodec {
         float cfgPacketLossRate;
         float cfgNetworkDegradation;
 
+        // RF channel-aware feedback state (13.2 kbps / >= 16 kHz only).
+        bool rfActive;                     // true if RF is viable at ctor time
+        int  lastAppliedFecOffset;          // throttling: last value pushed to encoder
+        int  lastAppliedFecHi;             // throttling: last HI/LO pushed
+
         // Derive a non-negative per-packet arrival offset (ms) from
         // jbmLcg, scaled by cfgNetworkDegradation. Degradation 0
         // returns 0 (or minimal jitter) so a clean path behaves
@@ -495,6 +500,11 @@ class ICodec {
         // ChannelProcessor::configure pushed in).
         float cfgPacketLossRate;
         float cfgNetworkDegradation;
+
+        // RF channel-aware feedback state (13.2 kbps / >= 16 kHz only).
+        bool rfActive;                     // true if RF is viable at ctor time
+        int  lastAppliedFecOffset;          // throttling: last value pushed to encoder
+        int  lastAppliedFecHi;             // throttling: last HI/LO pushed
 
         // Deterministic LCG state used to derive per-packet arrival jitter.
         uint32_t jitterLcg;

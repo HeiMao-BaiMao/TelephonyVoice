@@ -478,8 +478,11 @@ void EVSCodec::processFrame(const int16_t* in, int16_t* out, bool packetLost) {
         evs_enc_options_init(&opts);
         opts.dtx_enable       = 1;
         opts.dtx_sid_interval = 0;     // variable SID (see evs_api.h)
-        opts.rf_enable        = 0;
+        opts.rf_enable        = 0;  // RF enabled later via evs_enc_set_rf
         opts.sc_vbr_enable    = 0;
+        rfActive = (bitrateBps == EVS_BR_13200 && sampleRate >= 16000);
+        lastAppliedFecOffset = -1;
+        lastAppliedFecHi     = -1;
         enc = evs_enc_create_ex(sampleRate, bitrateBps, maxBw, &opts);
         if (!enc) {
             // Fall back to the legacy entry point on configuration
@@ -525,8 +528,14 @@ void EVSCodec::processFrame(const int16_t* in, int16_t* out, bool packetLost) {
         evs_enc_options_init(&opts);
         opts.dtx_enable       = 1;
         opts.dtx_sid_interval = 0;
-        opts.rf_enable        = 0;
+        opts.rf_enable        = (bitrateBps == EVS_BR_13200 && sampleRate >= 16000) ? 1 : 0;
+        opts.rf_fec_offset   = 0;     // use FEC_OFFSET default (3)
+        opts.rf_fec_hi       = 1;
         opts.sc_vbr_enable    = 0;
+        const bool rfOk = (opts.rf_enable == 1);
+        rfActive             = rfOk;
+        lastAppliedFecOffset = -1;    // force first apply
+        lastAppliedFecHi     = -1;
         enc = evs_enc_create_ex(sampleRate, bitrateBps, maxBw, &opts);
         if (!enc) {
             enc = evs_enc_create(sampleRate, bitrateBps, maxBw);
@@ -712,6 +721,23 @@ void EVSCodec::processFrame(const int16_t* in, int16_t* out, bool packetLost) {
                 && n == fs) {
                 std::memcpy(out, pcmBuf, fs * sizeof(int16_t));
                 fallbackPLC.storeGoodFrame(out, fs);
+                // After a successful pull, read the JBM's latest
+                // channel-aware FEC estimate and push it into the
+                // encoder for the next frame (13.2 kbps / >= 16 kHz
+                // only; rfActive is latched at ctor time).
+                if (rfActive && rx && enc) {
+                    int off = 0, hi = 0;
+                    if (evs_rx_jbm_get_fec_offset(rx, &off, &hi) == EVS_OK) {
+                        if (off != lastAppliedFecOffset || hi != lastAppliedFecHi) {
+                            const int encOff = (off == 1) ? 0 : off;
+                            if (encOff == 0 || encOff == 2 || encOff == 3 || encOff == 5 || encOff == 7) {
+                                evs_enc_set_rf(enc, 1, encOff, hi);
+                                lastAppliedFecOffset = off;
+                                lastAppliedFecHi     = hi;
+                            }
+                        }
+                    }
+                }
                 return;
             }
         }
@@ -735,7 +761,8 @@ void EVSCodec::processFrame(const int16_t* in, int16_t* out, bool packetLost) {
         : sampleRate(sampleRate), bitrateBps(0), maxBw(EVS_SWB),
           enc(nullptr), rx(nullptr), frameIndex(0), rtpSeq(0),
           jbmQueue(), jbmLcg(0x9E3779B9u),
-          cfgPacketLossRate(0.0f), cfgNetworkDegradation(0.0f) {
+          cfgPacketLossRate(0.0f), cfgNetworkDegradation(0.0f),
+          rfActive(false), lastAppliedFecOffset(-1), lastAppliedFecHi(-1) {
         fallbackPLC.reset(getFrameSize());
         jbmQueue.reserve(kMaxQueueSize);
     }

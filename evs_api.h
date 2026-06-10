@@ -139,6 +139,28 @@ int evs_enc_process(EVS_Encoder* enc,
                     int* bitstream_used);
 
 // ---------------------------------------------------------------------------
+// Channel-aware (RF) runtime control.
+//
+// Updates the channel-aware FEC parameters on an already-created encoder
+// so a JBM/VoIP control loop can push its current FEC-offset / LO-HI
+// estimate into the encoder between frames. The reference CLI only sets
+// these at startup via -RF, so this setter is the public mirror for
+// real-time feedback.
+//
+// rf_on :0 = RF off, non-zero = RF on.
+// rf_fec_offset :0 -> use the reference default (FEC_OFFSET,3);
+//2,3,5,7 -> use the requested FEC offset;
+// any other value is silently ignored (no change).
+// rf_fec_indicator :0 = LO, non-zero = HI.
+//
+// Same bitrate/sample-rate guard as the constructor: if rf_on is
+// requested but the encoder is not at ACELP_13k20 or the input rate is
+// below16 kHz, rf_on is silently turned off and the encoder is reset
+// to the no-RF defaults (rf_fec_offset =0, rf_fec_indicator =1).
+// ---------------------------------------------------------------------------
+void evs_enc_set_rf(EVS_Encoder* enc, int rf_on, int rf_fec_offset, int rf_fec_indicator);
+
+// ---------------------------------------------------------------------------
 // Decoder lifecycle.
 // sample_rate_hz : 8000, 16000, 32000, 48000 (output rate)
 // bitrate_bps    : bitrate that the encoder was configured with
