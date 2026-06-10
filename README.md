@@ -57,17 +57,38 @@ Internally those user-facing endpoints map to codec-era modes:
 | ------------------------ | ----------- | ---------------------- | ------------------------------------- |
 | `PSTN_G711`              | 8 kHz       | G.711 µ-law            | ✅ (Public Domain, Sun)               |
 | `GSM_FR`                 | 8 kHz       | GSM 06.10              | ✅ (libgsm, permissive)                |
-| `AMR_NB_3G`              | 8 kHz       | AMR-NB MR122           | ✅ (opencore-amr, Apache 2.0)          |
-| `AMR_WB_VOLTE`           | 16 kHz      | AMR-WB 12.65 kbps      | ✅ (vo-amrwbenc + opencore-amrwb)     |
+| `AMR_NB_3G`              | 8 kHz       | AMR-NB MR475~MR122 (selectable)           | ✅ (opencore-amr, Apache 2.0)          |
+| `AMR_WB_VOLTE`           | 16 kHz      | AMR-WB 6.60~23.85 kbps (selectable)      | ✅ (vo-amrwbenc + opencore-amrwb)     |
 | `EVS_LIKE`               | 32 kHz      | *filter-only stand-in* | ❌ (safe to ship)                     |
 | `EVS_NATIVE`             | 8/16/32/48  | 3GPP EVS reference     | ✅ (3GPP TS 26.443 v12.7.0/v13.3.0)   |
 | `Bypass`                 | host        | –                      | –                                     |
-| `OPUS_VOIP` *(experimental)* | 48 kHz   | Opus (VOIP application, 24 kbps) | ✅ (opus, BSD) — non-distribution only |
-| `EVS_JBM` *(experimental)*   | 8/16/32/48 | EVS + Stage-1 JBM/VoIP adapter | ✅ (3GPP EVS + `EvsRXlib`) — non-distribution, `TELEPHONY_USE_EVS_JBM=ON` only |
+| `OPUS_VOIP` *(experimental)* | 48 kHz   | Opus (VOIP application, 6~256 kbps selectable) | ✅ (opus, BSD) — non-distribution only |
+| `EVS_JBM` *(experimental)*   | 8/16/32/48 | EVS + Stage-1 JBM/VoIP adapter | ✅ (3GPP EVS + `EvsRXlib`) — exposed as `5G携帯 (JBM)` via `Mobile5GJbm` endpoint, `TELEPHONY_USE_EVS_JBM=ON` only |
 
 ## Current State of Work
 
-### Done
+### Done (latest — Tier 0 codec control points)
+
+* **G.711 A-law selection**: `G711Codec` now supports A-law in addition to µ-law.
+  VST UI (`kParamG711Law`) + CLI (`--g711-law ulaw|alaw`).
+* **AMR-NB 8 modes** (MR475~MR122 / 4.75~12.2 kbps): `AMRNBCodec` ctor accepts
+  `mode` parameter. VST (`kParamAmrNbMode`) + CLI (`--amr-nb-mode 0..7`).
+* **AMR-WB 9 modes** (6.60~23.85 kbps): same pattern. VST (`kParamAmrWbMode`)
+  + CLI (`--amr-wb-mode 0..8`).
+* **Opus variable bitrate** (6~256 kbps): `OpusCodec::setBitrate()`. VST
+  (`kParamOpusBitrate`, 12 choices) + CLI (`--opus-bitrate`).
+* **Opus bandwidth switching** (NB/MB/WB/SWB/FB): `OpusCodec::setMaxBandwidth()`.
+  VST (`kParamOpusBandwidth`, 5 choices) + CLI (`--opus-bw`).
+* **EVS DTX SID interval**: `EVSCodec`/`EVSCodecJbm::setDtxSidInterval()`
+  (0=variable, 3~100=fixed frames). VST (`kParamEvsDtxSidInterval`) +
+  CLI (`--evs-dtx-sid-interval N`).
+* **EVS SC-VBR** (Source-Controlled VBR, 5.9 kbps mode):
+  `EVSCodec`/`EVSCodecJbm::setScVbrEnabled()`. VST (`kParamEvsScVbr`) +
+  CLI (`--evs-sc-vbr`).
+* **File structure refactor**: `TelephonyDSP.h` (744 lines) + `TelephonyDSP.cpp`
+  (2002 lines) split into `dsp/` subdirectory with 27 per-class files.
+
+### Done (previous)
 
 * `external/3gpp-evs` added as a submodule from
   [`lem21h/3gpp-evs`](https://github.com/lem21h/3gpp-evs) (2024-05 3GPP EVS
@@ -201,27 +222,46 @@ been fixed in this tree:
 * Fixed-point EVS (`TELEPHONY_USE_EVS_FX`) remains unimplemented and
   untested; see `### CMake Build Option (Untested Path)` below.
 
-### CMake Build Option (Untested Path)
+### CMake Build Option (EVS Fixed-Point — blocked)
 
-```pwsh
-cmake -DTELEPHONY_USE_EVS_FX=ON --preset x64-release
-```
+The fixed-point EVS variant (TS 26.442 v16.4.0) is gated by
+`TELEPHONY_USE_EVS_FX=ON`. Two blockers were partially addressed, but a
+fundamental incompatibility remains.
 
-This is intended to build the fixed-point variant (TS 26.442 v16.4.0), but it
-is not currently usable. The float wrapper (`evs_api.c`) is replaced by the
-stub `evs_api_fx.c`, which returns errors, and the FX library build currently
-fails before linking because fixed-point sources include `cnst_fx.h` while
-`stat_com.h` still pulls in the float `cnst.h`.
+**Progress made:**
 
-The user-facing target is that `5G mobile (precise)` / `EVS_NATIVE` should use
-the fixed-point implementation by default, matching real mobile deployments.
-Do not flip `TELEPHONY_USE_EVS_FX` to ON by default until:
+1. `evs_api_fx.c` rewritten as a real wrapper around the fixed-point APIs
+   (`init_encoder_fx`, `evs_enc_fx`, `init_decoder_fx`, `evs_dec_fx`,
+   `destroy_encoder_fx`, `destroy_decoder`). Signature-compatible with
+   `evs_api.c`, so `dsp/EvsCodec` needs zero changes.
+2. `cmake/3gpp-evs.cmake` injects `-DCNST_H` on all FX targets, successfully
+   suppressing the float `cnst.h`. This eliminates 1004+ `#define`/`enum`
+   conflicts between `cnst.h` (float) and `cnst_fx.h` (FX). `stat_com.h` is
+   left intact because it provides `typedef.h` (Word16/Word32 types).
 
-* the fixed-point source collection no longer mixes float and FX headers;
-* `evs_api_fx.c` implements `evs_enc_create`, `evs_enc_process`,
-  `evs_dec_process`, and `evs_dec_process_lost`;
-* the normal and distribution builds both pass, with distribution still hiding
-  all native 3GPP codecs.
+**Remaining blocker — `typedefs.h` / `typedef.h` type collision:**
+
+`prot_fx.h` includes `"typedefs.h"` which resolves to `basic_op/typedefs.h`.
+But `lib_com/typedef.h` is also included (via `stat_com.h`). Both headers
+define `Word16`, `Word32`, `UWord16` etc. via `typedef`. Their include guards
+differ (`_TYPEDEFS_H` vs `TYPEDEF_H`), so both are expanded in the same
+translation unit. C/C++ does not allow `typedef` redefinition even to the
+same type → `error C2371: Word16: redefinition; different base types`.
+
+**Workarounds tried (all failed under the "no external/ edits" constraint):**
+
+| Approach | Result |
+|---|---|
+| Add `basic_op/` to include path + suppress `lib_com/typedef.h` via `-DTYPEDEF_H` | `stat_dec_fx.h` typedefs missing, new cascade of errors |
+| Add `basic_op/` only (both typedefs coexist) | `Word16` redefinition error (100+) |
+| Empty-file redirect for `cnst.h` + `stat_com.h` | Bypassed by same-directory `#include` search |
+| Include-guard suppression only (`-DCNST_H`, no `basic_op/`) | `typedefs.h` not found → `fatal error C1083` |
+
+**Root cause:** The 3GPP reference code was designed with two incompatible
+type systems (`basic_op/typedefs.h` for DSP primitives vs `lib_com/typedef.h`
+for codec structures). The fixed-point variant cannot be built without
+resolving this at the source level, which requires editing files under
+`external/3gpp-evs/`.
 
 ## Distribution / Non-EVS Edition
 
@@ -401,16 +441,27 @@ What is deliberately still **not** in scope:
   (AMR / G.711 / GSM); the energy VAD currently only drives DTX for
   `OPUS_VOIP` and `EVS_LIKE` (see the SpeexDSPAux bullet above).
 
-## Open Questions for the Next Agent
+## Open Questions
 
-1. Finish fixed-point EVS and make `EVS_NATIVE` default to it. This requires
-   fixing the current FX header collision (`cnst_fx.h` plus float `cnst.h`) and
-   replacing the `evs_api_fx.c` stub with a real wrapper.
-2. Should the `EVS_LIKE` mode be promoted to a proper `EVS_DIST`
-   filter-only class for the distribution build, or stay as a single
-   mode in `SignalProcessor`?
-3. Should a dedicated VSTGUI editor be added for a visual route diagram? The
-   current implementation exposes `in`, `out`, and `degraded segment` through
-   the host's generic VST parameter UI.
-4. Are there other 3GPP EVS mirrors worth considering if the lem21h
-   one stays unmaintained?  (AOSP branches, etc.)
+1. **EVS fixed-point (TELEPHONY_USE_EVS_FX) blocked** — see the CMake Build
+   Option section above. The `cnst.h` conflict is solved (`-DCNST_H`), but the
+   `typedefs.h`/`typedef.h` Word16 redefinition is a fundamental incompatibility
+   in the 3GPP reference sources that cannot be worked around without editing
+   files under `external/`.
+2. Should the `EVS_LIKE` mode be promoted to a proper `EVS_DIST` filter-only
+   class for the distribution build?
+3. Should a dedicated VSTGUI editor be added for a visual route diagram?
+4. Are there other 3GPP EVS mirrors worth considering? (AOSP branches, etc.)
+5. **Implementation tiers** (priority-ordered roadmap for the VST plugin):
+   * **Tier 0** ✅ — completed: file-structure refactor (`dsp/`), 7 codec
+     control points (G.711 A-law, AMR-NB/WB all modes, Opus bitrate/bandwidth,
+     EVS SC-VBR, EVS DTX SID interval).
+   * **Tier 1** (next) — network simulation: decouple 7 degradation
+     effects from the single `networkDegradation` slider, Gilbert-Elliott
+     2-state Markov loss model, jitter distribution upgrade
+     (Gamma/Weibull + AR(1) autocorrelation), bit-error injection (BER).
+   * **Tier 2** (later) — audio realism: PSD-based comfort noise (G.711/
+     GSM/EVS_LIKE), DTMF tone generation, real-time transport mode.
+   * **Tier 3** (distant) — protocol fidelity: RTP header internal
+     simulation, payload format RFC compliance (RFC 4867/TS 26.445),
+     clock drift, wireless fading/C-I rate adaptation.
