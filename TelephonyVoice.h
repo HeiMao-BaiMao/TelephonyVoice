@@ -18,6 +18,9 @@ namespace Vst {
         kParamPacketLossRate,
         kParamNetworkDegradation,
         kParamOutputEndpoint,
+        kParamEvsSampleRate,
+        kParamEvsBitrate,
+        kParamEvsMaxBw,
         kParamDegradationSegment
     };
 
@@ -53,6 +56,9 @@ namespace Vst {
         int32 currentEraMode;
         int32 currentOutputEndpoint;
         int32 currentDegradationSegment;
+        int32 currentEvsSampleRate;
+        int32 currentEvsBitrate;
+        int32 currentEvsMaxBw;
         float currentDryWet;
         float currentOutGain;
         bool currentArtifactsEnabled;

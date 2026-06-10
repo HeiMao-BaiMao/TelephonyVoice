@@ -28,6 +28,36 @@ constexpr int32 kDefaultOutputEndpoint = 5;
 #endif
 constexpr int32 kMaxDegradationSegment = 3;
 
+constexpr int32 kNumEvsSampleRates = 4;
+constexpr int32 kDefaultEvsSampleRateIndex = 2; // 32 kHz (SWB)
+constexpr int32 kEvsSampleRateValues[kNumEvsSampleRates] = { 8000, 16000, 32000, 48000 };
+static const char* kEvsSampleRateStrings[kNumEvsSampleRates] = {
+    "8 kHz (NB)", "16 kHz (WB)", "32 kHz (SWB)", "48 kHz (FB)"
+};
+
+constexpr int32 kNumEvsBitrates = 12;
+constexpr int32 kDefaultEvsBitrateIndex = 4; // 13.2 kbps
+constexpr int32 kEvsBitrateValues[kNumEvsBitrates] = {
+    5900, 7200, 8000, 9600, 13200, 16400, 24400, 32000, 48000, 64000, 96000, 128000
+};
+static const char* kEvsBitrateStrings[kNumEvsBitrates] = {
+    "5.9 kbps", "7.2 kbps", "8.0 kbps", "9.6 kbps", "13.2 kbps", "16.4 kbps",
+    "24.4 kbps", "32 kbps", "48 kbps", "64 kbps", "96 kbps", "128 kbps"
+};
+
+constexpr int32 kNumEvsMaxBws = 4;
+constexpr int32 kDefaultEvsMaxBwIndex = 2; // SWB
+constexpr int32 kEvsMaxBwValues[kNumEvsMaxBws] = {
+    (int32)EVS_NB, (int32)EVS_WB, (int32)EVS_SWB, (int32)EVS_FB
+};
+static const char* kEvsMaxBwStrings[kNumEvsMaxBws] = {
+    "NB", "WB", "SWB", "FB"
+};
+
+constexpr int32 kDefaultEvsSampleRate = 32000;
+constexpr int32 kDefaultEvsBitrate = 13200;
+constexpr int32 kDefaultEvsMaxBw = (int32)EVS_SWB;
+
 TelephonyDSP::RouteEndpoint endpointFromParameter(int32 endpoint)
 {
     endpoint = std::clamp(endpoint, 0, kMaxExposedEndpoint);
@@ -76,6 +106,9 @@ TelephonyVoiceProcessor::TelephonyVoiceProcessor()
     : currentEraMode(0)
     , currentOutputEndpoint(kDefaultOutputEndpoint)
     , currentDegradationSegment(0)
+    , currentEvsSampleRate(kDefaultEvsSampleRate)
+    , currentEvsBitrate(kDefaultEvsBitrate)
+    , currentEvsMaxBw(kDefaultEvsMaxBw)
     , currentDryWet(0.5f)
     , currentOutGain(0.0f)
     , currentArtifactsEnabled(false)
@@ -158,6 +191,21 @@ tresult PLUGIN_API TelephonyVoiceProcessor::process(ProcessData& data)
                         case kParamDegradationSegment:
                             currentDegradationSegment = std::clamp((int32)(value * kMaxDegradationSegment + 0.5), 0, kMaxDegradationSegment);
                             break;
+                        case kParamEvsSampleRate: {
+                            int32 idx = std::clamp((int32)(value * (kNumEvsSampleRates - 1) + 0.5), 0, kNumEvsSampleRates - 1);
+                            currentEvsSampleRate = kEvsSampleRateValues[idx];
+                            break;
+                        }
+                        case kParamEvsBitrate: {
+                            int32 idx = std::clamp((int32)(value * (kNumEvsBitrates - 1) + 0.5), 0, kNumEvsBitrates - 1);
+                            currentEvsBitrate = kEvsBitrateValues[idx];
+                            break;
+                        }
+                        case kParamEvsMaxBw: {
+                            int32 idx = std::clamp((int32)(value * (kNumEvsMaxBws - 1) + 0.5), 0, kNumEvsMaxBws - 1);
+                            currentEvsMaxBw = kEvsMaxBwValues[idx];
+                            break;
+                        }
                         case kParamDryWet: currentDryWet = (float)value; break;
                         case kParamOutputGain: currentOutGain = (float)(value * 84.0 - 60.0); break;
                         case kParamArtifactsEnabled: currentArtifactsEnabled = (value > 0.5); break;
@@ -202,11 +250,13 @@ void TelephonyVoiceProcessor::updateDSPParameters()
     currentEraMode = std::clamp(currentEraMode, 0, kMaxExposedEndpoint);
     currentOutputEndpoint = std::clamp(currentOutputEndpoint, 0, kMaxExposedEndpoint);
     currentDegradationSegment = std::clamp(currentDegradationSegment, 0, kMaxDegradationSegment);
+    currentEvsMaxBw = std::clamp(currentEvsMaxBw, (int32)EVS_NB, (int32)EVS_FB);
     dsp.setRoute(endpointFromParameter(currentEraMode),
                  endpointFromParameter(currentOutputEndpoint),
                  degradationSegmentFromParameter(currentDegradationSegment));
     dsp.setParameters(currentDryWet, currentOutGain, currentArtifactsEnabled, currentArtifactAmount,
                       currentPacketLossRate, currentNetworkDegradation);
+    dsp.setEVSConfig(currentEvsSampleRate, currentEvsBitrate, (EVS_Bandwidth)currentEvsMaxBw);
 }
 
 tresult PLUGIN_API TelephonyVoiceProcessor::setState(IBStream* state)
@@ -227,10 +277,14 @@ tresult PLUGIN_API TelephonyVoiceProcessor::setState(IBStream* state)
     if (!streamer.readInt32(currentDegradationSegment)) currentDegradationSegment = 0;
     if (!streamer.readFloat(currentPacketLossRate)) currentPacketLossRate = 0.0f;
     if (!streamer.readFloat(currentNetworkDegradation)) currentNetworkDegradation = 0.0f;
+    if (!streamer.readInt32(currentEvsSampleRate)) currentEvsSampleRate = kDefaultEvsSampleRate;
+    if (!streamer.readInt32(currentEvsBitrate)) currentEvsBitrate = kDefaultEvsBitrate;
+    if (!streamer.readInt32(currentEvsMaxBw)) currentEvsMaxBw = kDefaultEvsMaxBw;
     currentOutputEndpoint = std::clamp(currentOutputEndpoint, 0, kMaxExposedEndpoint);
     currentDegradationSegment = std::clamp(currentDegradationSegment, 0, kMaxDegradationSegment);
     currentPacketLossRate = std::clamp(currentPacketLossRate, 0.0f, 0.95f);
     currentNetworkDegradation = std::clamp(currentNetworkDegradation, 0.0f, 1.0f);
+    currentEvsMaxBw = std::clamp(currentEvsMaxBw, (int32)EVS_NB, (int32)EVS_FB);
     updateDSPParameters();
     return kResultOk;
 }
@@ -245,6 +299,9 @@ tresult PLUGIN_API TelephonyVoiceProcessor::getState(IBStream* state)
     streamer.writeInt32(currentDegradationSegment);
     streamer.writeFloat(currentPacketLossRate);
     streamer.writeFloat(currentNetworkDegradation);
+    streamer.writeInt32(currentEvsSampleRate);
+    streamer.writeInt32(currentEvsBitrate);
+    streamer.writeInt32(currentEvsMaxBw);
     return kResultOk;
 }
 
@@ -284,6 +341,38 @@ tresult PLUGIN_API TelephonyVoiceController::initialize(FUnknown* context)
     appendEndpointStrings(outputParam);
     outputParam->setNormalized((double)kDefaultOutputEndpoint / (double)kMaxExposedEndpoint);
     parameters.addParameter(outputParam);
+
+    StringListParameter* evsSampleRateParam = new StringListParameter(STR16("EVS Sample Rate"), kParamEvsSampleRate, nullptr, ParameterInfo::kCanAutomate | ParameterInfo::kIsList);
+    evsSampleRateParam->appendString(STR16("8 kHz (NB)"));
+    evsSampleRateParam->appendString(STR16("16 kHz (WB)"));
+    evsSampleRateParam->appendString(STR16("32 kHz (SWB)"));
+    evsSampleRateParam->appendString(STR16("48 kHz (FB)"));
+    evsSampleRateParam->setNormalized((double)kDefaultEvsSampleRateIndex / (double)(kNumEvsSampleRates - 1));
+    parameters.addParameter(evsSampleRateParam);
+
+    StringListParameter* evsBitrateParam = new StringListParameter(STR16("EVS Bitrate"), kParamEvsBitrate, nullptr, ParameterInfo::kCanAutomate | ParameterInfo::kIsList);
+    evsBitrateParam->appendString(STR16("5.9 kbps"));
+    evsBitrateParam->appendString(STR16("7.2 kbps"));
+    evsBitrateParam->appendString(STR16("8.0 kbps"));
+    evsBitrateParam->appendString(STR16("9.6 kbps"));
+    evsBitrateParam->appendString(STR16("13.2 kbps"));
+    evsBitrateParam->appendString(STR16("16.4 kbps"));
+    evsBitrateParam->appendString(STR16("24.4 kbps"));
+    evsBitrateParam->appendString(STR16("32 kbps"));
+    evsBitrateParam->appendString(STR16("48 kbps"));
+    evsBitrateParam->appendString(STR16("64 kbps"));
+    evsBitrateParam->appendString(STR16("96 kbps"));
+    evsBitrateParam->appendString(STR16("128 kbps"));
+    evsBitrateParam->setNormalized((double)kDefaultEvsBitrateIndex / (double)(kNumEvsBitrates - 1));
+    parameters.addParameter(evsBitrateParam);
+
+    StringListParameter* evsMaxBwParam = new StringListParameter(STR16("EVS Max Bandwidth"), kParamEvsMaxBw, nullptr, ParameterInfo::kCanAutomate | ParameterInfo::kIsList);
+    evsMaxBwParam->appendString(STR16("NB"));
+    evsMaxBwParam->appendString(STR16("WB"));
+    evsMaxBwParam->appendString(STR16("SWB"));
+    evsMaxBwParam->appendString(STR16("FB"));
+    evsMaxBwParam->setNormalized((double)kDefaultEvsMaxBwIndex / (double)(kNumEvsMaxBws - 1));
+    parameters.addParameter(evsMaxBwParam);
 
     StringListParameter* segmentParam = new StringListParameter(STR16("\u52a3\u5316\u533a\u9593: in -> \u4ea4\u63db\u5c40 -> out"), kParamDegradationSegment, nullptr, ParameterInfo::kCanAutomate | ParameterInfo::kIsList);
     segmentParam->appendString(STR16("\u4e21\u65b9"));
