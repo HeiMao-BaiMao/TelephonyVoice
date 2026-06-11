@@ -95,6 +95,61 @@ else()
     set(EVS_API_LIBS evs-lib-enc evs-lib-dec)
 endif()
 
+# ---------------------------------------------------------------------------
+# Source-specific forced-include for evs_api_fx.c (parent-only FX build)
+#
+# cmake/3gpp-evs.cmake generates an FX typedef shim that maps Word16/Word32
+# to the fixed-point types, pre-defines the float lib_com/cnst.h guard
+# (CNST_H), pre-defines the float lib_com/typedef.h guards (TYPEDEF_H /
+# _TYPEDEF_H), and overrides the broken lib_com/control.h FOR/WHILE/DO/IF/
+# ELSE/SWITCH/CONTINUE/BREAK/GOTO macros.  This shim is force-included into
+# every translation unit of evs-lib-{com,enc,dec}-fx, but the parent-repo
+# C wrapper evs_api_fx.c lives in TelephonyDSP - not in those targets -
+# so it does not currently see the shim.
+#
+# Apply the shim to evs_api_fx.c ONLY, never to the rest of TelephonyDSP:
+#   - The C++ sources use the all-caps identifiers `FOR`, `WHILE`, etc. in
+#     legitimate ways (none today, but new C++ code might), and remapping
+#     `Mpy_32_16` -> `evs_fx_Mpy_32_16_2arg` globally would poison anything
+#     that touches basic_math/oper_32b.h transitively.
+#   - `Word16` / `Word32` / `UWord16` / `UWord32` are FX-only types that
+#     must not leak into C++ TUs that include only the float headers.
+#
+# set_source_files_properties applied to the absolute path used in
+# EVS_API_SRC above is the canonical CMake mechanism for this; it must
+# happen before add_library(TelephonyDSP ...) so the generator picks up
+# the per-file COMPILE_OPTIONS when it writes the build.ninja rule.
+#
+# EVS_FX_TYPEDEF_SHIM and EVS_FX_INCLUDE_DIRS are both defined inside the
+# `if(TELEPHONY_USE_EVS_FX)` block of cmake/3gpp-evs.cmake (which has
+# already been included by this point via the `include(cmake/3gpp-evs.cmake)`
+# call in the External Libraries section above), so they are visible here.
+# Include directories are already propagated transitively from
+# evs-lib-{com,enc,dec}-fx (PUBLIC link with PUBLIC include_directories),
+# so we do NOT need to add EVS_FX_INCLUDE_DIRS to the source here - we
+# only need to attach the force-include option.  We attach it explicitly
+# anyway, as a safety net, so the source compiles even if a future
+# refactor flips the FX libs to PRIVATE include directories.
+# ---------------------------------------------------------------------------
+if(TELEPHONY_USE_EVS_FX)
+    if(MSVC)
+        # MSVC uses /FI<path> (no space).  The path is absolute because
+        # EVS_FX_TYPEDEF_SHIM is set to
+        # "${CMAKE_CURRENT_BINARY_DIR}/evs_fx_shim/evs_fx_typedef_shim.h".
+        set_source_files_properties("${EVS_API_SRC}" PROPERTIES
+            INCLUDE_DIRECTORIES "${EVS_FX_INCLUDE_DIRS}"
+            COMPILE_OPTIONS    "/FI${EVS_FX_TYPEDEF_SHIM}"
+        )
+    else()
+        # GCC/Clang use -include <path> (with space).  CMake's
+        # COMPILE_OPTIONS is a list, so split the option from its value.
+        set_source_files_properties("${EVS_API_SRC}" PROPERTIES
+            INCLUDE_DIRECTORIES "${EVS_FX_INCLUDE_DIRS}"
+            COMPILE_OPTIONS    "-include;${EVS_FX_TYPEDEF_SHIM}"
+        )
+    endif()
+endif()
+
 add_library(TelephonyDSP STATIC
     dsp/RingBuffer.cpp
     dsp/WaveformConcealer.cpp

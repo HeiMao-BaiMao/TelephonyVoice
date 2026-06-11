@@ -100,10 +100,9 @@ Internally those user-facing endpoints map to codec-era modes:
 * `evs_api.h` / `evs_api.c` – clean C wrapper around the reference
   `init_encoder` / `evs_enc` / `init_decoder` / `evs_dec` quartet.  Uses
   `tmpfile()` to round-trip the G.192 bitstream between encoder and decoder.
-* `evs_api_fx.c` – stub for the fixed-point variant (`TELEPHONY_USE_EVS_FX`
-  build option).  Not implemented. The current FX source set still mixes
-  float and fixed headers (`stat_com.h` pulls in `cnst.h` next to
-  `cnst_fx.h`), so this cannot be made the default yet.
+* `evs_api_fx.c` – fixed-point wrapper for `TELEPHONY_USE_EVS_FX=ON`.
+  This path is now partially wired, but remains experimental and link-blocked
+  (see the fixed-point status section below).
 * `TelephonyDSP` extended with an `EVS_NATIVE` mode, `EVSCodec` class
   wrapping the C API, EVS configuration plumbing on `ChannelProcessor` and
   `SignalProcessor`.  Default config: SWB 32 kHz / 13.2 kbps.
@@ -219,14 +218,30 @@ been fixed in this tree:
   builds. The DTX/CNG wiring in `EVSCodec` is also compiled out under
   `TELEPHONY_DISTRIBUTION_BUILD`, so the distribution path is
   unaffected.
-* Fixed-point EVS (`TELEPHONY_USE_EVS_FX`) remains unimplemented and
-  untested; see `### CMake Build Option (Untested Path)` below.
+* Fixed-point EVS (`TELEPHONY_USE_EVS_FX`) has parent-repo-only WIP wiring.
+  It configures and compiles much further than before, but is not complete:
+  `TelephonyRunner` still fails at final link with unresolved FX helpers.
+  See `### CMake Build Option (EVS Fixed-Point — WIP / link-blocked)` below.
 
-### CMake Build Option (EVS Fixed-Point — blocked)
+### CMake Build Option (EVS Fixed-Point — WIP / link-blocked)
 
 The fixed-point EVS variant (TS 26.442 v16.4.0) is gated by
-`TELEPHONY_USE_EVS_FX=ON`. Two blockers were partially addressed, but a
-fundamental incompatibility remains.
+`TELEPHONY_USE_EVS_FX=ON`. This is **not a shippable path yet**; the float
+EVS wrapper remains the practical supported EVS implementation. The current
+FX work keeps `external/3gpp-evs` read-only and applies compatibility shims
+from the parent repository only.
+
+Latest checked command:
+
+```powershell
+cmake --preset x64-release -DTELEPHONY_USE_EVS_FX=ON -DTELEPHONY_USE_EVS_JBM=OFF -DTELEPHONY_EXPERIMENTAL_NETWORK=OFF
+cmake --build out/build/x64-release --target TelephonyRunner --parallel
+```
+
+**Current result:** configure succeeds; `evs-lib-com-fx`, `evs-lib-enc-fx`,
+`evs-lib-dec-fx`, and `TelephonyDSP` build. The `TelephonyRunner` build now
+gets through all object/static-library compilation, but the final executable
+link still fails on MSVC with `LNK1120: 138 unresolved external references`.
 
 **Progress made:**
 
@@ -234,34 +249,35 @@ fundamental incompatibility remains.
    (`init_encoder_fx`, `evs_enc_fx`, `init_decoder_fx`, `evs_dec_fx`,
    `destroy_encoder_fx`, `destroy_decoder`). Signature-compatible with
    `evs_api.c`, so `dsp/EvsCodec` needs zero changes.
-2. `cmake/3gpp-evs.cmake` injects `-DCNST_H` on all FX targets, successfully
-   suppressing the float `cnst.h`. This eliminates 1004+ `#define`/`enum`
-   conflicts between `cnst.h` (float) and `cnst_fx.h` (FX). `stat_com.h` is
-   left intact because it provides `typedef.h` (Word16/Word32 types).
+2. `cmake/3gpp-evs.cmake` now generates and force-includes an FX compatibility
+   shim that suppresses the float `typedef.h` / `cnst.h` collisions, includes
+   the fixed-point `basic_op/typedefs.h` + `cnst_fx.h`, remaps the shared
+   `stat_com.h` types that FX sources need, fixes the `Mpy_32_16` 2-arg vs
+   3-arg collision, and overrides broken no-WMOPS control-flow macros.
+3. The parent CMake adds the fixed-point helper sources needed to get through
+   compilation: `basic_op` helpers, `basic_math` including `math_32.c`,
+   `basop_mpy.c`, `basop_com_lpc.c`, `basop_lsf_tools.c`, `basop_util.c`, and
+   `rom_basop_util.c`. MSVC `/FORCE:MULTIPLE` is used for expected duplicate
+   basic-op symbols shared with the AMR libraries.
+4. `external/3gpp-evs` remains untouched; all changes are parent-repo CMake / shim
+   changes.
 
-**Remaining blocker — `typedefs.h` / `typedef.h` type collision:**
+**Known exclusions / blockers:**
 
-`prot_fx.h` includes `"typedefs.h"` which resolves to `basic_op/typedefs.h`.
-But `lib_com/typedef.h` is also included (via `stat_com.h`). Both headers
-define `Word16`, `Word32`, `UWord16` etc. via `typedef`. Their include guards
-differ (`_TYPEDEFS_H` vs `TYPEDEF_H`), so both are expanded in the same
-translation unit. C/C++ does not allow `typedef` redefinition even to the
-same type → `error C2371: Word16: redefinition; different base types`.
-
-**Workarounds tried (all failed under the "no external/ edits" constraint):**
-
-| Approach | Result |
-|---|---|
-| Add `basic_op/` to include path + suppress `lib_com/typedef.h` via `-DTYPEDEF_H` | `stat_dec_fx.h` typedefs missing, new cascade of errors |
-| Add `basic_op/` only (both typedefs coexist) | `Word16` redefinition error (100+) |
-| Empty-file redirect for `cnst.h` + `stat_com.h` | Bypassed by same-directory `#include` search |
-| Include-guard suppression only (`-DCNST_H`, no `basic_op/`) | `typedefs.h` not found → `fatal error C1083` |
-
-**Root cause:** The 3GPP reference code was designed with two incompatible
-type systems (`basic_op/typedefs.h` for DSP primitives vs `lib_com/typedef.h`
-for codec structures). The fixed-point variant cannot be built without
-resolving this at the source level, which requires editing files under
-`external/3gpp-evs/`.
+* `basop_tcx_utils.c` remains excluded. It calls `BASOP_cfft` with a 4-argument
+  form, while the FX declaration uses a 6-argument form, and it also pulls in
+  float `prot.h` / `cnst.h` / `rom_com.h` headers.
+* `lag_wind.c` remains excluded. The upstream file is float-only and triggers
+  float `stat_dec.h` / `prot.h` / `rom_com.h` / `cnst.h` header leakage; FX
+  callers still need fixed-point `lag_wind` / `adapt_lag_wind` implementations
+  or a deliberate port.
+* The remaining unresolved externals are not one missing library. They are
+  missing fixed-point implementations/ports or float-only helper families:
+  TNS, CLDFB, FD-CNG, TCX/TEC/TBE, pitch/ACELP, post-filter/concealment,
+  `lag_wind` / `hp20` / `lerp` / `get_gain`, and `BASOP_cfft` / FFT / divide
+  helpers. Continuing requires a broader architecture decision: port these FX
+  helpers in the parent repository, introduce controlled stubs/wrappers, or keep
+  FX disabled while the float EVS path remains the supported path.
 
 ## Distribution / Non-EVS Edition
 
@@ -301,7 +317,7 @@ Implemented path:
 │   └── vo-amrwbenc.cmake
 ├── evs_api.h              # public C API for the 3GPP EVS wrapper
 ├── evs_api.c              # float variant (working wrapper)
-├── evs_api_fx.c           # fixed-point variant stub
+├── evs_api_fx.c           # fixed-point wrapper (experimental/link-blocked)
 ├── TelephonyDSP.h         # public C++ API of the route-aware SignalProcessor
 ├── TelephonyDSP.cpp       # two-leg path, codec emulations, PLC, resampler/filter chain
 ├── TelephonyVoice.h       # VST3 processor + edit controller
@@ -323,7 +339,7 @@ Implemented path:
 
 | Option                     | Default | Effect                                                                 |
 | -------------------------- | ------- | ---------------------------------------------------------------------- |
-| `TELEPHONY_USE_EVS_FX`     | OFF     | Build fixed-point EVS (TS 26.442) instead of float (TS 26.443).         |
+| `TELEPHONY_USE_EVS_FX`     | OFF     | Experimental fixed-point EVS (TS 26.442) build instead of float (TS 26.443); currently compiles through FX libs/`TelephonyDSP` but `TelephonyRunner` final link is blocked by unresolved FX helpers. |
 | `TELEPHONY_USE_EVS_JBM`    | OFF     | Build the experimental EVS Stage-1 JBM/VoIP receive adapter (`evs_api_rx`) around 3GPP `EvsRXlib` plus the `EVSJbmSmoke` smoke executable. Incompatible with `TELEPHONY_DISTRIBUTION_BUILD` and with `TELEPHONY_USE_EVS_FX`. |
 | `TELEPHONY_DISTRIBUTION_BUILD` | OFF | Strip AMR/AMR-WB/EVS references and expose only distributable modes. |
 | `TELEPHONY_EXPERIMENTAL_NETWORK` | ON (forced OFF in distribution builds) | Build SpeexDSP + Opus and expose `OPUS_VOIP` mode (BSD-licensed). |
@@ -524,7 +540,7 @@ realistic codec/PCL/JBM behavior.
 |---|------|-----------|
 | 4.1 | **Wireless fading / C-I rate adaptation** — Rayleigh/Jakes fading model → C/I estimation → dynamic AMR/EVS mode selection per 3GPP TS 45.008 / 36.101 channel models. | ★★★★★ |
 | 4.2 | **Handover gap simulation** — momentary mute (50~200 ms) with rapid codec-state recovery, mimicking inter-base-station handovers. | ★★★★ |
-| 4.3 | **EVS fixed-point v16 (TELEPHONY_USE_EVS_FX)** — blocked by `basic_op/typedefs.h` vs `lib_com/typedef.h` Word16 redefinition. The `cnst.h` conflict is solved (`-DCNST_H`), but the type-system incompatibility in the 3GPP reference sources cannot be worked around without editing files under `external/`. | — blocked |
+| 4.3 | **EVS fixed-point v16 (TELEPHONY_USE_EVS_FX)** — WIP. Parent-only shim/source-list work now resolves the original typedef/cnst/stat_com compile blockers and builds the FX static libs plus `TelephonyDSP`, but `TelephonyRunner` still fails final link (`LNK1120: 138 unresolved external references`) because multiple FX helper families still need ports or deliberate stubs. | — WIP / link-blocked |
 | 4.4 | **Wideband extension to narrowband transcoding artifacts** — tandem coding effects when WB input is encoded as NB, then decoded and re-encoded. | ★★★★ |
 | 4.5 | **Voice activity detection (VAD-2) with hangover** — implement proper 3GPP-style VAD with primary decision, hangover addition, and burst-length smoothing. Currently only simple energy threshold. | ★★★ |
 
