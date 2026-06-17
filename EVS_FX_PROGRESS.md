@@ -7,11 +7,11 @@
 
 | 項目 | 値 |
 |---|---|
-| 最終ビルド結果 | `TelephonyRunner.exe` リンク失敗（予期内） |
-| 最新 `LNK1120` | **47 未解決外部参照** (`tmp/fx_link_after_wave2_dupfix.log`) |
+| 最終ビルド結果 | **`TelephonyRunner.exe` リンク成功** |
+| 最新 `LNK1120` | **0 未解決外部参照** (`tmp/fx_link_after_wave3.log`) |
 | 初期 `LNK1120` | 138（`get_gain_fx` 実装前） |
-| 削減数 | **91 シンボル** 解決済み |
-| コミット済み | `6ccbcc2 Document EVS FX WIP status` 以降は未コミット |
+| 削減数 | **138 シンボルすべて解決** |
+| コミット | `c9d0b80` on branch `feature/evs-fx-link-helpers` |
 
 ### `LNK1120` の推移
 
@@ -29,8 +29,9 @@
 | Quick wins (`cast16`, `bufferCopyFx`, `getInvFrameLen`) | 86 | 3 | `tmp/fx_link_after_quick_wins.log` |
 | `tec_tfa_tbe_fx` | **79** | 7 | `tmp/fx_link_after_tec_tfa.log` |
 | `basic_utils_fx` | 74 | 5 | `tmp/fx_link_after_basic_utils.log` |
-| `pitch_fx` + `fdcng_enc_fx` + `fdcng_dec_fx` Wave 2 | **47** | 27 | `tmp/fx_link_after_wave2.log` |
+| Wave 2 (`pitch_fx` + `fdcng_enc_fx` + `fdcng_dec_fx`) | **47** | 27 | `tmp/fx_link_after_wave2.log` |
 | Wave 2 duplicate fix | 47 | 0（重複定義修正） | `tmp/fx_link_after_wave2_dupfix.log` |
+| Wave 3 (`acelp_core_fx` + `core_enc_vad_fx` + `dec_postfilter_fx`) | **0** | 47 | `tmp/fx_link_after_wave3.log` |
 
 ## 2. 実装済み親リポジトリヘルパー
 
@@ -49,10 +50,13 @@
 | `pitch_fx.c` | Pitch family 8 シンボル | `pitch_ol_init_fx`, `pitch_ol_fx`, `pit_decode_fx`, `pit_Q_dec_fx`, `pit16k_Q_dec_fx`, `abs_pit_dec_fx`, `delta_pit_dec_fx`, `pitch_pred_linear_fit`。ピッチ復号は float 版を固定小数点化、`pitch_ol_fx` / `pitch_pred_linear_fit` はリンク unblock stub。 |
 | `fdcng_enc_fx.c` | FD-CNG encoder 10 シンボル | `createFdCngEnc`, `deleteFdCngEnc`, `initFdCngEnc`, `configureFdCngEnc`, `resetFdCngEnc`, `FdCng_exc`, `noisy_speech_detection`。`perform_noise_estimation_enc`, `FdCng_encodeSID`, `generate_comfort_noise_enc` は stub（TODO）。 |
 | `fdcng_dec_fx.c` | FD-CNG decoder 10 シンボル | `createFdCngDec`, `initFdCngDec`, `deleteFdCngDec`, `configureFdCngDec`, `ApplyFdCng`, `FdCng_decodeSID`, `generate_comfort_noise_dec`, `generate_comfort_noise_dec_hf`, `generate_masking_noise`, `noisy_speech_detection`。CNG 合成はリンク unblock stub。 |
+| `acelp_core_fx.c` | ACELP core 14 シンボル | `E_ACELP_codebook_corr`, `E_ACELP_codebook_target_update`, `E_ACELP_convolve`, `E_ACELP_correlation`, `E_ACELP_innovative_codeword`, `E_ACELP_q_pulse`, `E_ACELP_xAq`, `E_ACELP_xh_corr`, `E_ACELP_1`, `E_GAIN_closed_loop_search`, `encode_acelp_gains`, `BITS_ALLOC_config_acelp`, `Unified_weighting_fx`。相関・畳み込みは実装、コードブック探索・ゲイン量子化は stub。 |
+| `core_enc_vad_fx.c` | Core encoder / VAD 19 シンボル | `enc_acelp_tcx_main`, `core_encode_update`, `init_coder_ace_plus`, `MDCT_selector_reset`, `InitTransientDetection`, `enc_prm_rf`, `SetModeIndex`, `analysisCldfbEncoder_fx`, `MDCT_selector`, `long_enr_fx`, `find_uv_fx`, `signal_clas_fx`, `core_acelp_tcx20_switching`, `analy_sp`, `AdjustFirstSID`, `RunTransientDetection`, `GetTCXAvgTemporalFlatnessMeasure`, `SetTCXModeInfo`, `vad_proc`。状態 init 系は機能実装、ACELP/TCX コア符号化・RF パックは stub。 |
+| `dec_postfilter_fx.c` | Decoder post-filter / LPD 14 シンボル | `init_decoder_LPD_fx`, `open_decoder_LPD`, `close_decoder_LPD`, `decode_gn_lpc`, `speech_music_class`, `acelp_mode_dec`, `core_decoder_signal`, `tcx_ltp_post`, `lpd_delay_switch`, `decoder_LPD_status`, `resynch_LPD`, `lpd_get_closest_freq_arry`, `lpd_get_closest_pitch_arry`, `scale_st`。`open_decoder_LPD` は既存 FX ヘルパーだけを使用し float-only 依存を避ける。LPD 状態機は stub。 |
 
 ## 3. `cmake/3gpp-evs.cmake` での主な改修
 
-- `EVS_FX_EXTRAS_LIB_COM` に上記ヘルパーを追加（Wave 2 では `basic_utils_fx.c`, `pitch_fx.c`, `fdcng_enc_fx.c`, `fdcng_dec_fx.c` を新規追加）。
+- `EVS_FX_EXTRAS_LIB_COM` に上記ヘルパーを追加（Wave 3 では `acelp_core_fx.c`, `core_enc_vad_fx.c`, `dec_postfilter_fx.c` を新規追加）。
 - `EVS_FX_BASOP_COM_SOURCES` に `basic_math/math_32.c`, `basop_mpy.c`, `basop_com_lpc.c`, `basop_lsf_tools.c`, `basop_util.c`, `rom_basop_util.c` を追加。
 - `basop_tcx_utils.c` と `lag_wind.c` を FX ビルドから除外（`BASOP_cfft` 4 引数/6 引数のシグネチャ競合＋float ヘッダ漏れのため）。
 - `evs-lib-com-fx` に `/FORCE:MULTIPLE` を設定（重複 BASOP シンボルを許容）。
@@ -102,42 +106,63 @@ cmd /c 'call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxilia
 - **現象**: `basop_extra_l_shl()` が負数を左シフトしていた。
 - **修正**: unsigned 32-bit パターンでシフトし、飽和後に符号解釈するよう変更。
 
-## 6. 未解決シンボルの残り家族（LNK1120: 47）
+### 5.8 `noisy_speech_detection` の重複定義
+- **現象**: `fdcng_enc_fx.c` と `fdcng_dec_fx.c` の両方に `noisy_speech_detection` を実装したため `LNK4006` 警告。
+- **修正**: エンコーダ側の定義を削除し、デコーダ側に集約。
 
-`tmp/fx_link_after_wave2_dupfix.log` より、主な家族：
+## 6. 動作確認
 
-| 家族 | 推定シンボル数 | リスク | 代表シンボル |
-|---|---|---|---|
-| ACELP core encoder | 14 | 高 | `E_ACELP_*`, `E_GAIN_closed_loop_search`, `encode_acelp_gains`, `BITS_ALLOC_config_acelp`, `Unified_weighting_fx` |
-| コアエンコーダ / VAD 前処理 | 19 | 高 | `enc_acelp_tcx_main`, `core_encode_update`, `init_coder_ace_plus`, `MDCT_selector*`, `SetModeIndex`, `analysisCldfbEncoder_fx`, `vad_proc`, `analy_sp` |
-| デコーダ/ポストフィルタ | 14 | 中高 | `Init_post_filter`, `nb_post_filt`, `formant_post_filt`, `scale_st`, `blend_subfr2`, `dec_acelp_tcx_frame`, `waveform_adj2_fix`, `concealment_update2_x`, `open_decoder_LPD`, `post_decoder` |
-| Misc | 3 | 低〜中 | `PulseResynchronization`, `D_ACELP_indexing` |
+### 6.1 リンク確認
 
-## 7. 推奨次ステップ
+```text
+[260/261] Linking CXX static library TelephonyDSP.lib
+[261/261] Linking CXX executable TelephonyRunner.exe
+```
 
-1. **ACELP core encoder** (14 シンボル) を実装。ピッチ家族が既に解決済みなので、依存関係が整っている。
-2. **Decoder / post-filter** (14 シンボル) を実装。ピッチ・FD-CNG decoder が既に解決済み。
-3. **Core encoder / VAD 前処理** (19 シンボル) を実装。ACELP core encoder 完了後に着手すると依存が整理しやすい。
+`LNK1120` は **0** となり、`TelephonyRunner.exe` が生成された。残存するリンク警告は `Log2_norm_lc` / `Pow2` の重複定義（`basop_util.c` と `basic_math/log2.c` / `basic_math/math_op.c`）のみで、動作に影響しない既知のもの。
+
+### 6.2 実行確認
+
+```powershell
+./out/build/x64-release/TelephonyRunner.exe --help
+./out/build/x64-release/TelephonyRunner.exe tmp/test_16k.wav --mode evs_native --evs-sr 16000 --evs-br 13200 --evs-bw WB
+```
+
+- `--help` は正常に表示される。
+- `evs_native` モードはクラッシュせずに終了し、出力 WAV を生成する。
+- ただし、現時点では **出力 WAV が 0 バイト** になる。これは `enc_acelp_tcx_main` などのコア符号化パスがリンク unblock stub のためであり、今後の数値的実装で音声が出力されるようになる。
+
+## 7. 未解決の機能的課題（リンクは通ったが stub あり）
+
+| 領域 | 残課題 | 影響 |
+|---|---|---|
+| ACELP/TCX コア符号化 | `E_ACELP_1`, `E_GAIN_closed_loop_search`, `encode_acelp_gains`, `enc_acelp_tcx_main` などが stub | `evs_native` 出力が 0 バイト、音声品質未実装 |
+| FD-CNG | `perform_noise_estimation_enc`, `FdCng_encodeSID`, `generate_comfort_noise_*`, `generate_masking_noise` などが stub | 快適雑音生成/SID 符号化が機能しない |
+| デコーダ LPD 状態機 | `open_decoder_LPD` 以外の多くが stub | フレーム喪失時のコンシールメントなどが未実装 |
+| VAD/前処理 | `vad_proc`, `analy_sp`, `MDCT_selector` などが stub | DTX/VAD 判定が固定値に近い動作 |
+
+これらは **リンクエラー解決後の機能実装フェーズ** として別途対応する。
 
 ## 8. 変更中ファイル一覧
 
-### 未追跡（新規ヘルパー）
+### コミット済み（`feature/evs-fx-link-helpers`）
+- `acelp_core_fx.c`
+- `basic_utils_fx.c`
 - `basop1616_fx.c`
 - `basop_extra_fx.c`
-- `basic_utils_fx.c`
 - `cldfb_fx.c`
-- `fdcng_enc_fx.c`
+- `core_enc_vad_fx.c`
+- `dec_postfilter_fx.c`
 - `fdcng_dec_fx.c`
+- `fdcng_enc_fx.c`
 - `get_gain_fx.c`
 - `lerp_fx.c`
 - `pitch_fx.c`
 - `tec_tfa_tbe_fx.c`
 - `tns_base_fx.c`
-
-### 変更済み追跡ファイル
-- `.gitignore` — `tmp/` を追加
-- `cmake/3gpp-evs.cmake` — 上記ヘルパー・BASOP ソース・コンパイル定義の追加
-- `EVS_FX_PROGRESS.md` — 進捗更新
+- `EVS_FX_PROGRESS.md`
+- `.gitignore`
+- `cmake/3gpp-evs.cmake`
 
 ### 未変更（読み取り専守）
 - `external/3gpp-evs/**` — 一切編集していない。
