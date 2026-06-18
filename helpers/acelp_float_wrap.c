@@ -11,6 +11,10 @@
 #define E_ACELP_indexing   evs_fx_E_ACELP_indexing
 #define D_ACELP_indexing   evs_fx_D_ACELP_indexing
 
+/* The 43-bit special cases are supplied by acelp_43bit_float.c (see below). */
+#define E_ACELP_code43bit  evs_fx_E_ACELP_code43bit
+#define D_ACELP_decode_43bit evs_fx_D_ACELP_decode_43bit
+
 /* Rename tables that collide with the fixed-point ROM names. */
 #define tipos              evs_float_tipos
 #define pulsestostates     evs_float_pulsestostates
@@ -21,21 +25,7 @@
 #define index_mask         evs_float_index_mask
 #define PulseConfTable     evs_float_PulseConfTable
 
-/* Stubs for the 43-bit special case; our smoke test does not use 43 bits,
- * and pulling in cod4t64.c / dec4t64.c drags in many more dependencies. */
-static short E_ACELP_code43bit(const float code[], unsigned long *ps, int *p,
-                               unsigned short idxs[])
-{
-    (void)code; (void)ps; (void)p; (void)idxs;
-    return 0;
-}
-
-static void D_ACELP_decode_43bit(unsigned short idxs[], float code[], int pulsestrack[])
-{
-    int i;
-    (void)idxs; (void)pulsestrack;
-    for (i = 0; i < 64; i++) code[i] = 0.0f;
-}
+#include "acelp_43bit_float.c"
 
 /* Stubs for helpers only referenced by dead code (E_ACELP_innovative_codebook).
  * Keeping them empty lets /OPT:REF discard that code path without dragging in

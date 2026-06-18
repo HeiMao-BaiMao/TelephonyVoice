@@ -297,6 +297,12 @@ target_compile_definitions(evs-lib-dec PRIVATE ${EVS_WB_VAD_RENAME_DEFS})
 if(MSVC)
     target_compile_definitions(evs-lib-dec PRIVATE _CRT_SECURE_NO_WARNINGS)
     target_compile_options(evs-lib-dec PRIVATE /wd4244 /wd4267 /wd4018 /wd4305 /O2)
+    # Work around an MSVC internal compiler error (C1001) in avq_dec.c
+    # when compiled with /O2 in this toolchain version.  /Od for this
+    # single file avoids the crash without affecting the rest of the
+    # decoder library.
+    set_source_files_properties("${EVS_ROOT}/lib_dec/avq_dec.c"
+        PROPERTIES COMPILE_FLAGS "/Od")
 endif()
 
 # ---------------------------------------------------------------------------

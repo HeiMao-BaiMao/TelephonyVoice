@@ -369,6 +369,40 @@ static Word16 float_to_q9(float x)
     return (Word16)v;
 }
 
+/* ----------------------------------------------------------------------------
+ * PulseConfig translation from the FX namespace to the float helper namespace.
+ *
+ * The FX cnst_fx.h and the float cnst.h share the same TRACKPOS semantics but
+ * disagree on the numeric value of TRACKPOS_FREE_THREE (5 vs 6).  The float
+ * ACELP helper was compiled against the float enum, so we must translate the
+ * codetrackpos field before passing an FX PulseConfig to it.
+ *
+ * The FX code stores config.alp as a Q13 fixed-point integer (e.g. 6144 means
+ * 0.75) even though the shared PulseConfig.alp field is typed as float.  The
+ * float search expects a normalised floating-point energy, so convert it back.
+ * --------------------------------------------------------------------------- */
+static int codetrackpos_fx_to_float(int fx)
+{
+    switch (fx)
+    {
+    case 0:  return 0;  /* TRACKPOS_FIXED_FIRST        */
+    case 1:  return 1;  /* TRACKPOS_FIXED_EVEN         */
+    case 2:  return 2;  /* TRACKPOS_FIXED_FIRST_TWO    */
+    case 3:  return 3;  /* TRACKPOS_FIXED_TWO          */
+    case 4:  return 4;  /* TRACKPOS_FREE_ONE           */
+    case 5:  return 6;  /* TRACKPOS_FREE_THREE (FX=5, float=6) */
+    default: return fx;
+    }
+}
+
+static PulseConfig pulseconfig_fx_to_float(const PulseConfig *fx)
+{
+    PulseConfig flt = *fx;
+    flt.codetrackpos = (enum TRACKPOS)codetrackpos_fx_to_float((int)fx->codetrackpos);
+    flt.alp = fx->alp / 8192.0f;
+    return flt;
+}
+
 /* ============================================================================
  * E_ACELP_4tsearch
  *
@@ -400,7 +434,10 @@ void E_ACELP_4tsearch(
         H_f[i]  = fx_to_float(H[i]);
     }
 
-    evs_fx_E_ACELP_4tsearch(dn_f, cn_f, H_f, code_f, (PulseConfig *)config, ind, y_f);
+    {
+        PulseConfig cfg = pulseconfig_fx_to_float(config);
+        evs_fx_E_ACELP_4tsearch(dn_f, cn_f, H_f, code_f, &cfg, ind, y_f);
+    }
 
     for (i = 0; i < L_SUBFR; i++)
     {
@@ -441,7 +478,10 @@ void E_ACELP_4tsearchx(
         Rw_f[i] = fx_to_float(Rw[i]);
     }
 
-    evs_fx_E_ACELP_4tsearchx(dn_f, cn_f, Rw_f, code_f, (PulseConfig *)config, ind);
+    {
+        PulseConfig cfg = pulseconfig_fx_to_float(config);
+        evs_fx_E_ACELP_4tsearchx(dn_f, cn_f, Rw_f, code_f, &cfg, ind);
+    }
 
     for (i = 0; i < L_SUBFR; i++)
     {
@@ -466,13 +506,14 @@ Word16 E_ACELP_indexing(
     Word16 i;
     Word16 wordcnt = (Word16)((config->bits + 15) >> 4);
     short saved;
+    PulseConfig cfg = pulseconfig_fx_to_float(config);
 
     for (i = 0; i < L_SUBFR; i++)
     {
         code_f[i] = (Float32)code[i] / 512.0f;
     }
 
-    saved = evs_fx_E_ACELP_indexing(code_f, *config, num_tracks, prm_i);
+    saved = evs_fx_E_ACELP_indexing(code_f, cfg, num_tracks, prm_i);
 
     for (i = 0; i < wordcnt; i++)
     {

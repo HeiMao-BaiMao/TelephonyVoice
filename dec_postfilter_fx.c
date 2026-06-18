@@ -72,6 +72,32 @@ extern void evs_fx_D_ACELP_indexing(
     int index[], short *BER_detect);
 
 /* ---------------------------------------------------------------------------
+ *  PulseConfig translation from the FX namespace to the float helper namespace.
+ *  See the matching comment in acelp_core_fx.c for the rationale.
+ * --------------------------------------------------------------------------- */
+static int codetrackpos_fx_to_float(int fx)
+{
+    switch (fx)
+    {
+    case 0:  return 0;  /* TRACKPOS_FIXED_FIRST        */
+    case 1:  return 1;  /* TRACKPOS_FIXED_EVEN         */
+    case 2:  return 2;  /* TRACKPOS_FIXED_FIRST_TWO    */
+    case 3:  return 3;  /* TRACKPOS_FIXED_TWO          */
+    case 4:  return 4;  /* TRACKPOS_FREE_ONE           */
+    case 5:  return 6;  /* TRACKPOS_FREE_THREE (FX=5, float=6) */
+    default: return fx;
+    }
+}
+
+static PulseConfig pulseconfig_fx_to_float(const PulseConfig *fx)
+{
+    PulseConfig flt = *fx;
+    flt.codetrackpos = (enum TRACKPOS)codetrackpos_fx_to_float((int)fx->codetrackpos);
+    flt.alp = fx->alp / 8192.0f;
+    return flt;
+}
+
+/* ---------------------------------------------------------------------------
  *  Small inline helpers
  * --------------------------------------------------------------------------- */
 
@@ -959,13 +985,14 @@ void D_ACELP_indexing(
     int index_i[8];
     Word16 i;
     Word16 wordcnt = (Word16)((config.bits + 15) >> 4);
+    PulseConfig cfg = pulseconfig_fx_to_float(&config);
 
     for (i = 0; i < wordcnt; i++)
     {
         index_i[i] = (int)index[i];
     }
 
-    evs_fx_D_ACELP_indexing(code_f, config, num_tracks, index_i, (short *)BER_detect);
+    evs_fx_D_ACELP_indexing(code_f, cfg, num_tracks, index_i, (short *)BER_detect);
 
     for (i = 0; i < L_SUBFR; i++)
     {
