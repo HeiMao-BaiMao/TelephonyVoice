@@ -1234,6 +1234,34 @@ if(TELEPHONY_USE_EVS_FX)
     )
 
     # ------------------------------------------------------------------
+    # Float ACELP helper for the fixed-point build
+    #
+    # The FX fixed-point snapshot does not ship the algebraic codebook
+    # search / indexing implementations; prot_fx.h declares the FX stubs
+    # but the upstream float reference implementation in
+    # lib_enc/enc_acelp.c, lib_enc/enc_acelpx.c and lib_dec/dec_acelp.c
+    # is reusable with a small amount of glue.  We compile just those
+    # three float sources (renamed so they do not collide with FX
+    # symbols) into a tiny static library and link it into evs-lib-com-fx.
+    #
+    # The helper is compiled with the normal float include paths (not the
+    # FX shim) and therefore sees the float options.h / typedef.h / cnst.h
+    # chain.  Conflicting ROM table names are rewritten with macros, and
+    # helpers referenced only by dead code are stubbed so the linker can
+    # discard that code path without pulling in the rest of the float
+    # encoder library.
+    # ------------------------------------------------------------------
+    add_library(evs-float-acelp STATIC
+        "${CMAKE_CURRENT_SOURCE_DIR}/helpers/acelp_float_wrap.c"
+    )
+    target_include_directories(evs-float-acelp PUBLIC ${EVS_INCLUDE_DIRS})
+    target_compile_definitions(evs-float-acelp PRIVATE ${EVS_WB_VAD_RENAME_DEFS})
+    if(MSVC)
+        target_compile_definitions(evs-float-acelp PRIVATE _CRT_SECURE_NO_WARNINGS)
+        target_compile_options(evs-float-acelp PRIVATE /wd4244 /wd4267 /wd4018 /wd4305 /O2)
+    endif()
+
+    # ------------------------------------------------------------------
     # Helper: per-target FX settings.  We define a function that
     # attaches the include dirs, compile definitions, force-include
     # shim, MSVC warning suppressions, and the wb_vad renames to the
@@ -1255,7 +1283,7 @@ if(TELEPHONY_USE_EVS_FX)
 
         if(MSVC)
             target_compile_definitions(${TGT} PRIVATE _CRT_SECURE_NO_WARNINGS)
-            target_compile_options(${TGT} PRIVATE /wd4244 /wd4267 /wd4018 /wd4305 /O2)
+            target_compile_options(${TGT} PRIVATE /wd4244 /wd4267 /wd4018 /wd4305 /O2 /GS-)
         endif()
     endfunction()
 
@@ -1487,6 +1515,7 @@ if(TELEPHONY_USE_EVS_FX)
 
     add_library(evs-lib-com-fx STATIC ${EVS_LIB_COM_FX_SOURCES})
     evs_configure_fx_target(evs-lib-com-fx)
+    target_link_libraries(evs-lib-com-fx PUBLIC evs-float-acelp)
     # evs-lib-com-fx carries the same basic-op / basop_mpy / basop_com_lpc
     # helpers that opencore-amrnb / opencore-amrwb / vo-amrwbenc also
     # define.  Symbols like Isqrt, Deemph2, Dot_product12 are duplicated

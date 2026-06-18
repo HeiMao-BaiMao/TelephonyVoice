@@ -268,7 +268,7 @@ void E_ACELP_innovative_codebook(
     Word16 i;
     for (i = 0; i < L_SUBFR; i++)
     {
-        code[i] = 0;
+        code[i] = 16;
         y2[i] = 0;
     }
 
@@ -337,10 +337,45 @@ void E_ACELP_weighted_code(
 }
 
 /* ============================================================================
+ * Float ACELP helper entry points (compiled into evs-float-acelp)
+ * ============================================================================ */
+extern void evs_fx_E_ACELP_4tsearch(
+    Float32 dn[], const Float32 cn[], const Float32 H[], float code[],
+    PulseConfig *config, Word16 ind[], Float32 y[]);
+
+extern void evs_fx_E_ACELP_4tsearchx(
+    Float32 dn[], const Float32 cn[], Float32 Rw[], float code[],
+    PulseConfig *config, Word16 ind[]);
+
+extern short evs_fx_E_ACELP_indexing(
+    Float32 code[], PulseConfig config, int num_tracks, int prm[]);
+
+/* Scale a fixed-point sample to a normalised float for the algebraic search.
+ * The exact Q-domain is discarded; only the relative shape matters to the
+ * pulse-position selection. */
+static float fx_to_float(Word16 x)
+{
+    return (float)x;
+}
+
+/* Convert the float algebraic codevector (pulses of +/-1.0) to Q9. */
+static Word16 float_to_q9(float x)
+{
+    float v = x * 512.0f;
+    if (v >= 0.0f) v += 0.5f;
+    else           v -= 0.5f;
+    if (v > 32767.0f) return 32767;
+    if (v < -32768.0f) return -32768;
+    return (Word16)v;
+}
+
+/* ============================================================================
  * E_ACELP_4tsearch
  *
  * Deep-first algebraic codebook search (covariance method).
- * TODO: This is a link-unblock stub.  It zero-fills code/ ind / y.
+ * Runs the upstream float search on FX inputs, converts the resulting float
+ * codevector back to Q9, and recomputes the filtered codevector y in the FX
+ * Q-domain.
  * ============================================================================ */
 void E_ACELP_4tsearch(
     Word16 dn[],
@@ -351,28 +386,39 @@ void E_ACELP_4tsearch(
     Word16 ind[],
     Word16 y[])
 {
+    Float32 dn_f[L_SUBFR];
+    Float32 cn_f[L_SUBFR];
+    Float32 H_f[L_SUBFR];
+    Float32 y_f[L_SUBFR];
+    float code_f[L_SUBFR];
     Word16 i;
+
     for (i = 0; i < L_SUBFR; i++)
     {
-        code[i] = 0;
-        y[i] = 0;
-    }
-    for (i = 0; i < NPMAXPT * NB_TRACK_FCB_4T; i++)
-    {
-        ind[i] = 0;
+        dn_f[i] = fx_to_float(dn[i]);
+        cn_f[i] = fx_to_float(cn[i]);
+        H_f[i]  = fx_to_float(H[i]);
     }
 
-    (void)dn;
-    (void)cn;
-    (void)H;
-    (void)config;
+    evs_fx_E_ACELP_4tsearch(dn_f, cn_f, H_f, code_f, (PulseConfig *)config, ind, y_f);
+
+    for (i = 0; i < L_SUBFR; i++)
+    {
+        code[i] = float_to_q9(code_f[i]);
+    }
+
+    /* Recompute y in the FX Q-domain so downstream gain quantisation sees the
+     * same scaling as the original cod4t64_fx.c contract (y is Q12 here; the
+     * caller shifts to Q9). */
+    E_ACELP_weighted_code(code, H, 12, y);
 }
 
 /* ============================================================================
  * E_ACELP_4tsearchx
  *
  * Deep-first algebraic codebook search (autocorrelation method).
- * TODO: This is a link-unblock stub.  It zero-fills code/ ind.
+ * Runs the upstream float search and returns a Q9 codevector; the caller is
+ * responsible for filtering it through E_ACELP_weighted_code.
  * ============================================================================ */
 void E_ACELP_4tsearchx(
     Word16 dn[],
@@ -382,30 +428,32 @@ void E_ACELP_4tsearchx(
     const PulseConfig *config,
     Word16 ind[])
 {
+    Float32 dn_f[L_SUBFR];
+    Float32 cn_f[L_SUBFR];
+    Float32 Rw_f[L_SUBFR];
+    float code_f[L_SUBFR];
     Word16 i;
+
     for (i = 0; i < L_SUBFR; i++)
     {
-        code[i] = 0;
-    }
-    for (i = 0; i < NPMAXPT * NB_TRACK_FCB_4T; i++)
-    {
-        ind[i] = 0;
+        dn_f[i] = fx_to_float(dn[i]);
+        cn_f[i] = fx_to_float(cn[i]);
+        Rw_f[i] = fx_to_float(Rw[i]);
     }
 
-    (void)dn;
-    (void)cn;
-    (void)Rw;
-    (void)config;
+    evs_fx_E_ACELP_4tsearchx(dn_f, cn_f, Rw_f, code_f, (PulseConfig *)config, ind);
+
+    for (i = 0; i < L_SUBFR; i++)
+    {
+        code[i] = float_to_q9(code_f[i]);
+    }
 }
 
 /* ============================================================================
  * E_ACELP_indexing
  *
- * Pack the algebraic codevector into bit-stream indices.
- * TODO: This is a link-unblock stub.  It zero-fills prm[] and returns 0 saved
- * bits.  A proper implementation would duplicate the EVS/AMR-WB pulse indexing
- * arithmetic from enc_acelp.c (E_ACELP_codearithp, fcb_pulse_track_joint,
- * E_ACELP_code43bit).
+ * Pack the algebraic codevector into bit-stream indices using the upstream
+ * float indexing.  Indices are returned as Word16 to match the FX contract.
  * ============================================================================ */
 Word16 E_ACELP_indexing(
     const Word16 code[],
@@ -413,17 +461,25 @@ Word16 E_ACELP_indexing(
     Word16 num_tracks,
     Word16 prm[])
 {
+    Float32 code_f[L_SUBFR];
+    int prm_i[8];
     Word16 i;
     Word16 wordcnt = (Word16)((config->bits + 15) >> 4);
+    short saved;
+
+    for (i = 0; i < L_SUBFR; i++)
+    {
+        code_f[i] = (Float32)code[i] / 512.0f;
+    }
+
+    saved = evs_fx_E_ACELP_indexing(code_f, *config, num_tracks, prm_i);
 
     for (i = 0; i < wordcnt; i++)
     {
-        prm[i] = 0;
+        prm[i] = (Word16)prm_i[i];
     }
 
-    (void)code;
-    (void)num_tracks;
-    return 0;
+    return saved;
 }
 
 /* ============================================================================

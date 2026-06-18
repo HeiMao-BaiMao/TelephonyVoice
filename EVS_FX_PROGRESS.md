@@ -7,11 +7,12 @@
 
 | 項目 | 値 |
 |---|---|
-| 最終ビルド結果 | **`TelephonyRunner.exe` リンク成功** |
+| 最終ビルド結果 | **`TelephonyRunner.exe` リンク成功・実行クラッシュ解消** |
 | 最新 `LNK1120` | **0 未解決外部参照** (`tmp/fx_link_after_wave3.log`) |
 | 初期 `LNK1120` | 138（`get_gain_fx` 実装前） |
 | 削減数 | **138 シンボルすべて解決** |
 | コミット | `c9d0b80` on branch `feature/evs-fx-link-helpers` |
+| `evs_native` 実行 | クラッシュせず終了、出力 WAV 生成（残 stub のため音声はほぼ無音） |
 
 ### `LNK1120` の推移
 
@@ -50,13 +51,15 @@
 | `pitch_fx.c` | Pitch family 8 シンボル | `pitch_ol_init_fx`, `pitch_ol_fx`, `pit_decode_fx`, `pit_Q_dec_fx`, `pit16k_Q_dec_fx`, `abs_pit_dec_fx`, `delta_pit_dec_fx`, `pitch_pred_linear_fit`。ピッチ復号は float 版を固定小数点化、`pitch_ol_fx` / `pitch_pred_linear_fit` はリンク unblock stub。 |
 | `fdcng_enc_fx.c` | FD-CNG encoder 10 シンボル | `createFdCngEnc`, `deleteFdCngEnc`, `initFdCngEnc`, `configureFdCngEnc`, `resetFdCngEnc`, `FdCng_exc`, `noisy_speech_detection`。`perform_noise_estimation_enc`, `FdCng_encodeSID`, `generate_comfort_noise_enc` は stub（TODO）。 |
 | `fdcng_dec_fx.c` | FD-CNG decoder 10 シンボル | `createFdCngDec`, `initFdCngDec`, `deleteFdCngDec`, `configureFdCngDec`, `ApplyFdCng`, `FdCng_decodeSID`, `generate_comfort_noise_dec`, `generate_comfort_noise_dec_hf`, `generate_masking_noise`, `noisy_speech_detection`。CNG 合成はリンク unblock stub。 |
-| `acelp_core_fx.c` | ACELP core 14 シンボル | `E_ACELP_codebook_corr`, `E_ACELP_codebook_target_update`, `E_ACELP_convolve`, `E_ACELP_correlation`, `E_ACELP_innovative_codeword`, `E_ACELP_q_pulse`, `E_ACELP_xAq`, `E_ACELP_xh_corr`, `E_ACELP_1`, `E_GAIN_closed_loop_search`, `encode_acelp_gains`, `BITS_ALLOC_config_acelp`, `Unified_weighting_fx`。相関・畳み込みは実装、コードブック探索・ゲイン量子化は stub。 |
+| `acelp_core_fx.c` | ACELP core 14 シンボル | `E_ACELP_xy2_corr`, `E_ACELP_adaptive_codebook`, `E_ACELP_innovative_codebook`, `E_ACELP_weighted_code`, `E_ACELP_4tsearch`, `E_ACELP_4tsearchx`, `E_ACELP_indexing`, `E_ACELP_hh_corr`, `E_ACELP_toeplitz_mul`, `E_ACELP_conv`, `E_GAIN_closed_loop_search`, `encode_acelp_gains`, `BITS_ALLOC_config_acelp`, `Unified_weighting_fx`。相関・畳み込み・重み付けは実装。`E_ACELP_4tsearch`/`4tsearchx`/`indexing` は `evs-float-acelp` ヘルパー（float 版探索／インデクシングのラッパー）を呼ぶ。 |
 | `core_enc_vad_fx.c` | Core encoder / VAD 19 シンボル | `enc_acelp_tcx_main`, `core_encode_update`, `init_coder_ace_plus`, `MDCT_selector_reset`, `InitTransientDetection`, `enc_prm_rf`, `SetModeIndex`, `analysisCldfbEncoder_fx`, `MDCT_selector`, `long_enr_fx`, `find_uv_fx`, `signal_clas_fx`, `core_acelp_tcx20_switching`, `analy_sp`, `AdjustFirstSID`, `RunTransientDetection`, `GetTCXAvgTemporalFlatnessMeasure`, `SetTCXModeInfo`, `vad_proc`。状態 init 系は機能実装、ACELP/TCX コア符号化・RF パックは stub。 |
-| `dec_postfilter_fx.c` | Decoder post-filter / LPD 14 シンボル | `init_decoder_LPD_fx`, `open_decoder_LPD`, `close_decoder_LPD`, `decode_gn_lpc`, `speech_music_class`, `acelp_mode_dec`, `core_decoder_signal`, `tcx_ltp_post`, `lpd_delay_switch`, `decoder_LPD_status`, `resynch_LPD`, `lpd_get_closest_freq_arry`, `lpd_get_closest_pitch_arry`, `scale_st`。`open_decoder_LPD` は既存 FX ヘルパーだけを使用し float-only 依存を避ける。LPD 状態機は stub。 |
+| `dec_postfilter_fx.c` | Decoder post-filter / LPD 14 シンボル | `init_decoder_LPD_fx`, `open_decoder_LPD`, `close_decoder_LPD`, `decode_gn_lpc`, `speech_music_class`, `acelp_mode_dec`, `core_decoder_signal`, `tcx_ltp_post`, `lpd_delay_switch`, `decoder_LPD_status`, `resynch_LPD`, `lpd_get_closest_freq_arry`, `lpd_get_closest_pitch_arry`, `scale_st`。`open_decoder_LPD` は既存 FX ヘルパーだけを使用し float-only 依存を避ける。`D_ACELP_indexing` は `evs-float-acelp` ヘルパーを呼ぶ。LPD 状態機は stub。 |
+| `helpers/acelp_float_wrap.c` | Float ACELP ヘルパー（`evs-float-acelp` ターゲット） | `enc_acelp.c`/`enc_acelpx.c`/`dec_acelp.c` の float 探索／インデクシング関数を自己完結オブジェクトにコンパイル。FX 側ではシンボル衝突を避けるため `evs_fx_*` にリネーム。`evs-lib-com-fx` にリンク。 |
 
 ## 3. `cmake/3gpp-evs.cmake` での主な改修
 
 - `EVS_FX_EXTRAS_LIB_COM` に上記ヘルパーを追加（Wave 3 では `acelp_core_fx.c`, `core_enc_vad_fx.c`, `dec_postfilter_fx.c` を新規追加）。
+- FX ビルド時に `evs-float-acelp` ターゲットを追加。`helpers/acelp_float_wrap.c` を float include パスでコンパイルし、`evs-lib-com-fx` に PUBLIC リンク。
 - `EVS_FX_BASOP_COM_SOURCES` に `basic_math/math_32.c`, `basop_mpy.c`, `basop_com_lpc.c`, `basop_lsf_tools.c`, `basop_util.c`, `rom_basop_util.c` を追加。
 - `basop_tcx_utils.c` と `lag_wind.c` を FX ビルドから除外（`BASOP_cfft` 4 引数/6 引数のシグネチャ競合＋float ヘッダ漏れのため）。
 - `evs-lib-com-fx` に `/FORCE:MULTIPLE` を設定（重複 BASOP シンボルを許容）。
@@ -124,24 +127,59 @@ cmd /c 'call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxilia
 ### 6.2 実行確認
 
 ```powershell
-./out/build/x64-release/TelephonyRunner.exe --help
-./out/build/x64-release/TelephonyRunner.exe tmp/test_16k.wav --mode evs_native --evs-sr 16000 --evs-br 13200 --evs-bw WB
+./out/build/x64-debug/TelephonyRunner.exe --help
+./out/build/x64-debug/TelephonyRunner.exe tmp/test_16k.wav --mode evs_native --evs-sr 16000 --evs-br 13200 --evs-bw WB
 ```
 
 - `--help` は正常に表示される。
 - `evs_native` モードはクラッシュせずに終了し、出力 WAV を生成する。
-- ただし、現時点では **出力 WAV が 0 バイト** になる。これは `enc_acelp_tcx_main` などのコア符号化パスがリンク unblock stub のためであり、今後の数値的実装で音声が出力されるようになる。
+- 現時点では **出力 WAV は小振幅だが無音ではない**（フレーム 21120、max 467、RMS 47 程度）。
+  - エンコーダは 13.2 kbps フルレートフレームを出力するまで到達。
+  - デコーダも `read_indices_fx` / `evs_dec_fx` を通過して PCM を返す。
+  - `E_ACELP_4tsearch` / `E_ACELP_4tsearchx` / `E_ACELP_indexing` と `D_ACELP_indexing` に決定論的パルスパターンを導入し、エンコード／デコードループを自己整合させた。
+  - パルス振幅・密度を変えても出力レベルは頭打ちになるため、残りの音量不足はゲイン量子化／予測創作エネルギー `Es_pred` の側に原因があると推定された。
+  - **追記**: 上記 ACELP 固定符号帳の探索／インデクシングを、float 版 `enc_acelp.c` / `enc_acelpx.c` / `dec_acelp.c` を流用した新規ヘルパー `evs-float-acelp` に置き換えた。`acelp_core_fx.c` / `dec_postfilter_fx.c` は FX 入出力を float 入出力に変換して呼び出し、Q9 コードベクトルで戻す。ビルド・リンク・smoke test は成功し、自己整合性は維持される。出力レベルは引き続きゲイン量子化側の stub が支配している。
 
 ## 7. 未解決の機能的課題（リンクは通ったが stub あり）
 
 | 領域 | 残課題 | 影響 |
 |---|---|---|
 | ACELP/TCX コア符号化 | `E_ACELP_1`, `E_GAIN_closed_loop_search`, `encode_acelp_gains`, `enc_acelp_tcx_main` などが stub | `evs_native` 出力が 0 バイト、音声品質未実装 |
+| ACELP 固定符号帳   | `E_ACELP_4tsearch`/`E_ACELP_4tsearchx`/`E_ACELP_indexing`、`D_ACELP_indexing` は float 版を流用したが、入出力スケーリングは近似 | 出力は自己整合するが低レベル。ゲイン量子化側が主因 |
 | FD-CNG | `perform_noise_estimation_enc`, `FdCng_encodeSID`, `generate_comfort_noise_*`, `generate_masking_noise` などが stub | 快適雑音生成/SID 符号化が機能しない |
 | デコーダ LPD 状態機 | `open_decoder_LPD` 以外の多くが stub | フレーム喪失時のコンシールメントなどが未実装 |
-| VAD/前処理 | `vad_proc`, `analy_sp`, `MDCT_selector` などが stub | DTX/VAD 判定が固定値に近い動作 |
+| VAD/前処理 | `vad_proc`, `MDCT_selector` などが stub | DTX/VAD 判定が固定値に近い動作 |
 
 これらは **リンクエラー解決後の機能実装フェーズ** として別途対応する。
+
+### 6.3 今回修正した追加課題
+
+| 修正箇所 | 内容 | 効果 |
+|---|---|---|
+| `dsp/Biquad.h` | `reset()` で係数をゼロにせず、状態のみクリア。未設定フィルタは恒等フィルタになる。 | EVS_NATIVE の bypass フィルタが信号を殺さなくなった。 |
+| `core_enc_vad_fx.c` | `analy_sp` を固定小数点実装（float FFT + Q 変換）。 | `speech_music_classif_fx` の `div_s(0,0)` abort を回避。 |
+| `evs_api_fx.c` | デコーダ生成時に `Decoder_State_fx::bit_stream_fx` を割り当て・解放。 | `read_indices_fx` の `NULL` 書き込みクラッシュを回避。 |
+| `evs_api_fx.c` | オールゼロ入力フレームをエンコード前にスキップ。 | Levinson-Durbin などの `div_s` assert 発火を回避。 |
+| `dsp/EvsCodec.cpp` | 不要なフレーム毎デバッグログを削除。 | ランナー出力がクリーンに。 |
+| `acelp_core_fx.c` | `E_ACELP_4tsearch`/`E_ACELP_4tsearchx`/`E_ACELP_indexing` に決定論的 + パルスパターンを実装。 | 固定符号帳がゼロにならず、デコーダと整合する。 |
+| `dec_postfilter_fx.c` | `D_ACELP_indexing` をエンコーダと同じパターンに合わせる。 | エンコード／デコードループが自己整合。 |
+
+### 6.4 ACELP 固定符号帳 stub のチューニング結果
+
+```powershell
+./out/build/x64-debug/TelephonyRunner.exe tmp/test_16k.wav --mode evs_native --evs-sr 16000 --evs-br 13200 --evs-bw WB
+```
+
+| パルス条件 | 振幅 (Q9) | 出力 max | RMS | 備考 |
+|---|---|---:|---:|---|
+| `i & 3 == 0` | 512 | 239 | 23.6 | 交互符号 |
+| `i & 3 == 0` | 64  | 81  | 2.1 | 振幅小さすぎ |
+| `i & 3 == 0` | 8   | 467 | 47.2 | 現状最良 |
+| `i & 1 == 0` | 8   | 467 | 47.2 | 密度を上げても頭打ち |
+| 全サンプル   | 8   | 467 | 47.2 | 密度を上げても頭打ち |
+
+- 振幅や密度を変えても出力レベルはほぼ変わらないため、音量のボトルネックは固定符号帳のパターンそのものではなく、後段のゲイン量子化／`Es_pred` の推定値にあると考えられる。
+- 決定論的 stub からさらに大きな音量を出すには、float 版 `enc_acelp.c` / `dec_acelp.c` の代数的探索／pulse indexing を fixed-point 化する必要がある。
 
 ## 8. 変更中ファイル一覧
 
@@ -163,6 +201,9 @@ cmd /c 'call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxilia
 - `EVS_FX_PROGRESS.md`
 - `.gitignore`
 - `cmake/3gpp-evs.cmake`
+- `dsp/Biquad.h`
+- `evs_api_fx.c`
+- `dsp/EvsCodec.cpp`
 
 ### 未変更（読み取り専守）
 - `external/3gpp-evs/**` — 一切編集していない。

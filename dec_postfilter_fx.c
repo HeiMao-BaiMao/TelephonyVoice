@@ -65,6 +65,13 @@
 #include <string.h>
 
 /* ---------------------------------------------------------------------------
+ *  Float ACELP helper entry point (compiled into evs-float-acelp)
+ * --------------------------------------------------------------------------- */
+extern void evs_fx_D_ACELP_indexing(
+    Float32 code[], PulseConfig config, int num_tracks,
+    int index[], short *BER_detect);
+
+/* ---------------------------------------------------------------------------
  *  Small inline helpers
  * --------------------------------------------------------------------------- */
 
@@ -936,8 +943,10 @@ void PulseResynchronization(
 }
 
 /* ---------------------------------------------------------------------------
- *  D_ACELP_indexing - ACELP innovation de-indexing (link-unblock stub)
- *  TODO: full fixed-point port using pulsestostates / indx_fact tables.
+ *  D_ACELP_indexing - ACELP innovation de-indexing
+ *
+ * Decode the EVS pulse indices using the upstream float de-indexer and convert
+ * the resulting float codevector (pulses of +/-1.0) to Q9 for the FX decoder.
  * --------------------------------------------------------------------------- */
 void D_ACELP_indexing(
     Word16 code[],
@@ -946,18 +955,25 @@ void D_ACELP_indexing(
     Word16 index[],
     Word16 *BER_detect)
 {
+    Float32 code_f[L_SUBFR];
+    int index_i[8];
     Word16 i;
+    Word16 wordcnt = (Word16)((config.bits + 15) >> 4);
 
-    (void)config;
-    (void)num_tracks;
-    (void)index;
+    for (i = 0; i < wordcnt; i++)
+    {
+        index_i[i] = (int)index[i];
+    }
+
+    evs_fx_D_ACELP_indexing(code_f, config, num_tracks, index_i, (short *)BER_detect);
 
     for (i = 0; i < L_SUBFR; i++)
     {
-        code[i] = 0;
+        float v = code_f[i] * 512.0f;
+        if (v >= 0.0f) v += 0.5f;
+        else           v -= 0.5f;
+        if (v > 32767.0f) code[i] = 32767;
+        else if (v < -32768.0f) code[i] = -32768;
+        else code[i] = (Word16)v;
     }
-
-    *BER_detect = 0;
-
-    return;
 }
