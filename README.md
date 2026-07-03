@@ -1,618 +1,196 @@
 # TelephonyVoice
 
-VST3 plugin (and CLI runner) that emulates telephone / cellular voice paths.
-The VST UI uses route labels such as `in -> exchange -> out`, `fixed line`,
-`4G mobile`, and `5G mobile` rather than codec-standard names. Personal-use
-builds can use the bundled 3GPP reference implementations; distribution builds
-hide those modes and use distributable stand-ins only.
+固定電話・携帯電話の音声経路をエミュレートする VST3 プラグイン(+ CLI ランナー)です。
+UI はコーデック規格名ではなく「`in -> 交換局 -> out`」「固定電話」「4G携帯」「5G携帯」
+といった経路ラベルで操作します。個人利用ビルドは同梱の 3GPP 参照実装を使用でき、
+配布ビルドではそれらのモードを隠して配布可能な代替実装のみを使います。
 
-## Quick Start
+- 作業履歴の詳細: [docs/CHANGELOG.md](docs/CHANGELOG.md)
+- 実装ロードマップ (Tier 0〜4): [docs/ROADMAP.md](docs/ROADMAP.md)
+
+## クイックスタート
 
 ```pwsh
-# 1. Clone with submodules
+# 1. サブモジュールごとクローン
 git clone --recurse-submodules <this-repo> TelephonyVoice
 cd TelephonyVoice
 
-# 2. Configure (VS 18 / Ninja)
+# 2. 構成 (VS 18 / Ninja)
 cmd /c "call `"C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvars64.bat`" && cmake --preset x64-release"
 
-# 3. Build
+# 3. ビルド
 cmd /c "call `"C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvars64.bat`" && cmake --build out/build/x64-release --parallel"
 ```
 
-Outputs:
+成果物:
 
 * `out/build/x64-release/TelephonyRunner.exe` – CLI
-* `out/build/x64-release/VST3/Release/TelephonyVoice.vst3` – plugin
+* `out/build/x64-release/VST3/Release/TelephonyVoice.vst3` – プラグイン
 
-Run the CLI on any 16-bit PCM WAV:
+CLI は 16-bit PCM WAV を入力すると、各モードの出力 `<入力名>.<モード>.wav` を
+まとめて生成します:
 
 ```pwsh
 .\out\build\x64-release\TelephonyRunner.exe path\to\input.wav
 ```
 
-It produces `<input>.<mode>.wav` for each internal mode in parallel.
+コーデック設定は CLI フラグでも変更できます
+(`--g711-law` / `--amr-nb-mode` / `--amr-wb-mode` / `--opus-bitrate` /
+`--opus-bw` / `--evs-dtx-sid-interval` / `--evs-sc-vbr` など。
+`TelephonyRunner.exe --help` を参照)。
 
-## Routes and Modes
+## ルートとモード
 
-The VST path is modeled as two independently degraded legs:
+VST の経路は独立に劣化する 2 本のレグとしてモデル化されています:
 
 ```text
-in -> exchange -> out
+in -> 交換局 -> out
 ```
 
-UI parameters:
+UI パラメータ:
 
-* `in` – fixed line / 2G mobile / 3G mobile / 4G mobile / 5G mobile
-* `out` – fixed line / 2G mobile / 3G mobile / 4G mobile / 5G mobile
-* `degraded segment: in -> exchange -> out` – both legs, only input-to-exchange,
-  only exchange-to-output, or none
-* `packet loss` – applied as packet/frame erasure on the selected degraded leg(s)
-* `network degradation` – narrows the simulated path bandwidth and increases burst
-  loss on the selected degraded leg(s)
+* `in` / `out` – 固定電話 / 2G携帯 / 3G携帯 / 4G携帯 / 5G携帯 (+ 個人ビルドでは 5G携帯(精密))
+* `劣化区間: in -> 交換局 -> out` – 両区間 / in→交換局のみ / 交換局→out のみ / なし
+* `パケットロス` – 選択した劣化区間にパケット/フレーム消失として適用
+* `通信劣化` – 経路帯域の狭窄とバースト損失の増加
+* コーデック詳細 – G.711 Law / AMR-NB・AMR-WB モード / Opus ビットレート・帯域 /
+  EVS サンプルレート・ビットレート・帯域・DTX SID 間隔・SC-VBR
 
-Internally those user-facing endpoints map to codec-era modes:
+ユーザー向けエンドポイントは内部的に次のコーデック世代モードへマップされます:
 
-| `EraMode`                | Sample rate | Codec                  | Real implementation?                  |
+| `EraMode`                | サンプルレート | コーデック             | 実装                                   |
 | ------------------------ | ----------- | ---------------------- | ------------------------------------- |
-| `PSTN_G711`              | 8 kHz       | G.711 µ-law            | ✅ (Public Domain, Sun)               |
-| `GSM_FR`                 | 8 kHz       | GSM 06.10              | ✅ (libgsm, permissive)                |
-| `AMR_NB_3G`              | 8 kHz       | AMR-NB MR475~MR122 (selectable)           | ✅ (opencore-amr, Apache 2.0)          |
-| `AMR_WB_VOLTE`           | 16 kHz      | AMR-WB 6.60~23.85 kbps (selectable)      | ✅ (vo-amrwbenc + opencore-amrwb)     |
-| `EVS_LIKE`               | 32 kHz      | *filter-only stand-in* | ❌ (safe to ship)                     |
-| `EVS_NATIVE`             | 8/16/32/48  | 3GPP EVS reference     | ✅ (3GPP TS 26.443 v12.7.0/v13.3.0)   |
-| `Bypass`                 | host        | –                      | –                                     |
-| `OPUS_VOIP` *(experimental)* | 48 kHz   | Opus (VOIP application, 6~256 kbps selectable) | ✅ (opus, BSD) — non-distribution only |
-| `EVS_JBM` *(experimental)*   | 8/16/32/48 | EVS + Stage-1 JBM/VoIP adapter | ✅ (3GPP EVS + `EvsRXlib`) — exposed as `5G携帯 (JBM)` via `Mobile5GJbm` endpoint, `TELEPHONY_USE_EVS_JBM=ON` only |
+| `PSTN_G711`              | 8 kHz       | G.711 µ-law / A-law    | ✅ (パブリックドメイン, Sun)           |
+| `GSM_FR`                 | 8 kHz       | GSM 06.10              | ✅ (libgsm, 寛容ライセンス)            |
+| `AMR_NB_3G`              | 8 kHz       | AMR-NB MR475~MR122 (選択可) | ✅ (opencore-amr, Apache 2.0)      |
+| `AMR_WB_VOLTE`           | 16 kHz      | AMR-WB 6.60~23.85 kbps (選択可) | ✅ (vo-amrwbenc + opencore-amrwb) |
+| `EVS_LIKE`               | 32 kHz      | *フィルタのみの代替*    | ❌ (配布可能)                          |
+| `EVS_NATIVE`             | 8/16/32/48  | 3GPP EVS 参照実装       | ✅ (3GPP TS 26.443 v12.7.0/v13.3.0)    |
+| `Bypass`                 | ホスト      | –                      | –                                     |
+| `OPUS_VOIP` *(実験的)*   | 48 kHz      | Opus (VOIP アプリケーション, 6~256 kbps 選択可) | ✅ (opus, BSD) — 非配布ビルドのみ |
+| `EVS_JBM` *(実験的)*     | 8/16/32/48  | EVS + Stage-1 JBM/VoIP アダプタ | ✅ (3GPP EVS + `EvsRXlib`) — `Mobile5GJbm` エンドポイント経由で `5G携帯 (JBM)`、`TELEPHONY_USE_EVS_JBM=ON` のみ |
 
-## Current State of Work
+バイパスはレイテンシ補正付きです(プラグインがホストへ報告するレイテンシと同じ
+遅延をドライ信号にも与えるので、バイパス切替で音の位置がずれません)。
 
-### Done (latest — VST wiring fixes, DSP bug fixes, in-memory EVS API, tests)
+## ビルドオプション
 
-* **Biquad "disabled = mute" bug fixed** (`dsp/Biquad.h`): `Biquad::reset()`
-  zeroed all coefficients, so any mode that used `reset()` to mean "no
-  filtering" ran its audio through an all-zero filter. This silenced
-  `EVS_NATIVE` and `OPUS_VOIP` entirely at zero network degradation (both
-  skip the band cascade in that case). `reset()` is now an identity
-  pass-through. Caught by the new `TelephonyDspSmoke` test.
-* **Opus jitter-queue playback logic fixed** (`dsp/OpusCodec.cpp`): the
-  receive side consumed each packet immediately after encode via the FEC
-  path (2 frames before its scheduled arrival), so the decoder never saw
-  real payload and output only concealment. Playback now tracks the
-  correct slot (`playbackFrame - basePlaybackDelay()`), decodes the exact
-  packet when it has arrived, uses next-packet FEC only for genuinely
-  late/lost slots (without consuming the next packet), and drops stale
-  packets. Jitter is now zero at degradation 0 (direct-feed behaviour).
-* **VST parameter wiring completed** (`TelephonyVoice.cpp`): `process()`
-  previously ignored `kParamG711Law`, `kParamAmrWbMode`, `kParamOpusBitrate`,
-  `kParamEvsDtxSidInterval`, and `kParamEvsScVbr`; the controller never
-  registered AMR-WB Mode / Opus Bitrate / EVS SC-VBR at all. All five are
-  now handled in `process()` and registered in the controller UI. The EVS
-  DTX SID interval `RangeParameter` had `stepCount=1` (only 0 or 100
-  selectable); it is now 100 steps.
-* **State persistence completed**: `getState()`/`setState()` now persist
-  `currentAmrWbMode`, `currentG711Law`, `currentEvsScVbr`, and
-  `currentOpusBitrate` (appended after the existing fields, so older saved
-  states still load with defaults). `setComponentState()` was an empty stub
-  — the UI showed defaults after project reload; it now mirrors the
-  processor stream and restores every parameter position.
-* **Plugin identity fixed**: the factory definition still carried the
-  Voxengo placeholder vendor/URL/email; it now identifies this project
-  (vendor `Rumia Channel`). The placeholder FUIDs were replaced with
-  freshly generated ones. **Note:** hosts identify plugins by FUID, so
-  DAW projects saved with earlier dev builds will not find the plugin
-  under the new IDs. The IDs must stay stable from now on.
-* **`evs_api.c` no longer performs file I/O** — the G.192 round-trip
-  through `tmpfile()` (unsafe on the audio thread; broken for non-admin
-  users on Windows, where the fallback also opened a *shared fixed-name*
-  file in the CWD, corrupting concurrent instances) is gone. The encoder
-  serialises `ind_list` into the caller's buffer directly (replicating the
-  reference `write_indices()` G192 branch), and the decoder repacks the
-  G.192 words into a compact AU and feeds the exported
-  `read_indices_from_djb()`. The decoder also reuses a preallocated PCM
-  buffer instead of a per-frame `calloc`, mirrors the reference decoder
-  main loop by running `FRAMEMODE_MISSING` concealment when the RX DTX
-  handler flags an untransmitted gap, and validates the G.192 header
-  (sync word, frame length, rate allowlist) instead of `exit(-1)`.
-* **Smoke tests added** (`tests/TelephonyDspSmoke.cpp`, ctest name
-  `dsp_smoke`): sweeps every `EraMode` reachable in the build config over
-  a speech-like burst signal (a steady sine is classified as background
-  noise by the EVS VAD / energy VAD and would read as silence) and checks
-  finite, non-silent output; round-trips the raw EVS C API at WB 16 kHz
-  and SWB 32 kHz (the plugin default) with DTX on, covering SID/NO_DATA
-  frames and the PLC path. Run with `ctest --test-dir out/build/x64-release`.
+| オプション                  | 既定値  | 効果                                                                 |
+| -------------------------- | ------- | ---------------------------------------------------------------------- |
+| `TELEPHONY_USE_EVS_FX`     | OFF     | 実験的な固定小数点 EVS (TS 26.442)。FX ライブラリと `TelephonyDSP` まではビルドできるが、`TelephonyRunner` の最終リンクが未解決シンボルでブロック中(詳細は [docs/CHANGELOG.md](docs/CHANGELOG.md))。 |
+| `TELEPHONY_USE_EVS_JBM`    | OFF     | 3GPP `EvsRXlib` を包む実験的な EVS Stage-1 JBM/VoIP 受信アダプタ (`evs_api_rx`) と `EVSJbmSmoke` をビルド。`TELEPHONY_DISTRIBUTION_BUILD`・`TELEPHONY_USE_EVS_FX` とは併用不可。 |
+| `TELEPHONY_DISTRIBUTION_BUILD` | OFF | AMR/AMR-WB/EVS 参照実装を除外し、配布可能なモードのみを公開。 |
+| `TELEPHONY_EXPERIMENTAL_NETWORK` | ON (配布ビルドでは強制 OFF) | SpeexDSP + Opus をビルドし `OPUS_VOIP` モードを公開 (BSD ライセンス)。 |
 
-### Done (previous — Tier 0 codec control points)
+CMake プリセット:
 
-* **G.711 A-law selection**: `G711Codec` now supports A-law in addition to µ-law.
-  VST UI (`kParamG711Law`) + CLI (`--g711-law ulaw|alaw`).
-* **AMR-NB 8 modes** (MR475~MR122 / 4.75~12.2 kbps): `AMRNBCodec` ctor accepts
-  `mode` parameter. VST (`kParamAmrNbMode`) + CLI (`--amr-nb-mode 0..7`).
-* **AMR-WB 9 modes** (6.60~23.85 kbps): same pattern. VST (`kParamAmrWbMode`)
-  + CLI (`--amr-wb-mode 0..8`).
-* **Opus variable bitrate** (6~256 kbps): `OpusCodec::setBitrate()`. VST
-  (`kParamOpusBitrate`, 12 choices) + CLI (`--opus-bitrate`).
-* **Opus bandwidth switching** (NB/MB/WB/SWB/FB): `OpusCodec::setMaxBandwidth()`.
-  VST (`kParamOpusBandwidth`, 5 choices) + CLI (`--opus-bw`).
-* **EVS DTX SID interval**: `EVSCodec`/`EVSCodecJbm::setDtxSidInterval()`
-  (0=variable, 3~100=fixed frames). VST (`kParamEvsDtxSidInterval`) +
-  CLI (`--evs-dtx-sid-interval N`).
-* **EVS SC-VBR** (Source-Controlled VBR, 5.9 kbps mode):
-  `EVSCodec`/`EVSCodecJbm::setScVbrEnabled()`. VST (`kParamEvsScVbr`) +
-  CLI (`--evs-sc-vbr`).
-* **File structure refactor**: `TelephonyDSP.h` (744 lines) + `TelephonyDSP.cpp`
-  (2002 lines) split into `dsp/` subdirectory with 27 per-class files.
+| プリセット           | 内容                                       |
+| ------------------- | ------------------------------------------ |
+| `x64-release`       | 通常(個人利用)ビルド                      |
+| `x64-release-dist`  | 配布ビルド (`TELEPHONY_DISTRIBUTION_BUILD=ON`) |
+| `x64-release-jbm`   | EVS JBM 実験ビルド (`TELEPHONY_USE_EVS_JBM=ON`) |
+| `x64-debug` ほか    | デバッグ用                                  |
 
-### Done (previous)
+## テストと CI
 
-* `external/3gpp-evs` added as a submodule from
-  [`lem21h/3gpp-evs`](https://github.com/lem21h/3gpp-evs) (2024-05 3GPP EVS
-  update; the older wanglihe/3gpp-evs was tried first and removed).
-* `cmake/3gpp-evs.cmake` builds three static libs from the float variant:
-  `evs-lib-com`, `evs-lib-enc`, `evs-lib-dec`.  Plus an `INTERFACE
-  /FORCE:MULTIPLE` link option (MSVC) to resolve basop symbol collisions with
-  `opencore-amrnb`.
-* `evs_api.h` / `evs_api.c` – clean C wrapper around the reference
-  `init_encoder` / `evs_enc` / `init_decoder` / `evs_dec` quartet.
-  Originally staged the G.192 bitstream through `tmpfile()`; now fully
-  in-memory (see the latest "Done" section above).
-* `evs_api_fx.c` – fixed-point wrapper for `TELEPHONY_USE_EVS_FX=ON`.
-  This path is now partially wired, but remains experimental and link-blocked
-  (see the fixed-point status section below).
-* `TelephonyDSP` extended with an `EVS_NATIVE` mode, `EVSCodec` class
-  wrapping the C API, EVS configuration plumbing on `ChannelProcessor` and
-  `SignalProcessor`.  Default config: SWB 32 kHz / 13.2 kbps.
-* `TelephonyRunner` calls `setEVSConfig` for `EVS_NATIVE` and processes it
-  alongside the other era modes (personal/normal build). The integration
-  crash traced to two issues, both now resolved: EVS `wb_vad` symbol
-  collision with `vo-amrwbenc` (fixed at the parent-repo level by passing
-  `wb_vad=evs_wb_vad` / `wb_vad_init=evs_wb_vad_init` as compile
-  definitions to the EVS lib targets in `cmake/3gpp-evs.cmake` so the EVS
-  sources compile as if those symbols were renamed, without editing the
-  submodule) and r8brain `CDSPResampler24` `aMaxInLen=1024` overflow when
-  EVS-like/native 640-sample frames accumulated to >1024 samples (fixed
-  by chunking resampler calls). Distribution build still aliases
-  `EVS_NATIVE` to `EVS_LIKE` and omits it from the runner's mode list.
-* VST3 route selection now exposes `in`, `out`, and
-  `degraded segment: in -> exchange -> out`. Normal/personal builds expose
-  fixed line, 2G, 3G, 4G, 5G, and 5G precise/native. Distribution builds expose
-  only fixed line, 2G, and 5G stand-in.
-* Packet loss is modeled before/during the codec frame rather than as output
-  noise. AMR-NB and AMR-WB use the decoder `bfi` path. EVS Native uses
-  `FRAMEMODE_MISSING`. G.711, GSM, and EVS-Like use a waveform-repetition PLC
-  with pitch estimation and attenuation because those bundled APIs do not expose
-  a standards-grade PLC entry point.
-* `TELEPHONY_DISTRIBUTION_BUILD=ON` is implemented as a non-3GPP build path:
-  AMR/AMR-WB/EVS reference libraries are not included or linked, the UI only
-  exposes fixed line / 2G / 5G stand-in, and direct `EVS_NATIVE` requests are
-  aliased to `EVS_LIKE`.
-* `evs_api_rx.h` / `evs_api_rx.c` add a Stage-1 parent adapter around the 3GPP
-  `EvsRXlib` (`EVS_RX_*`) for the JBM/VoIP receive path. It is **OFF by
-  default** via the `TELEPHONY_USE_EVS_JBM` build option, float EVS only,
-  non-distribution only. The adapter now exposes a public
-  `evs_rx_jbm_g192_to_compact_au` helper, and a new `EVSCodecJbm` class
-  (sibling of `EVSCodec`) wires the encoder and the JBM together as a
-  single `ICodec`. The `EVS_JBM` mode is now reachable from
-  `TelephonyRunner` (suffix `evs_jbm`) when `TELEPHONY_USE_EVS_JBM=ON`,
-  gated by the same CMake option. The mode is **not** exposed in the VST
-  UI. `EVSCodecJbm` now also runs a small deterministic
-  packet-arrival / jitter queue between the encoder and the JBM: each
-  encoded AU is stamped with a `recvMs = rtpTsMs + offset` where the
-  offset comes from an LCG seeded from
-  `configureNetwork(networkDegradation)`; queue cap is 16, jitter window
-  scales linearly with `networkDegradation` (0 => no jitter, preserving
-  the previous direct-feed behaviour), and the queue is fed into the JBM
-  with its deterministic recv time exactly as the adapter's per-packet
-  wall clock. Offline renders remain deterministic (no real wall clock is
-  read), and no encoder CTLs are issued yet — only the queue +
-  `configureNetwork` plumbing. Still **not** exposed in the VST UI.
-  * Raw AU contract: callers feed compact EVS access unit bytes
-    (the same bit-packed payload the encoder produces); `au_bits_count` is
-    in **bits** (not bytes) and must already be aligned to the codec frame
-    size; RTP timestamps from the wire must be converted to the JBM's 1 ms
-    timeline before being fed into the receive adapter.
-  * When `TELEPHONY_USE_EVS_JBM=ON`, CMake also builds `EVSJbmSmoke`. It
-    validates the G.192 short-stream to compact MSB-first AU conversion through
-    `evs_rx_jbm_feed_frame` / `evs_rx_jbm_get_samples`, drains with
-    `evs_rx_jbm_is_empty` only at end-of-stream, checks non-zero decoded
-    energy and `evs_rx_jbm_get_fec_offset`, and uses only public parent APIs.
-* AMR-NB and AMR-WB encoders now enable their bundled 3GPP DTX/CNG path by
-  default in normal / personal builds. `AMRNBCodec` initializes
-  `Encoder_Interface_init(dtxEnabled ? 1 : 0)` (default `dtxEnabled = true`)
-  and `AMRWBCodec` passes `dtxEnabled ? 1 : 0` as the final `E_IF_encode`
-  argument (the AMR-WB init API does not take DTX). When DTX is enabled,
-  the encoded AMR frame payload size becomes SID/data-dependent inside the
-  3GPP reference encoder (it no longer matches a fixed per-mode byte count).
-  Both classes expose `setDtxEnabled(bool)` / `isDtxEnabled()` for callers
-  that need to override the default; the `EVS_NATIVE` DTX behaviour added
-  in the previous bullet is unchanged. The distribution build keeps its
-  pass-through AMR stubs with identical constructor signatures and does
-  not invoke any external encoder API, so it is unaffected.
+スモークテスト (`tests/TelephonyDspSmoke.cpp`) は、ビルド構成で到達可能な全
+`EraMode` に音声的なバースト信号を通して「有限かつ無音でない出力」を確認し、
+さらに非配布ビルドでは EVS C API を WB 16 kHz / SWB 32 kHz(プラグイン既定)で
+DTX 有効のままラウンドトリップします(SID / NO_DATA フレームと PLC 経路を含む)。
 
-### EVS Native Integration Status
-
-**Status: the `EVS_NATIVE` integration crash that previously blocked the
-runner is resolved.** The standalone EVS API (`evs_api.c` over the
-`init_encoder` / `evs_enc` / `init_decoder` / `evs_dec` quartet) was
-working throughout; the `SignalProcessor` / `TelephonyRunner`
-integration was crashing because of two upstream issues that have both
-been fixed in this tree:
-
-1. **EVS `wb_vad` symbol collision with `vo-amrwbenc`.** Both libraries
-   export a `wb_vad` symbol; under `INTERFACE /FORCE:MULTIPLE` (MSVC) one
-   wins at link time and the other runs with the wrong implementation,
-   which corrupts encoder state. Resolved at the parent-repo level by
-   passing `wb_vad=evs_wb_vad` and `wb_vad_init=evs_wb_vad_init` as
-   `target_compile_definitions` to `evs-lib-com` / `evs-lib-enc` /
-   `evs-lib-dec` in `cmake/3gpp-evs.cmake`. The C preprocessor rewrites
-   the identifiers in the EVS headers, sources, and call sites so the
-   binary exposes `evs_wb_vad*` and `vo-amrwbenc` keeps its own
-   `wb_vad*`. The submodule is not modified.
-2. **r8brain `CDSPResampler24` `aMaxInLen=1024` overflow.** EVS-like and
-   EVS-native paths emit 640-sample frames; accumulating more than 1024
-   samples before a resampler call exceeded the resampler's per-call
-   input cap. Resolved by chunking resampler calls so each call stays
-   within the supported input length.
-
-**Current state:**
-
-* The normal/personal build's `TelephonyRunner` now includes
-  `EVS_NATIVE` in its mode list and produces an `evs_native` output WAV
-  end-to-end.
-* `EVS_NATIVE` (non-distribution) now exercises the 3GPP EVS internal
-  VAD/DTX/SID/CNG path by default. `EVSCodec` calls
-  `evs_enc_create_ex` with DTX enabled and a variable SID update
-  interval (`dtx_sid_interval=0`); the legacy `evs_enc_create` entry
-  point is preserved as a thin wrapper that maps to `_ex(..., NULL)`
-  and reproduces the historical "DTX off" behaviour. Channel-aware
-  mode (RF) and source-controlled VBR (SC-VBR) stay off; RF is
-  restricted by the EVS spec to 13.2 kbps with >= 16 kHz input, and
-  JBM/RTP-packet-loss handling remain future work.
-* The distribution build (`TELEPHONY_DISTRIBUTION_BUILD=ON`) still
-  aliases `EVS_NATIVE` to `EVS_LIKE` and omits it from the runner's
-  mode list, so the EVS reference is never linked or invoked in shipped
-  builds. The DTX/CNG wiring in `EVSCodec` is also compiled out under
-  `TELEPHONY_DISTRIBUTION_BUILD`, so the distribution path is
-  unaffected.
-* Fixed-point EVS (`TELEPHONY_USE_EVS_FX`) has parent-repo-only WIP wiring.
-  It configures and compiles much further than before, but is not complete:
-  `TelephonyRunner` still fails at final link with unresolved FX helpers.
-  See `### CMake Build Option (EVS Fixed-Point — WIP / link-blocked)` below.
-
-### CMake Build Option (EVS Fixed-Point — WIP / link-blocked)
-
-The fixed-point EVS variant (TS 26.442 v16.4.0) is gated by
-`TELEPHONY_USE_EVS_FX=ON`. This is **not a shippable path yet**; the float
-EVS wrapper remains the practical supported EVS implementation. The current
-FX work keeps `external/3gpp-evs` read-only and applies compatibility shims
-from the parent repository only.
-
-Latest checked command:
-
-```powershell
-cmake --preset x64-release -DTELEPHONY_USE_EVS_FX=ON -DTELEPHONY_USE_EVS_JBM=OFF -DTELEPHONY_EXPERIMENTAL_NETWORK=OFF
-cmake --build out/build/x64-release --target TelephonyRunner --parallel
+```pwsh
+ctest --test-dir out/build/x64-release --output-on-failure
 ```
 
-**Current result:** configure succeeds; `evs-lib-com-fx`, `evs-lib-enc-fx`,
-`evs-lib-dec-fx`, and `TelephonyDSP` build. The `TelephonyRunner` build now
-gets through all object/static-library compilation, but the final executable
-link still fails on MSVC with `LNK1120: 138 unresolved external references`.
+JBM ビルドでは `EVSJbmSmoke` も `evs_jbm_smoke` として ctest に登録されます。
+GitHub Actions (`.github/workflows/ci.yml`) が push / PR ごとに
+`x64-release` / `x64-release-dist` / `x64-release-jbm` の 3 構成を
+ビルド+テストします。
 
-**Progress made:**
-
-1. `evs_api_fx.c` rewritten as a real wrapper around the fixed-point APIs
-   (`init_encoder_fx`, `evs_enc_fx`, `init_decoder_fx`, `evs_dec_fx`,
-   `destroy_encoder_fx`, `destroy_decoder`). Signature-compatible with
-   `evs_api.c`, so `dsp/EvsCodec` needs zero changes.
-2. `cmake/3gpp-evs.cmake` now generates and force-includes an FX compatibility
-   shim that suppresses the float `typedef.h` / `cnst.h` collisions, includes
-   the fixed-point `basic_op/typedefs.h` + `cnst_fx.h`, remaps the shared
-   `stat_com.h` types that FX sources need, fixes the `Mpy_32_16` 2-arg vs
-   3-arg collision, and overrides broken no-WMOPS control-flow macros.
-3. The parent CMake adds the fixed-point helper sources needed to get through
-   compilation: `basic_op` helpers, `basic_math` including `math_32.c`,
-   `basop_mpy.c`, `basop_com_lpc.c`, `basop_lsf_tools.c`, `basop_util.c`, and
-   `rom_basop_util.c`. MSVC `/FORCE:MULTIPLE` is used for expected duplicate
-   basic-op symbols shared with the AMR libraries.
-4. `external/3gpp-evs` remains untouched; all changes are parent-repo CMake / shim
-   changes.
-
-**Known exclusions / blockers:**
-
-* `basop_tcx_utils.c` remains excluded. It calls `BASOP_cfft` with a 4-argument
-  form, while the FX declaration uses a 6-argument form, and it also pulls in
-  float `prot.h` / `cnst.h` / `rom_com.h` headers.
-* `lag_wind.c` remains excluded. The upstream file is float-only and triggers
-  float `stat_dec.h` / `prot.h` / `rom_com.h` / `cnst.h` header leakage; FX
-  callers still need fixed-point `lag_wind` / `adapt_lag_wind` implementations
-  or a deliberate port.
-* The remaining unresolved externals are not one missing library. They are
-  missing fixed-point implementations/ports or float-only helper families:
-  TNS, CLDFB, FD-CNG, TCX/TEC/TBE, pitch/ACELP, post-filter/concealment,
-  `lag_wind` / `hp20` / `lerp` / `get_gain`, and `BASOP_cfft` / FFT / divide
-  helpers. Continuing requires a broader architecture decision: port these FX
-  helpers in the parent repository, introduce controlled stubs/wrappers, or keep
-  FX disabled while the float EVS path remains the supported path.
-
-## Distribution / Non-EVS Edition
-
-User requirement: a separate, distributable build that drops
-AMR/AMR-WB/EVS entirely (the codecs that have patent / 3GPP-member
-encumbrance) and only ships fixed line, 2G, and the 5G stand-in route.
-
-Implemented path:
-
-* `TELEPHONY_DISTRIBUTION_BUILD=ON` excludes
-  `cmake/vo-amrwbenc.cmake`, `cmake/opencore-amr.cmake`, and
-  `cmake/3gpp-evs.cmake`.
-* `TelephonyDSP` compiles without AMR/AMR-WB/EVS symbols. AMR stand-ins keep
-  the existing resampling/filter path and pass frames through instead of using
-  the 3GPP codecs.
-* `EraMode::EVS_NATIVE` is aliased to `EVS_LIKE` under the distribution build.
-* The VST3 UI lists only fixed line, 2G mobile, and 5G mobile stand-in under
-  the distribution build. 3G, 4G, and 5G precise/native are not reachable from
-  the distribution UI.
-* `TelephonyRunner` lists only G.711, GSM, and EVS-Like under the distribution
-  build because it still uses the internal mode names for generated filenames.
-
-## Code Layout
+## コード構成
 
 ```
 .
 ├── CMakeLists.txt
 ├── CMakePresets.json
+├── .github/workflows/ci.yml  # CI (3構成のビルド+ctest)
 ├── cmake/
-│   ├── 3gpp-evs.cmake     # builds evs-lib-{com,enc,dec}[-fx]
+│   ├── 3gpp-evs.cmake     # evs-lib-{com,enc,dec}[-fx] をビルド
 │   ├── g711.cmake
 │   ├── libgsm.cmake
 │   ├── opencore-amr.cmake
-│   ├── opus.cmake         # add_subdirectory(external/opus) with programs/tests OFF
+│   ├── opus.cmake         # external/opus を programs/tests OFF で add_subdirectory
 │   ├── r8brain.cmake
-│   ├── speexdsp.cmake     # static lib from selected libspeexdsp sources
+│   ├── speexdsp.cmake     # libspeexdsp の必要ソースのみの静的ライブラリ
 │   └── vo-amrwbenc.cmake
-├── evs_api.h              # public C API for the 3GPP EVS wrapper
-├── evs_api.c              # float variant (working wrapper)
-├── evs_api_fx.c           # fixed-point wrapper (experimental/link-blocked)
-├── dsp/                   # route-aware SignalProcessor, per-codec classes,
-│                          # PLC, resampler/filter chain (27 per-class files)
-├── TelephonyVoice.h       # VST3 processor + edit controller
-├── TelephonyVoice.cpp     # VST3 glue
-├── TelephonyRunner.cpp    # CLI: applies every era to a WAV
+├── evs_api.h              # 3GPP EVS ラッパーの公開 C API
+├── evs_api.c              # 浮動小数点版(完全インメモリ、ファイルI/Oなし)
+├── evs_api_fx.c           # 固定小数点版(実験的 / リンクブロック中)
+├── evs_api_rx.h / .c      # EVS JBM/VoIP 受信アダプタ (TELEPHONY_USE_EVS_JBM)
+├── dsp/                   # 経路対応 SignalProcessor、コーデック別クラス、
+│                          # PLC、リサンプラ/フィルタチェーン(クラス毎に27ファイル)
+├── TelephonyVoice.h       # VST3 プロセッサ + エディットコントローラ
+├── TelephonyVoice.cpp     # VST3 グルー
+├── TelephonyRunner.cpp    # CLI: 入力 WAV に全モードを適用
 ├── tests/
-│   └── TelephonyDspSmoke.cpp  # ctest smoke test (mode sweep + EVS API round-trip)
+│   └── TelephonyDspSmoke.cpp  # ctest スモークテスト
+├── docs/
+│   ├── CHANGELOG.md       # 作業履歴の詳細ログ
+│   └── ROADMAP.md         # 実装ロードマップ (Tier 0〜4)
 └── external/
-    ├── 3gpp-evs/          # 3GPP EVS reference (TS 26.443 + 26.442)
+    ├── 3gpp-evs/          # 3GPP EVS 参照実装 (TS 26.443 + 26.442)
     ├── G711_G72x/         # G.711/G.721/G.723
     ├── libgsm/            # GSM 06.10
-    ├── opencore-amr/      # AMR-NB + AMR-WB decoder
-    ├── opus/              # Opus codec (BSD)
-    ├── r8brain/           # sample-rate converter
-    ├── speexdsp/          # SpeexDSP (BSD, only preprocess/jitter/FFT subset built)
-    ├── vo-amrwbenc/       # AMR-WB encoder
+    ├── opencore-amr/      # AMR-NB + AMR-WB デコーダ
+    ├── opus/              # Opus コーデック (BSD)
+    ├── r8brain/           # サンプルレートコンバータ
+    ├── speexdsp/          # SpeexDSP (BSD、preprocess/jitter/FFT のみビルド)
+    ├── vo-amrwbenc/       # AMR-WB エンコーダ
     └── vst3sdk/           # Steinberg VST3 SDK
 ```
 
-## Build Options
+## 配布ビルド(非 EVS 版)
 
-| Option                     | Default | Effect                                                                 |
-| -------------------------- | ------- | ---------------------------------------------------------------------- |
-| `TELEPHONY_USE_EVS_FX`     | OFF     | Experimental fixed-point EVS (TS 26.442) build instead of float (TS 26.443); currently compiles through FX libs/`TelephonyDSP` but `TelephonyRunner` final link is blocked by unresolved FX helpers. |
-| `TELEPHONY_USE_EVS_JBM`    | OFF     | Build the experimental EVS Stage-1 JBM/VoIP receive adapter (`evs_api_rx`) around 3GPP `EvsRXlib` plus the `EVSJbmSmoke` smoke executable. Incompatible with `TELEPHONY_DISTRIBUTION_BUILD` and with `TELEPHONY_USE_EVS_FX`. |
-| `TELEPHONY_DISTRIBUTION_BUILD` | OFF | Strip AMR/AMR-WB/EVS references and expose only distributable modes. |
-| `TELEPHONY_EXPERIMENTAL_NETWORK` | ON (forced OFF in distribution builds) | Build SpeexDSP + Opus and expose `OPUS_VOIP` mode (BSD-licensed). |
+特許・3GPP メンバー関連の制約があるコーデック (AMR/AMR-WB/EVS) を完全に除外し、
+固定電話・2G・5G 代替ルートのみを載せた配布用ビルドです。
 
-## License Note
+* `TELEPHONY_DISTRIBUTION_BUILD=ON` で `cmake/vo-amrwbenc.cmake`、
+  `cmake/opencore-amr.cmake`、`cmake/3gpp-evs.cmake` を除外。
+* `TelephonyDSP` は AMR/AMR-WB/EVS のシンボルなしでコンパイルされ、AMR 代替は
+  既存のリサンプル/フィルタ経路でフレームをパススルーします。
+* `EraMode::EVS_NATIVE` は配布ビルドでは `EVS_LIKE` にエイリアスされます。
+* VST3 UI に表示されるのは固定電話 / 2G携帯 / 5G携帯(代替)のみ。
+  3G・4G・5G精密は配布 UI から到達できません。
+* `TelephonyRunner` も G.711 / GSM / EVS-Like のみを列挙します。
 
-For personal use, all libraries are permissively licensed
-(Apache 2.0 / MIT / public domain / custom permissive).  However,
-**AMR/AMR-WB/EVS codec patents** (VoiceAge, Fraunhofer, NTT DoCoMo,
-Ericsson, Nokia, etc.) apply to commercial distribution.  Use
-`TELEPHONY_DISTRIBUTION_BUILD=ON` for a build that avoids those codec
-implementations.
+## ライセンスと特許の注意
 
-The normal/personal build exposes `5G mobile (precise)` / `EVS Native` in the
-VST3 UI for testing. It must not be shipped. The distribution build keeps
-`EVS_NATIVE` aliased to `EVS_LIKE` and out of the runner's mode list, so
-the EVS reference is never linked or invoked in shipped builds.
+個人利用の範囲では、すべてのライブラリは寛容なライセンス
+(Apache 2.0 / MIT / パブリックドメイン / 独自の寛容ライセンス)です。ただし
+**AMR / AMR-WB / EVS のコーデック特許**(VoiceAge、Fraunhofer、NTTドコモ、
+Ericsson、Nokia など)は商用配布に適用されます。配布には
+`TELEPHONY_DISTRIBUTION_BUILD=ON` を使い、これらのコーデック実装を含まない
+ビルドにしてください。
 
-## Experimental / Non-GPL Additions
+通常(個人)ビルドはテスト用に `5G携帯(精密)` / EVS Native を VST3 UI に
+公開しますが、**このビルドは配布してはいけません**。配布ビルドでは
+`EVS_NATIVE` が `EVS_LIKE` にエイリアスされ、EVS 参照実装はリンクも呼び出しも
+されません。
 
-This first experimental step adds two BSD-licensed libraries — SpeexDSP and
-Opus — to the personal / non-distribution build, behind a new CMake option
-`TELEPHONY_EXPERIMENTAL_NETWORK` (default ON, **always OFF** under
-`TELEPHONY_DISTRIBUTION_BUILD`).
+## 実験的機能の概要
 
-The goal is to start reproducing 2G / 3G / 4G / 5G voice behaviour more
-faithfully while staying clear of GPL / AGPL and the heavier 3GPP patent
-encumbrances. Full RAN stacks (e.g. srsRAN, OAI) are intentionally **not**
-included; we only use the BSD DSP / codec primitives that already ship in
-those projects.
+* **SpeexDSP + Opus** (`TELEPHONY_EXPERIMENTAL_NETWORK`, 既定 ON):
+  BSD ライセンスの 2 ライブラリを非配布ビルドに追加。`OPUS_VOIP` モード
+  (48 kHz / 20 ms / VOIP アプリケーション、in-band FEC + DTX + 決定論的
+  ジッタバッファ付きのパケット化トランスポートをシミュレート)と、
+  `OPUS_VOIP` / `EVS_LIKE` の DTX を駆動するエナジー VAD
+  (`SpeexDSPAux`) を提供します。`OPUS_VOIP` は現状 CLI からのみ到達可能で、
+  VST の経路リストには追加していません。
+* **EVS JBM** (`TELEPHONY_USE_EVS_JBM`, 既定 OFF): 3GPP `EvsRXlib` を使う
+  受信側ジッタバッファ(JBM)アダプタ。`5G携帯 (JBM)` エンドポイントと
+  `EVSJbmSmoke` テストを追加します。浮動小数点 EVS 専用・非配布のみ。
+* **固定小数点 EVS** (`TELEPHONY_USE_EVS_FX`, 既定 OFF): TS 26.442 v16.4.0 の
+  移植作業中。コンパイルは通るものの最終リンクが未解決シンボルでブロックされて
+  おり、出荷可能な状態ではありません。浮動小数点版が引き続きサポート対象です。
 
-What is wired up in this step:
-
-* `cmake/speexdsp.cmake` builds a small static `speexdsp-core` library from
-  only the SpeexDSP preprocess / jitter / FFT sources we need
-  (`preprocess.c`, `jitter.c`, `buffer.c`, `fftwrap.c`, `filterbank.c`,
-  `kiss_fft.c`, `kiss_fftr.c`, `smallft.c`). The submodule is read-only —
-  no file under `external/speexdsp/` is modified. The SpeexDSP
-  autotools-generated `speexdsp_config_types.h` is replaced by a minimal
-  C99 stdint-based shim that the cmake module writes into the build tree.
-* `cmake/opus.cmake` pulls in `external/opus/CMakeLists.txt` via
-  `add_subdirectory()` with `OPUS_BUILD_TESTING=OFF`,
-  `OPUS_BUILD_PROGRAMS=OFF`, `OPUS_INSTALL_PKG_CONFIG_MODULE=OFF`,
-  `OPUS_INSTALL_CMAKE_CONFIG_MODULE=OFF`, and
-  `OPUS_BUILD_SHARED_LIBRARY=OFF` so we only link the static `opus`
-  library and do not build test programs / demos / docs.
-* New `EraMode::OPUS_VOIP` mode. Numeric values for existing modes stay
-  stable (the new mode is appended after `Bypass`). The CLI runner adds it
-  to its normal mode list with the suffix `opus_voip`. The distribution
-  runner does **not** include it.
-* `TelephonyDSP::OpusCodec` wraps the libopus C API. Defaults: 48 kHz,
-  20 ms frames, `OPUS_APPLICATION_VOIP`, 24 kbps target bitrate,
-  complexity 6. Frame loss is handled by calling `opus_decode(NULL, 0)`,
-  which lets Opus run its built-in PLC; the waveform concealer is only
-  the last-resort fallback. The codec now models a tiny packetized
-  transport on top of the bare encode/decode pair: in-band FEC is enabled
-  via `OPUS_SET_INBAND_FEC(1)`, expected loss via
-  `OPUS_SET_PACKET_LOSS_PERC(...)` driven by the clamped loss /
-  degradation values, and a deterministic LCG-based jitter buffer
-  simulates packet arrivals with a base + degradation-dependent delay.
-  Missing packets are concealed by in-band FEC (`decode_fec=1`) when the
-  next packet is available, otherwise by Opus's built-in PLC; DTX stays
-  enabled via Opus's internal VAD.
-* `TelephonyDSP::SpeexDSPAux` wraps `speex_preprocess` so the denoise (and
-   in the future AGC) primitives can be reached from `ChannelProcessor`,
- and now also provides a local energy-based VAD that drives
- `getSpeechProbability()` / `lastFrameIsSpeech()`. The energy VAD is
- now actively wired into the DTX path for the `OPUS_VOIP` and
- `EVS_LIKE` modes: in `ChannelProcessor::processCodec` the helper is
- fed each freshly-quantized int16 frame just before dispatch, and a
- silence classification forces the effective `packetLost` flag to
- `true` so Opus emits its built-in CNG via DTX and `EVS_LIKE`'s
- simulated-path PLC fills the slot with comfort noise. EVS_NATIVE /
- EVS_JBM keep their own 3GPP VAD and are intentionally not touched;
- AMR / G.711 / GSM are not in the experimental network scope and are
- unaffected. Only `SPEEX_PREPROCESS_SET_DENOISE` is enabled on the
- Speex state; the explicit `SPEEX_PREPROCESS_SET_VAD` ctl is left
- commented out because SpeexDSP's VAD is still a placeholder that
- prints `The VAD has been replaced by a hack pending a complete
- rewrite` every time it is enabled. To still give callers a meaningful
- speech probability, `SpeexDSPAux` runs a simple RMS-based VAD on the
- post-denoise frame in `runPreprocess()` and caches the result;
- `configure()` auto-scales the threshold by `sqrt(frameSize/160)` so
- longer frames aren't penalized, and `setEnergyVadEnabled()` lets
- callers opt out or override the threshold. The energy VAD is on by
- default, so `getSpeechProbability()` returns a value in [0,1] and
- `lastFrameIsSpeech()` returns `lastEnergyVadProb >0.5` instead of
- the legacy `-1.0f / false` "unknown" sentinel. A new
- `ChannelProcessor::getLastVadProb()` getter exposes the same value
- (or `-1.0f` when the helper isn't present) for telemetry / UI
- wiring.
-
-VST3 UI: the `OPUS_VOIP` mode is intentionally **not** exposed as a new
-endpoint in this step, to avoid changing the existing route string list
-or the host-side state-streams. It is reachable through `TelephonyRunner`
-for now; adding an endpoint option is a small follow-up.
-
-Distribution build (`TELEPHONY_DISTRIBUTION_BUILD=ON`):
-
-* Forces `TELEPHONY_EXPERIMENTAL_NETWORK=OFF`.
-* Skips `cmake/speexdsp.cmake` and `cmake/opus.cmake` entirely.
-* `OpusCodec` / `SpeexDSPAux` fall back to no-op stubs compiled with the
-  rest of `TelephonyDSP`, so the symbol table of a shipped plugin never
-  references `opus_*` or `speex_*`.
-
-What is deliberately still **not** in scope:
-
-* Full 2G/3G/4G PHY / RAN stacks. Anything under
-  `osmo-*` / `srsRAN` / `OAI` is GPL or AGPL and would force the whole
-  project onto those licenses; we are not pulling those in.
-* SpeexDSP-driven DTX for the legacy codecs in the non-experimental
-  path (AMR / G.711 / GSM) and for the 3GPP-native EVS family
-  (`EVS_NATIVE` / `EVS_JBM`). Those either already have their own
-  VAD (EVS) or are out of the experimental network scope
-  (AMR / G.711 / GSM); the energy VAD currently only drives DTX for
-  `OPUS_VOIP` and `EVS_LIKE` (see the SpeexDSPAux bullet above).
-
-## Implementation Roadmap
-
-All items are VST-plugin-internal only. No external network I/O, no
-multi-party conferencing, no signaling protocol stacks. The goal is
-perfect emulation of telephony noise, voice quality, packet loss, and
-radio degradation within the DAW plugin.
-
-Difficulty estimates: ★ = trivial (<50 lines), ★★ = small (50~150 lines),
-★★★ = medium (1~3 files, 150~500 lines), ★★★★ = large (cross-cutting,
-500+ lines), ★★★★★ = architecture redesign.
-
----
-
-### Tier 0 — codec control points ✅ COMPLETED (`b354da6`)
-
-| # | Item | Difficulty |
-|---|------|-----------|
-| 0.0 | File-structure refactor: `TelephonyDSP.h/cpp` → `dsp/` (27 files) | ★★★★★ |
-| 0.1 | **G.711 A-law / μ-law selection** — `G711Codec::setLaw()`, VST + CLI | ★ |
-| 0.2 | **EVS DTX SID interval** — `EVSCodec::setDtxSidInterval()` (0=variable, 3~100) | ★ |
-| 0.3 | **Opus variable bitrate** — `OpusCodec::setBitrate()` (6~256 kbps) | ★ |
-| 0.4 | **AMR-WB 9 modes** — `AMRWBCodec::setMode()` (6.60~23.85 kbps) | ★★ |
-| 0.5 | **AMR-NB 8 modes** — `AMRNBCodec::setMode()` (4.75~12.2 kbps) | ★★ |
-| 0.6 | **EVS SC-VBR** — `EVSCodec::setScVbrEnabled()` (5.9 kbps mode) | ★★ |
-| 0.7 | **Opus bandwidth** — `OpusCodec::setMaxBandwidth()` (NB~FB) | ★★ |
-
----
-
-### Tier 1 — network simulation fidelity
-
-The current `networkDegradation` slider couples 7 effects into one axis.
-Each item below decouples them or adds new independent simulation knobs.
-
-| # | Item | Difficulty |
-|---|------|-----------|
-| 1.1 | **Degradation parameter separation** — split `networkDegradation` into independent controls for: bandwidth narrowing, jitter amplitude, burst length mean, loss-rate boost, Opus FEC percent, Opus playback delay, filter-cascade enable. New `NetworkProfile` struct + VST knobs (6~8 new params). | ★★★★ |
-| 1.2 | **Gilbert-Elliott 2-state Markov loss model** — replace the current simplified burst model with proper Good↔Bad state transitions (p, r, k, h parameters). Add 3GPP TS 26.131 error patterns (EP1~EP6) as presets. | ★★★ |
-| 1.3 | **Jitter distribution upgrade** — change from uniform LCG jitter to Gamma / Weibull / Pareto distributions with configurable shape parameters. Add AR(1) autocorrelation for bursty jitter (consecutive frames with correlated delays). | ★★★ |
-| 1.4 | **Bit-error injection (BER)** — flip random bits in the encoded bitstream before decoding. Per-codec support: AMR bitstream corruption, EVS G.192 bit-flip, Opus ToC-aware corruption. New `--ber` CLI flag + VST slider. | ★ |
-| 1.5 | **Pure-silence DTX comparison mode** — emit true zero-PCM on DTX silence (bypass CNG) for A/B comparison. | ★ |
-| 1.6 | **Packet reordering** — allow jitter offsets to go negative (early arrivals), generating out-of-order seq delivery. Queue upgrade to `seq`-sorted multiset. Late-packet and duplicate-packet simulation. | ★★★★ |
-
----
-
-### Tier 2 — audio realism & comfort-noise quality
-
-| # | Item | Difficulty |
-|---|------|-----------|
-| 2.1 | **PSD-based comfort noise for G.711 / GSM / EVS_LIKE** — replace the current waveform-repetition PLC in non-DTX modes with proper spectrally-shaped comfort noise. Estimate PSD from recent good frames, generate colored noise, apply gain matching. | ★★★ |
-| 2.2 | **DTMF tone generation** — dual sine-wave generation with standard ITU-T frequencies and timing (50~100 ms on, 50 ms gap). Insert as test signal before the codec stage. | ★★ |
-| 2.3 | **Real-time transport mode** — use VST3 `ProcessContext::projectTimeMusic` for packet arrival times instead of the deterministic `frameIndex * 20 ms` clock. Togglable vs. deterministic mode. | ★★ |
-| 2.4 | **Opus detailed FEC controls** — expose `OPUS_SET_EXPERT_FRAME_DURATION` (2.5/5/10/20/40/60 ms), `OPUS_GET_MODE` (SILK/hybrid/CELT readout), `OPUS_SET_FORCE_MODE`. | ★★★ |
-| 2.5 | **EVS auto-bandwidth switching** — lightweight spectrum estimator on input → dynamically lower `max_bwidth` (NB→WB→SWB→FB) based on signal content. | ★★★ |
-| 2.6 | **Codec mode-switching transient artifacts** — simulate audible clicks / bandwidth-transition artifacts when AMR/EVS changes bitrate mid-call. Requires filter-coefficient interpolation and encoder-state preservation across mode changes. | ★★★★ |
-| 2.7 | **VAD→DTX extension to AMR / G.711 / GSM** — wire the existing SpeexDSP energy VAD to the legacy codecs (currently only OPUS_VOIP / EVS_LIKE). | ★ |
-| 2.8 | **EVS AMR-WB IO mode** — enable the 3GPP EVS encoder's inter-op mode that produces AMR-WB-compatible bitstreams. Requires `evs_dec_create` signature change (breaking). | ★★★ |
-| 2.9 | **VSTGUI editor** — custom visual route diagram showing the `in → exchange → out` path with live VU meters, loss-rate indicators, and codec labels. | ★★★★★ |
-
----
-
-### Tier 3 — protocol & transport fidelity (internal simulation)
-
-No actual network sockets. All protocol layers are simulated in-process for
-realistic codec/PCL/JBM behavior.
-
-| # | Item | Difficulty |
-|---|------|-----------|
-| 3.1 | **RTP header internal simulation** — build/serialize/parse 12-byte RTP fixed headers (V=2, P, X, CC, M, PT, seq, ts, SSRC). Feed serialized RTP packets through the internal jitter queue so codecs see RFC-compliant payloads. | ★★★ |
-| 3.2 | **RFC 4867 AMR payload format** — octet-aligned and bandwidth-efficient modes with CMR, ToC, and speech bits packing/unpacking. | ★★★★ |
-| 3.3 | **TS 26.445 EVS payload format** — header-full (CMR + ToC + payload) and compact modes. G.192 ↔ RFC payload conversion. | ★★★★ |
-| 3.4 | **Clock drift simulation** — asymmetric sample-rate offsets (±5~50 ppm) between encoder and decoder. Periodic buffer underrun/overrun → APA time-scaler activation. | ★★★★ |
-| 3.5 | **Hybrid echo (line echo)** — PSTN 2-wire/4-wire hybrid simulation: delayed, attenuated, filtered feedback of output into input path. Requires `SignalProcessor` architecture change (feedback loop). | ★★★★★ |
-| 3.6 | **RED (RFC 2198) + Opus FEC-only mode** — redundant audio payload encoding and Opus ToC-byte FEC indicator bit handling. | ★★★★ |
-| 3.7 | **RTCP receiver reports** — collect jitter, loss fraction, cumulative lost packets over the internal simulation timeline. Generate RTCP SR/RR/XR packets. Display as VST readouts (no network transmission). | ★★★ |
-
----
-
-### Tier 4 — wireless channel & deep simulation
-
-| # | Item | Difficulty |
-|---|------|-----------|
-| 4.1 | **Wireless fading / C-I rate adaptation** — Rayleigh/Jakes fading model → C/I estimation → dynamic AMR/EVS mode selection per 3GPP TS 45.008 / 36.101 channel models. | ★★★★★ |
-| 4.2 | **Handover gap simulation** — momentary mute (50~200 ms) with rapid codec-state recovery, mimicking inter-base-station handovers. | ★★★★ |
-| 4.3 | **EVS fixed-point v16 (TELEPHONY_USE_EVS_FX)** — WIP. Parent-only shim/source-list work now resolves the original typedef/cnst/stat_com compile blockers and builds the FX static libs plus `TelephonyDSP`, but `TelephonyRunner` still fails final link (`LNK1120: 138 unresolved external references`) because multiple FX helper families still need ports or deliberate stubs. | — WIP / link-blocked |
-| 4.4 | **Wideband extension to narrowband transcoding artifacts** — tandem coding effects when WB input is encoded as NB, then decoded and re-encoded. | ★★★★ |
-| 4.5 | **Voice activity detection (VAD-2) with hangover** — implement proper 3GPP-style VAD with primary decision, hangover addition, and burst-length smoothing. Currently only simple energy threshold. | ★★★ |
-
----
-
-### Out of scope (explicitly excluded)
-
-| Item | Reason |
-|------|--------|
-| Real network sockets (UDP/RTP send/receive) | DAW plugin, no external I/O |
-| SIP / SDP / IMS signaling stack | Not a real phone; pure audio processor |
-| Multi-party conferencing / N-way mixing | VST insert effect on a single track |
-| SRTP / DTLS encryption | No network layer to protect |
-| External microphone / speaker device I/O | Host DAW handles audio I/O via ASIO/WASAPI |
-| Real-time VoIP client mode | Offline deterministic rendering for reproducibility |
-| Full RAN stacks (srsRAN, OAI, Osmo-*) | GPL/AGPL license incompatibility |
-| PESQ / POLQA perceptual scoring | Licensing cost; not needed for plugin |
+詳細な経緯・設計メモはすべて [docs/CHANGELOG.md](docs/CHANGELOG.md) にあります。

@@ -176,6 +176,8 @@ TelephonyVoiceProcessor::TelephonyVoiceProcessor()
     , currentPacketLossRate(0.0f)
     , currentNetworkDegradation(0.0f)
     , currentBypass(false)
+    , bypassDelayLen(0)
+    , bypassDelayPos(0)
 {
     setControllerClass(TelephonyVoiceController::uid);
 }
@@ -219,6 +221,11 @@ tresult PLUGIN_API TelephonyVoiceProcessor::setActive(TBool state)
     if (state) {
         dsp.reset();
         updateDSPParameters();
+        // Size the bypass delay line to the latency the host is told about
+        // so bypassed audio stays time-aligned with processed audio.
+        bypassDelayLen = (int)dsp.getLatencySamples();
+        bypassDelayPos = 0;
+        bypassDelayBuf.assign(2, std::vector<float>((size_t)std::max(bypassDelayLen, 1), 0.0f));
     }
     return AudioEffect::setActive(state);
 }
@@ -313,23 +320,56 @@ tresult PLUGIN_API TelephonyVoiceProcessor::process(ProcessData& data)
     if (data.numInputs == 0 || data.numOutputs == 0) return kResultOk;
     if (data.symbolicSampleSize != kSample32) return kResultOk;
 
-    if (currentBypass) {
-        if (data.inputs[0].channelBuffers32 && data.outputs[0].channelBuffers32) {
-             for (int ch = 0; ch < data.numOutputs; ch++) {
-                 float* src = data.inputs[0].channelBuffers32[ch % data.numInputs];
-                 float* dst = data.outputs[0].channelBuffers32[ch];
-                 if (src != dst) memcpy(dst, src, data.numSamples * sizeof(float));
-             }
-        }
-        return kResultOk;
-    }
-
-    // Pass to DSP (Multi-channel)
     int32 numInCh = data.inputs[0].numChannels;
     int32 numOutCh = data.outputs[0].numChannels;
     float** in = data.inputs[0].channelBuffers32;
     float** out = data.outputs[0].channelBuffers32;
+    if (!in || !out || numInCh <= 0 || numOutCh <= 0) return kResultOk;
 
+    const int delayLen = bypassDelayLen;
+    const int maxDelayCh = (std::min)((int)numOutCh, (int)bypassDelayBuf.size());
+
+    if (currentBypass) {
+        // Latency-compensated bypass: emit the input delayed by the same
+        // amount the host compensates for (getLatencySamples()), so
+        // toggling bypass does not shift the audio in time.
+        for (int ch = 0; ch < numOutCh; ch++) {
+            float* src = in[ch % numInCh];
+            float* dst = out[ch];
+            if (delayLen <= 0 || ch >= maxDelayCh) {
+                if (src != dst) memcpy(dst, src, data.numSamples * sizeof(float));
+            } else {
+                float* ring = bypassDelayBuf[ch].data();
+                int pos = bypassDelayPos;
+                for (int32 i = 0; i < data.numSamples; ++i) {
+                    const float x = src[i]; // read before dst write: src may alias dst
+                    dst[i] = ring[pos];
+                    ring[pos] = x;
+                    if (++pos == delayLen) pos = 0;
+                }
+            }
+        }
+        if (delayLen > 0) bypassDelayPos = (int)((bypassDelayPos + data.numSamples) % delayLen);
+        return kResultOk;
+    }
+
+    // Keep the bypass delay line fed while processing normally so a
+    // mid-playback bypass toggle plays correctly aligned dry audio
+    // instead of a stale/zeroed buffer.
+    if (delayLen > 0) {
+        for (int ch = 0; ch < maxDelayCh; ch++) {
+            const float* src = in[ch % numInCh];
+            float* ring = bypassDelayBuf[ch].data();
+            int pos = bypassDelayPos;
+            for (int32 i = 0; i < data.numSamples; ++i) {
+                ring[pos] = src[i];
+                if (++pos == delayLen) pos = 0;
+            }
+        }
+        bypassDelayPos = (int)((bypassDelayPos + data.numSamples) % delayLen);
+    }
+
+    // Pass to DSP (Multi-channel)
     dsp.process(in, numInCh, out, numOutCh, data.numSamples);
 
     return kResultOk;

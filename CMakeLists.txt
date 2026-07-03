@@ -304,4 +304,8 @@ if(NOT TELEPHONY_USE_EVS_FX)
     endif()
 
     add_test(NAME dsp_smoke COMMAND TelephonyDspSmoke)
+
+    if(TELEPHONY_USE_EVS_JBM)
+        add_test(NAME evs_jbm_smoke COMMAND EVSJbmSmoke)
+    endif()
 endif()

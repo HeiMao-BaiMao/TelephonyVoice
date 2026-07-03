@@ -38,6 +38,22 @@
             }
         },
         {
+            "name": "x64-release-dist",
+            "displayName": "x64 Release (Distribution)",
+            "inherits": "x64-release",
+            "cacheVariables": {
+                "TELEPHONY_DISTRIBUTION_BUILD": "ON"
+            }
+        },
+        {
+            "name": "x64-release-jbm",
+            "displayName": "x64 Release (EVS JBM)",
+            "inherits": "x64-release",
+            "cacheVariables": {
+                "TELEPHONY_USE_EVS_JBM": "ON"
+            }
+        },
+        {
             "name": "x86-debug",
             "displayName": "x86 Debug",
             "inherits": "windows-base",

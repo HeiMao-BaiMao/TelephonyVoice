@@ -3,6 +3,7 @@
 #include "public.sdk/source/vst/vstaudioeffect.h"
 #include "public.sdk/source/vst/vsteditcontroller.h"
 #include "dsp/SignalProcessor.h"
+#include <vector>
 
 namespace Steinberg {
 namespace Vst {
@@ -80,6 +81,15 @@ namespace Vst {
         float currentPacketLossRate;
         float currentNetworkDegradation;
         bool currentBypass;
+
+        // Latency-compensated bypass: the plugin reports getLatencySamples()
+        // to the host, so the bypass path must delay the dry signal by the
+        // same amount or toggling bypass shifts the audio in time. The ring
+        // is fed on every process() call (read only while bypassed) so a
+        // mid-playback toggle stays seamless.
+        std::vector<std::vector<float>> bypassDelayBuf; // per output channel
+        int bypassDelayLen;
+        int bypassDelayPos;
 
         void updateDSPParameters();
     };

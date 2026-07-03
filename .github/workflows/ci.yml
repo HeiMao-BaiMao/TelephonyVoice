@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - preset: x64-release
+            name: normal
+          - preset: x64-release-dist
+            name: distribution
+          - preset: x64-release-jbm
+            name: evs-jbm
+
+    name: ${{ matrix.name }} (${{ matrix.preset }})
+
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Configure
+        run: cmake --preset ${{ matrix.preset }}
+
+      - name: Build
+        run: cmake --build out/build/${{ matrix.preset }} --parallel
+
+      - name: Test
+        run: ctest --test-dir out/build/${{ matrix.preset }} --output-on-failure
