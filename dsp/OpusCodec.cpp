@@ -154,11 +154,13 @@ namespace TelephonyDSP {
         // Linear congruential generator step (Numerical Recipes constants).
         jitterLcg = jitterLcg * 1664525u + 1013904223u;
         // Map the upper bits of the LCG state to a non-negative jitter
-        // offset in frames. degradation scales the magnitude so a clean
-        // network has jitter 0..1 and a heavily degraded one can drift
-        // several frames.
+        // offset in frames. degradation scales the magnitude: a clean
+        // network (degradation 0) has zero jitter so every packet arrives
+        // exactly basePlaybackDelay frames after it was sent, and a heavily
+        // degraded one can drift several frames past its playback slot
+        // (concealed by FEC/PLC below).
         const float d = std::clamp(cfgNetworkDegradation, 0.0f, 1.0f);
-        const float maxJitter = 1.0f + d * 4.0f; // up to ~5 frames
+        const float maxJitter = d * 4.0f; // up to ~4 frames
         const uint32_t r = (jitterLcg >> 8) & 0xFFFFu;
         const float u = (float)r / 65535.0f;     // [0,1]
         const int offset = (int)std::round(u * maxJitter);
@@ -210,15 +212,9 @@ namespace TelephonyDSP {
             if (nbBytes > 0) {
                 VoipPacket p;
                 p.seq = nextSeq++;
-                // arrivalFrame is computed against the packet's intended
-                // playback index (which equals p.seq for a steady, 1-in
-                // 1-out transport).
-                p.arrivalFrame = (int)(p.seq + basePlaybackDelay());
-                // Add a small deterministic jitter offset using the LCG.
-                // Subtract basePlaybackDelay here so the caller-visible
-                // arrivalFrame stays in terms of playbackFrame index.
-                int jitter = arrivalFrameFor(p.seq);
-                p.arrivalFrame = (int)p.seq + jitter;
+                // arrivalFrame = send frame (== seq for this steady 1-in
+                // 1-out transport) + base transport delay + LCG jitter.
+                p.arrivalFrame = (int)p.seq + arrivalFrameFor(p.seq);
                 p.data.assign(bitstream.begin(), bitstream.begin() + nbBytes);
                 queue.push_back(std::move(p));
                 trimQueue();
@@ -244,50 +240,54 @@ namespace TelephonyDSP {
         bool decoded = false;
 
         if (dec) {
-            // Walk the queue (it is sorted ascending by seq / arrival) and
-            // try, in order: exact match -> FEC of next available packet
-            // -> PLC if nothing else.
-            //
-            // Find the first packet whose arrivalFrame <= targetFrame.
-            // (queue is sorted by insertion order which matches arrivalFrame
-            // order because arrivalFrame grows with seq and jitter; in the
-            // rare case of jitter collapse the earliest-arrival packet
-            // wins.)
-            size_t idx = 0;
-            for (; idx < queue.size(); ++idx) {
-                if (queue[idx].arrivalFrame <= targetFrame) break;
-            }
+            // The playback slot for this frame: with a steady 1-in/1-out
+            // transport the packet played at frame T is the one sent
+            // basePlaybackDelay() frames earlier. During the initial
+            // warm-up (T < baseDelay) no packet is due yet and the PLC
+            // below emits decoder silence.
+            const int64_t seqToPlay = (int64_t)targetFrame - basePlaybackDelay();
 
-            if (idx < queue.size()) {
-                // The packet for this playback frame has arrived.
-                int n = opus_decode(dec, queue[idx].data.data(),
-                                    (opus_int32)queue[idx].data.size(),
-                                    out, fs, 0);
-                if (n == fs) {
-                    decoded = true;
+            // Drop packets for slots that have already been played; they
+            // arrived too late to be useful (their slot was concealed).
+            size_t w = 0;
+            for (size_t i = 0; i < queue.size(); ++i) {
+                if ((int64_t)queue[i].seq >= seqToPlay) {
+                    if (w != i) queue[w] = std::move(queue[i]);
+                    ++w;
                 }
-                // Drop the consumed packet. In the jitter-collapse case
-                // there could be additional packets with arrivalFrame <=
-                // targetFrame still in the queue; those represent future
-                // playback frames that arrived early. We leave them in
-                // place - they will be picked up at their target playback
-                // frame. The queue cap (kMaxQueueSize) keeps growth in
-                // check even if collapse happens repeatedly.
-                queue.erase(queue.begin() + (std::ptrdiff_t)idx);
-            } else if (!queue.empty()) {
-                // Target packet is missing but the next one is in flight;
-                // try in-band FEC recovery using decode_fec=1. The "next"
-                // packet is the one with the smallest seq, which is
-                // queue.front() because we insert in seq order.
-                int n = opus_decode(dec, queue.front().data.data(),
-                                    (opus_int32)queue.front().data.size(),
-                                    out, fs, 1);
-                if (n == fs) {
-                    decoded = true;
+            }
+            queue.resize(w);
+
+            if (seqToPlay >= 0) {
+                // Exact packet for this slot, if it has arrived by now.
+                size_t idx = queue.size();
+                size_t next = queue.size();
+                for (size_t i = 0; i < queue.size(); ++i) {
+                    if ((int64_t)queue[i].seq == seqToPlay) idx = i;
+                    else if ((int64_t)queue[i].seq == seqToPlay + 1) next = i;
                 }
-                // Whether or not FEC succeeded, drop the consumed packet
-                // so the queue doesn't grow forever.
-                queue.erase(queue.begin());
+
+                if (idx < queue.size() && queue[idx].arrivalFrame <= targetFrame) {
+                    int n = opus_decode(dec, queue[idx].data.data(),
+                                        (opus_int32)queue[idx].data.size(),
+                                        out, fs, 0);
+                    if (n == fs) {
+                        decoded = true;
+                    }
+                    queue.erase(queue.begin() + (std::ptrdiff_t)idx);
+                } else if (next < queue.size() && queue[next].arrivalFrame <= targetFrame) {
+                    // This slot's packet is missing or late, but the packet
+                    // for the NEXT slot has already arrived: recover this
+                    // frame from its in-band FEC (LBRR) data. The packet
+                    // stays queued so the next slot still decodes it
+                    // normally - that is the standard Opus FEC sequence.
+                    int n = opus_decode(dec, queue[next].data.data(),
+                                        (opus_int32)queue[next].data.size(),
+                                        out, fs, 1);
+                    if (n == fs) {
+                        decoded = true;
+                    }
+                }
             }
 
             if (!decoded) {

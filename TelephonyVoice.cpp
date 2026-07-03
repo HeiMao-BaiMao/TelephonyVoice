@@ -86,6 +86,30 @@ static const char* kAmrNbModeStrings[kNumAmrNbModes] = {
     "7.4 kbps", "7.95 kbps", "10.2 kbps", "12.2 kbps"
 };
 
+constexpr int32 kNumAmrWbModes = 9;
+constexpr int32 kDefaultAmrWbModeIndex = 2; // 12.65 kbps
+
+// Opus target bitrate choices in bps; passed straight into
+// OpusCodec::setBitrate() via SignalProcessor::setOpusBitrate().
+constexpr int32 kNumOpusBitrates = 12;
+constexpr int32 kDefaultOpusBitrateIndex = 4; // 24 kbps (OpusCodec default)
+constexpr int32 kOpusBitrateValues[kNumOpusBitrates] = {
+    6000, 8000, 12000, 16000, 24000, 32000, 48000, 64000,
+    96000, 128000, 192000, 256000
+};
+
+// Map a plain value back to its normalized position in a choice table.
+// Used by setComponentState() to restore StringListParameter positions
+// from the plain values persisted in the processor state.
+static double normalizedFromTable(int32 value, const int32* table, int32 count, int32 defaultIndex)
+{
+    int32 idx = defaultIndex;
+    for (int32 i = 0; i < count; ++i) {
+        if (table[i] == value) { idx = i; break; }
+    }
+    return (double)idx / (double)(count - 1);
+}
+
 TelephonyDSP::RouteEndpoint endpointFromParameter(int32 endpoint)
 {
     endpoint = std::clamp(endpoint, 0, kMaxExposedEndpoint);
@@ -123,9 +147,10 @@ TelephonyDSP::DegradationSegment degradationSegmentFromParameter(int32 segment)
     }
 }
 
-// Generate unique IDs (Placeholders)
-FUID TelephonyVoiceProcessor::uid(0x8625E8D6, 0x22F3F7FE, 0x400ED50D, 0x3F00CBAA);
-FUID TelephonyVoiceController::uid(0x715EC843, 0x443AC666, 0x012F2754, 0x19E07432);
+// Unique class IDs for this plugin. Changing these breaks plugin lookup
+// in previously saved host projects, so they must stay stable from now on.
+FUID TelephonyVoiceProcessor::uid(0x0DB311F2, 0x41851DD5, 0x85253F8B, 0x3D5EB34F);
+FUID TelephonyVoiceController::uid(0xB8390C57, 0x44E3C17F, 0x44F35BB2, 0xA9E8274A);
 
 // --------------------------------------------------------------------------
 // Processor Implementation
@@ -251,6 +276,26 @@ tresult PLUGIN_API TelephonyVoiceProcessor::process(ProcessData& data)
                             currentAmrNbMode = idx;
                             break;
                         }
+                        case kParamAmrWbMode: {
+                            currentAmrWbMode = std::clamp((int32)(value * (kNumAmrWbModes - 1) + 0.5), 0, kNumAmrWbModes - 1);
+                            break;
+                        }
+                        case kParamOpusBitrate: {
+                            int32 idx = std::clamp((int32)(value * (kNumOpusBitrates - 1) + 0.5), 0, kNumOpusBitrates - 1);
+                            currentOpusBitrate = kOpusBitrateValues[idx];
+                            break;
+                        }
+                        case kParamG711Law:
+                            currentG711Law = (value > 0.5) ? 1 : 0;
+                            break;
+                        case kParamEvsDtxSidInterval:
+                            // Plain range is 0..100 frames; 1..2 are collapsed
+                            // to 0 (variable SID) by ChannelProcessor.
+                            currentEvsDtxSidInterval = std::clamp((int32)(value * 100.0 + 0.5), 0, 100);
+                            break;
+                        case kParamEvsScVbr:
+                            currentEvsScVbr = (value > 0.5) ? 1 : 0;
+                            break;
                         case kParamDryWet: currentDryWet = (float)value; break;
                         case kParamOutputGain: currentOutGain = (float)(value * 84.0 - 60.0); break;
                         case kParamArtifactsEnabled: currentArtifactsEnabled = (value > 0.5); break;
@@ -342,6 +387,10 @@ tresult PLUGIN_API TelephonyVoiceProcessor::setState(IBStream* state)
     if (!streamer.readInt32(currentOpusBandwidth)) currentOpusBandwidth = kDefaultOpusBandwidth;
     if (!streamer.readInt32(currentAmrNbMode)) currentAmrNbMode = kDefaultAmrNbModeIndex;
     if (!streamer.readInt32(currentEvsDtxSidInterval)) currentEvsDtxSidInterval = 0;
+    if (!streamer.readInt32(currentAmrWbMode)) currentAmrWbMode = kDefaultAmrWbModeIndex;
+    if (!streamer.readInt32(currentG711Law)) currentG711Law = kDefaultG711LawIndex;
+    if (!streamer.readInt32(currentEvsScVbr)) currentEvsScVbr = 0;
+    if (!streamer.readInt32(currentOpusBitrate)) currentOpusBitrate = kOpusBitrateValues[kDefaultOpusBitrateIndex];
     currentOutputEndpoint = std::clamp(currentOutputEndpoint, 0, kMaxExposedEndpoint);
     currentDegradationSegment = std::clamp(currentDegradationSegment, 0, kMaxDegradationSegment);
     currentPacketLossRate = std::clamp(currentPacketLossRate, 0.0f, 0.95f);
@@ -350,6 +399,10 @@ tresult PLUGIN_API TelephonyVoiceProcessor::setState(IBStream* state)
     currentOpusBandwidth = std::clamp(currentOpusBandwidth, 1101, 1105);
     currentAmrNbMode = std::clamp(currentAmrNbMode, 0, kNumAmrNbModes - 1);
     currentEvsDtxSidInterval = std::clamp(currentEvsDtxSidInterval, 0, 100);
+    currentAmrWbMode = std::clamp(currentAmrWbMode, 0, kNumAmrWbModes - 1);
+    currentG711Law = std::clamp(currentG711Law, 0, 1);
+    currentEvsScVbr = std::clamp(currentEvsScVbr, 0, 1);
+    currentOpusBitrate = std::clamp(currentOpusBitrate, 6, 510000);
     updateDSPParameters();
     return kResultOk;
 }
@@ -370,6 +423,10 @@ tresult PLUGIN_API TelephonyVoiceProcessor::getState(IBStream* state)
     streamer.writeInt32(currentOpusBandwidth);
     streamer.writeInt32(currentAmrNbMode);
     streamer.writeInt32(currentEvsDtxSidInterval);
+    streamer.writeInt32(currentAmrWbMode);
+    streamer.writeInt32(currentG711Law);
+    streamer.writeInt32(currentEvsScVbr);
+    streamer.writeInt32(currentOpusBitrate);
     return kResultOk;
 }
 
@@ -463,6 +520,35 @@ tresult PLUGIN_API TelephonyVoiceController::initialize(FUnknown* context)
     amrNbModeParam->setNormalized((double)kDefaultAmrNbModeIndex / (double)(kNumAmrNbModes - 1));
     parameters.addParameter(amrNbModeParam);
 
+    StringListParameter* amrWbModeParam = new StringListParameter(STR16("AMR-WB Mode"), kParamAmrWbMode, nullptr, ParameterInfo::kCanAutomate | ParameterInfo::kIsList);
+    amrWbModeParam->appendString(STR16("6.60 kbps"));
+    amrWbModeParam->appendString(STR16("8.85 kbps"));
+    amrWbModeParam->appendString(STR16("12.65 kbps"));
+    amrWbModeParam->appendString(STR16("14.25 kbps"));
+    amrWbModeParam->appendString(STR16("15.85 kbps"));
+    amrWbModeParam->appendString(STR16("18.25 kbps"));
+    amrWbModeParam->appendString(STR16("19.85 kbps"));
+    amrWbModeParam->appendString(STR16("23.05 kbps"));
+    amrWbModeParam->appendString(STR16("23.85 kbps"));
+    amrWbModeParam->setNormalized((double)kDefaultAmrWbModeIndex / (double)(kNumAmrWbModes - 1));
+    parameters.addParameter(amrWbModeParam);
+
+    StringListParameter* opusBitrateParam = new StringListParameter(STR16("Opus Bitrate"), kParamOpusBitrate, nullptr, ParameterInfo::kCanAutomate | ParameterInfo::kIsList);
+    opusBitrateParam->appendString(STR16("6 kbps"));
+    opusBitrateParam->appendString(STR16("8 kbps"));
+    opusBitrateParam->appendString(STR16("12 kbps"));
+    opusBitrateParam->appendString(STR16("16 kbps"));
+    opusBitrateParam->appendString(STR16("24 kbps"));
+    opusBitrateParam->appendString(STR16("32 kbps"));
+    opusBitrateParam->appendString(STR16("48 kbps"));
+    opusBitrateParam->appendString(STR16("64 kbps"));
+    opusBitrateParam->appendString(STR16("96 kbps"));
+    opusBitrateParam->appendString(STR16("128 kbps"));
+    opusBitrateParam->appendString(STR16("192 kbps"));
+    opusBitrateParam->appendString(STR16("256 kbps"));
+    opusBitrateParam->setNormalized((double)kDefaultOpusBitrateIndex / (double)(kNumOpusBitrates - 1));
+    parameters.addParameter(opusBitrateParam);
+
     StringListParameter* g711LawParam = new StringListParameter(STR16("G.711 Law"), kParamG711Law, nullptr, ParameterInfo::kCanAutomate | ParameterInfo::kIsList);
     g711LawParam->appendString(STR16("\u03bc-law"));
     g711LawParam->appendString(STR16("A-law"));
@@ -486,20 +572,92 @@ tresult PLUGIN_API TelephonyVoiceController::initialize(FUnknown* context)
     // codec default, promoted to ~12 frames internally). 3..100 = fixed
     // SID update interval. Hosts that do not use EVS can leave this at 0
     // -- the value is only consumed by EVSCodec / EVSCodecJbm.
-    parameters.addParameter(new RangeParameter(STR16("EVS DTX SID Intv"), kParamEvsDtxSidInterval, STR16(""), 0.0, 100.0, 0.0, 1, ParameterInfo::kCanAutomate));
+    parameters.addParameter(new RangeParameter(STR16("EVS DTX SID Intv"), kParamEvsDtxSidInterval, STR16(""), 0.0, 100.0, 0.0, 100, ParameterInfo::kCanAutomate));
+    parameters.addParameter(new RangeParameter(STR16("EVS SC-VBR"), kParamEvsScVbr, STR16(""), 0.0, 1.0, 0.0, 1, ParameterInfo::kCanAutomate));
     parameters.addParameter(new RangeParameter(STR16("Bypass"), kParamMasterBypass, STR16(""), 0, 1, 0, 1, ParameterInfo::kCanAutomate | ParameterInfo::kIsBypass));
 
     return kResultOk;
 }
 
-tresult PLUGIN_API TelephonyVoiceController::setComponentState(IBStream* state) { return kResultOk; }
+tresult PLUGIN_API TelephonyVoiceController::setComponentState(IBStream* state)
+{
+    // Mirror TelephonyVoiceProcessor::setState() so the UI reflects the
+    // values the processor just restored. The stream layout must stay in
+    // lockstep with getState()/setState(); trailing fields are optional
+    // for backward compatibility with older saved states.
+    if (!state) return kResultFalse;
+
+    IBStreamer streamer(state, kLittleEndian);
+    int32 eraMode; float dry, gain, amt; bool art, byp;
+    if (!streamer.readInt32(eraMode)) return kResultFalse;
+    if (!streamer.readFloat(dry)) return kResultFalse;
+    if (!streamer.readFloat(gain)) return kResultFalse;
+    if (!streamer.readBool(art)) return kResultFalse;
+    if (!streamer.readFloat(amt)) return kResultFalse;
+    if (!streamer.readBool(byp)) return kResultFalse;
+
+    int32 outputEndpoint, degradationSegment;
+    float packetLossRate, networkDegradation;
+    int32 evsSampleRate, evsBitrate, evsMaxBw, opusBandwidth, amrNbMode, evsDtxSidInterval;
+    int32 amrWbMode, g711Law, evsScVbr, opusBitrate;
+    if (!streamer.readInt32(outputEndpoint)) outputEndpoint = kDefaultOutputEndpoint;
+    if (!streamer.readInt32(degradationSegment)) degradationSegment = 0;
+    if (!streamer.readFloat(packetLossRate)) packetLossRate = 0.0f;
+    if (!streamer.readFloat(networkDegradation)) networkDegradation = 0.0f;
+    if (!streamer.readInt32(evsSampleRate)) evsSampleRate = kDefaultEvsSampleRate;
+    if (!streamer.readInt32(evsBitrate)) evsBitrate = kDefaultEvsBitrate;
+    if (!streamer.readInt32(evsMaxBw)) evsMaxBw = kDefaultEvsMaxBw;
+    if (!streamer.readInt32(opusBandwidth)) opusBandwidth = kDefaultOpusBandwidth;
+    if (!streamer.readInt32(amrNbMode)) amrNbMode = kDefaultAmrNbModeIndex;
+    if (!streamer.readInt32(evsDtxSidInterval)) evsDtxSidInterval = 0;
+    if (!streamer.readInt32(amrWbMode)) amrWbMode = kDefaultAmrWbModeIndex;
+    if (!streamer.readInt32(g711Law)) g711Law = kDefaultG711LawIndex;
+    if (!streamer.readInt32(evsScVbr)) evsScVbr = 0;
+    if (!streamer.readInt32(opusBitrate)) opusBitrate = kOpusBitrateValues[kDefaultOpusBitrateIndex];
+
+    setParamNormalized(kParamEraMode,
+        (double)std::clamp(eraMode, 0, kMaxExposedEndpoint) / (double)kMaxExposedEndpoint);
+    setParamNormalized(kParamOutputEndpoint,
+        (double)std::clamp(outputEndpoint, 0, kMaxExposedEndpoint) / (double)kMaxExposedEndpoint);
+    setParamNormalized(kParamDegradationSegment,
+        (double)std::clamp(degradationSegment, 0, kMaxDegradationSegment) / (double)kMaxDegradationSegment);
+    setParamNormalized(kParamDryWet, std::clamp(dry, 0.0f, 1.0f));
+    setParamNormalized(kParamOutputGain, std::clamp((gain + 60.0) / 84.0, 0.0, 1.0));
+    setParamNormalized(kParamArtifactsEnabled, art ? 1.0 : 0.0);
+    setParamNormalized(kParamArtifactAmount, std::clamp(amt, 0.0f, 1.0f));
+    // The processor stores the plain rate (0..0.30); the parameter is
+    // normalized over that same 30 % span.
+    setParamNormalized(kParamPacketLossRate, std::clamp(packetLossRate / 0.30, 0.0, 1.0));
+    setParamNormalized(kParamNetworkDegradation, std::clamp(networkDegradation, 0.0f, 1.0f));
+    setParamNormalized(kParamMasterBypass, byp ? 1.0 : 0.0);
+    setParamNormalized(kParamEvsSampleRate,
+        normalizedFromTable(evsSampleRate, kEvsSampleRateValues, kNumEvsSampleRates, kDefaultEvsSampleRateIndex));
+    setParamNormalized(kParamEvsBitrate,
+        normalizedFromTable(evsBitrate, kEvsBitrateValues, kNumEvsBitrates, kDefaultEvsBitrateIndex));
+    setParamNormalized(kParamEvsMaxBw,
+        normalizedFromTable(evsMaxBw, kEvsMaxBwValues, kNumEvsMaxBws, kDefaultEvsMaxBwIndex));
+    setParamNormalized(kParamOpusBandwidth,
+        normalizedFromTable(opusBandwidth, kOpusBandwidthValues, kNumOpusBandwidths, kDefaultOpusBandwidthIndex));
+    setParamNormalized(kParamAmrNbMode,
+        (double)std::clamp(amrNbMode, 0, kNumAmrNbModes - 1) / (double)(kNumAmrNbModes - 1));
+    setParamNormalized(kParamEvsDtxSidInterval,
+        (double)std::clamp(evsDtxSidInterval, 0, 100) / 100.0);
+    setParamNormalized(kParamAmrWbMode,
+        (double)std::clamp(amrWbMode, 0, kNumAmrWbModes - 1) / (double)(kNumAmrWbModes - 1));
+    setParamNormalized(kParamG711Law, (g711Law != 0) ? 1.0 : 0.0);
+    setParamNormalized(kParamEvsScVbr, (evsScVbr != 0) ? 1.0 : 0.0);
+    setParamNormalized(kParamOpusBitrate,
+        normalizedFromTable(opusBitrate, kOpusBitrateValues, kNumOpusBitrates, kDefaultOpusBitrateIndex));
+
+    return kResultOk;
+}
 
 } // namespace Vst
 } // namespace Steinberg
 
 #include "public.sdk/source/main/pluginfactory.h"
 
-BEGIN_FACTORY_DEF("Voxengo (Aleksey Vaneev)", "https://www.voxengo.com", "mailto:info@voxengo.com")
+BEGIN_FACTORY_DEF("Rumia Channel", "https://github.com/HeiMao-BaiMao/TelephonyVoice", "")
     DEF_CLASS2(INLINE_UID_FROM_FUID(Steinberg::Vst::TelephonyVoiceProcessor::uid),
                PClassInfo::kManyInstances, kVstAudioEffectClass, "TelephonyVoice", Vst::kDistributable, Vst::PlugType::kFx, "1.0.0.0", "Telephony Voice Emulator", Steinberg::Vst::TelephonyVoiceProcessor::createInstance)
     DEF_CLASS2(INLINE_UID_FROM_FUID(Steinberg::Vst::TelephonyVoiceController::uid),

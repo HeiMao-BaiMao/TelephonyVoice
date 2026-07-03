@@ -1,9 +1,14 @@
 // Floating-point EVS wrapper (TS 26.443 v12.7.0 / v13.3.0)
 //
 // Provides a clean in-memory C API around the 3GPP EVS reference encoder and
-// decoder. The bitstream is staged through a temporary FILE* using the same
-// G.192 format the reference CLI tools use, so we reuse write_indices() and
-// read_indices() without re-implementing the serialisation.
+// decoder. The wire format between evs_enc_process() and evs_dec_process()
+// stays the ITU-T G.192 word stream the reference CLI tools use, but the
+// serialisation is done entirely in memory: the encoder replicates the G192
+// branch of write_indices() into the caller's buffer, and the decoder feeds
+// read_indices_from_djb() with the repacked compact access unit. No FILE*
+// round-trip is involved, so this path performs no file I/O per frame (it
+// previously staged every frame through tmpfile(), which is both unsafe on
+// a real-time audio thread and broken on Windows for non-admin users).
 
 #include "evs_api.h"
 
@@ -22,26 +27,33 @@
 struct EVS_Encoder {
     Encoder_State* st;
     Indice*        ind_buf;     // MAX_NUM_INDICES entries
-    FILE*          bitfile;     // tmpfile() roundtrip for the bitstream
 };
 
 struct EVS_Decoder {
     Decoder_State* st;
-    FILE*          bitfile;
+    float*         pcm_buf;     // output_Fs / 50 samples, reused every frame
 };
 
 // MAX_BITS_PER_FRAME is defined in cnst.h (2560).
 // MAX_NUM_INDICES = IND_UNUSED + 127 (also from cnst.h).
 
-static FILE* open_temp_bitstream(void) {
-    FILE* f = tmpfile();
-    if (!f) {
-        // tmpfile() may fail on some Windows configurations; fall back to
-        // a real temp file path.
-        const char* path = "evs_tandem.192";
-        f = fopen(path, "w+b");
+// Frame lengths that map to a defined EVS primary or AMR-WB IO mode.
+// Mirrors the switch in the reference rate2EVSmode() (lib_com/bitstream.c),
+// which is static there, so the accepted set is restated here. Used to
+// reject corrupt G.192 headers before they reach decoder_selectCodec().
+static int is_valid_g192_rate(long rate) {
+    switch (rate) {
+        // EVS primary modes
+        case 0:      case 2400:  case 2800:  case 7200:  case 8000:
+        case 9600:   case 13200: case 16400: case 24400: case 32000:
+        case 48000:  case 64000: case 96000: case 128000:
+        // AMR-WB IO modes
+        case 1750:   case 6600:  case 8850:  case 12650: case 14250:
+        case 15850:  case 18250: case 19850: case 23050: case 23850:
+            return 1;
+        default:
+            return 0;
     }
-    return f;
 }
 
 static int sample_rate_to_index(int sr_hz) {
@@ -132,8 +144,7 @@ EVS_Encoder* evs_enc_create_ex(int sample_rate_hz, int bitrate_bps, EVS_Bandwidt
 
     enc->st = (Encoder_State*)calloc(1, sizeof(Encoder_State));
     enc->ind_buf = (Indice*)calloc(MAX_NUM_INDICES, sizeof(Indice));
-    enc->bitfile = open_temp_bitstream();
-    if (!enc->st || !enc->ind_buf || !enc->bitfile) {
+    if (!enc->st || !enc->ind_buf) {
         evs_enc_destroy(enc);
         return NULL;
     }
@@ -209,7 +220,6 @@ void evs_enc_destroy(EVS_Encoder* enc) {
         free(enc->st);
     }
     if (enc->ind_buf) free(enc->ind_buf);
-    if (enc->bitfile) fclose(enc->bitfile);
     free(enc);
 }
 
@@ -241,33 +251,51 @@ int evs_enc_process(EVS_Encoder* enc,
                     const short* pcm_in, int n_samples,
                     unsigned char* bitstream_out, int bitstream_max,
                     int* bitstream_used) {
+    unsigned short stream[2 + MAX_BITS_PER_FRAME];
+    unsigned short* pt_stream;
+    short i, k, value, nb_bits;
+    int mask, need;
+
     if (!enc || !enc->st || !pcm_in || !bitstream_out || !bitstream_used) return EVS_ERROR;
     if (n_samples != enc->st->input_Fs / 50) return EVS_ERROR;
 
     evs_enc(enc->st, pcm_in, (short)n_samples);
 
-    // The encoder filled st->ind_list via push_indice(). write_indices()
-    // serialises that into the G.192 format into our temp file.
-    UWord8 pFrame[(MAX_BITS_PER_FRAME + 7) >> 3];
-    Word16 pFrame_size = 0;
-
-    if (enc->st->bitstreamformat == MIME) {
-        indices_to_serial(enc->st, pFrame, &pFrame_size);
-    }
-
-    rewind(enc->bitfile);
-    write_indices(enc->st, enc->bitfile, pFrame, pFrame_size);
-    fflush(enc->bitfile);
-
-    // Copy the G.192 stream out as a flat byte buffer.
-    rewind(enc->bitfile);
-    int need = (2 + MAX_BITS_PER_FRAME) * (int)sizeof(unsigned short);
+    // The encoder filled st->ind_list via push_indice(). Serialise it into
+    // the G.192 word stream directly, replicating the G192 branch of the
+    // reference write_indices() (lib_com/bitstream.c) including its
+    // post-write clearing of the index list and bit counters.
+    need = (2 + enc->st->nb_bits_tot) * (int)sizeof(unsigned short);
     if (bitstream_max < need) return EVS_ERROR;
 
-    unsigned short* stream = (unsigned short*)bitstream_out;
-    size_t read = fread(stream, sizeof(unsigned short), 2 + MAX_BITS_PER_FRAME, enc->bitfile);
-    *bitstream_used = (int)read * (int)sizeof(unsigned short);
-    if (read < 2) return EVS_ERROR;
+    pt_stream = stream;
+    *pt_stream++ = SYNC_GOOD_FRAME;
+    *pt_stream++ = (unsigned short)enc->st->nb_bits_tot;
+
+    for (i = 0; i < MAX_NUM_INDICES; i++) {
+        value   = enc->st->ind_list[i].value;
+        nb_bits = enc->st->ind_list[i].nb_bits;
+        if (nb_bits != -1) {
+            // mask from MSB to LSB
+            mask = 1 << (nb_bits - 1);
+            for (k = 0; k < nb_bits; k++) {
+                *pt_stream++ = (value & mask) ? G192_BIN1 : G192_BIN0;
+                mask >>= 1;
+            }
+        }
+    }
+
+    for (i = 0; i < MAX_NUM_INDICES; i++) {
+        enc->st->ind_list[i].nb_bits = -1;
+    }
+    enc->st->nb_bits_tot = 0;
+    enc->st->next_ind = 0;
+    enc->st->last_ind = -1;
+
+    // memcpy instead of a direct unsigned short* store: the caller's byte
+    // buffer is not guaranteed to be 2-byte aligned.
+    memcpy(bitstream_out, stream, (size_t)need);
+    *bitstream_used = need;
 
     return EVS_OK;
 }
@@ -283,8 +311,8 @@ EVS_Decoder* evs_dec_create(int sample_rate_hz, int bitrate_bps) {
     if (!dec) return NULL;
 
     dec->st = (Decoder_State*)calloc(1, sizeof(Decoder_State));
-    dec->bitfile = open_temp_bitstream();
-    if (!dec->st || !dec->bitfile) {
+    dec->pcm_buf = (float*)calloc(sample_rate_hz / 50, sizeof(float));
+    if (!dec->st || !dec->pcm_buf) {
         evs_dec_destroy(dec);
         return NULL;
     }
@@ -308,40 +336,65 @@ void evs_dec_destroy(EVS_Decoder* dec) {
         destroy_decoder(dec->st);
         free(dec->st);
     }
-    if (dec->bitfile) fclose(dec->bitfile);
+    if (dec->pcm_buf) free(dec->pcm_buf);
     free(dec);
 }
 
 int evs_dec_process(EVS_Decoder* dec,
                     const unsigned char* bitstream_in, int bitstream_len,
                     short* pcm_out, int* n_samples) {
+    unsigned char au[(MAX_BITS_PER_FRAME + 7) >> 3];
+    unsigned short sync_word, num_bits, w;
+    const unsigned char* words;
+    int i, k, N;
+
     if (!dec || !dec->st || !bitstream_in || !pcm_out || !n_samples) return EVS_ERROR;
-    if (bitstream_len <= 0) return EVS_ERROR;
+    if (bitstream_len < 2 * (int)sizeof(unsigned short)) return EVS_ERROR;
 
-    rewind(dec->bitfile);
-    if ((int)fwrite(bitstream_in, 1, bitstream_len, dec->bitfile) != bitstream_len) return EVS_ERROR;
-    fflush(dec->bitfile);
-    rewind(dec->bitfile);
+    // Parse the G.192 header. The input buffer is a byte stream with no
+    // alignment guarantee, so the 16-bit words are pulled out via memcpy.
+    memcpy(&sync_word, bitstream_in, sizeof(unsigned short));
+    memcpy(&num_bits, bitstream_in + sizeof(unsigned short), sizeof(unsigned short));
 
-    dec->st->bfi = 0;
+    if (sync_word != SYNC_GOOD_FRAME && sync_word != SYNC_BAD_FRAME) return EVS_ERROR;
+    if (num_bits > MAX_BITS_PER_FRAME) return EVS_ERROR;
+    if (bitstream_len < (2 + num_bits) * (int)sizeof(unsigned short)) return EVS_ERROR;
+    if (!is_valid_g192_rate((long)num_bits * 50)) return EVS_ERROR;
 
-    short ok = read_indices(dec->st, dec->bitfile, 0);
-    if (!ok) return EVS_ERROR;
+    if (sync_word == SYNC_BAD_FRAME) {
+        // A bad-frame marker carries no trustworthy payload; run the
+        // decoder's own concealment exactly like a lost packet.
+        return evs_dec_process_lost(dec, pcm_out, n_samples);
+    }
 
-    float* out = (float*)calloc(dec->st->output_Fs / 50, sizeof(float));
-    if (!out) return EVS_ERROR;
+    // Repack the G.192 soft bits into the compact MSB-first access unit
+    // layout consumed by the reference read_indices_from_djb(), which
+    // handles mode selection and the DTX (SID / NO_DATA) receive cases
+    // in memory -- no FILE* required.
+    memset(au, 0, sizeof(au));
+    words = bitstream_in + 2 * sizeof(unsigned short);
+    for (k = 0; k < (int)num_bits; k++) {
+        memcpy(&w, words + (size_t)k * sizeof(unsigned short), sizeof(unsigned short));
+        if (w == G192_BIN1) {
+            au[k >> 3] |= (unsigned char)(0x80 >> (k & 7));
+        }
+    }
 
-    evs_dec(dec->st, out, FRAMEMODE_NORMAL);
+    read_indices_from_djb(dec->st, au, num_bits, 0, 0);
 
-    int N = dec->st->output_Fs / 50;
-    for (int i = 0; i < N; ++i) {
-        float v = out[i];
+    // read_indices_from_djb() flags an untransmitted DTX gap (zero-length
+    // frame while not in CNG) as bfi; mirror the reference decoder main
+    // loop and run concealment for it.
+    evs_dec(dec->st, dec->pcm_buf, dec->st->bfi ? FRAMEMODE_MISSING : FRAMEMODE_NORMAL);
+
+    N = dec->st->output_Fs / 50;
+    for (i = 0; i < N; ++i) {
+        float v = dec->pcm_buf[i];
         if (v >  32767.0f) v =  32767.0f;
         if (v < -32768.0f) v = -32768.0f;
         pcm_out[i] = (short)v;
     }
     *n_samples = N;
-    free(out);
     return EVS_OK;
 }
 
@@ -350,23 +403,20 @@ int evs_dec_process_lost(EVS_Decoder* dec,
     if (!dec || !dec->st || !pcm_out || !n_samples) return EVS_ERROR;
 
     int N = dec->st->output_Fs / 50;
-    float* out = (float*)calloc(N, sizeof(float));
-    if (!out) return EVS_ERROR;
 
     dec->st->bfi = 1;
     if (dec->st->codec_mode == 0 && dec->st->last_codec_mode != 0) {
         dec->st->codec_mode = dec->st->last_codec_mode;
     }
 
-    evs_dec(dec->st, out, FRAMEMODE_MISSING);
+    evs_dec(dec->st, dec->pcm_buf, FRAMEMODE_MISSING);
 
     for (int i = 0; i < N; ++i) {
-        float v = out[i];
+        float v = dec->pcm_buf[i];
         if (v >  32767.0f) v =  32767.0f;
         if (v < -32768.0f) v = -32768.0f;
         pcm_out[i] = (short)v;
     }
     *n_samples = N;
-    free(out);
     return EVS_OK;
 }

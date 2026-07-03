@@ -67,7 +67,62 @@ Internally those user-facing endpoints map to codec-era modes:
 
 ## Current State of Work
 
-### Done (latest — Tier 0 codec control points)
+### Done (latest — VST wiring fixes, DSP bug fixes, in-memory EVS API, tests)
+
+* **Biquad "disabled = mute" bug fixed** (`dsp/Biquad.h`): `Biquad::reset()`
+  zeroed all coefficients, so any mode that used `reset()` to mean "no
+  filtering" ran its audio through an all-zero filter. This silenced
+  `EVS_NATIVE` and `OPUS_VOIP` entirely at zero network degradation (both
+  skip the band cascade in that case). `reset()` is now an identity
+  pass-through. Caught by the new `TelephonyDspSmoke` test.
+* **Opus jitter-queue playback logic fixed** (`dsp/OpusCodec.cpp`): the
+  receive side consumed each packet immediately after encode via the FEC
+  path (2 frames before its scheduled arrival), so the decoder never saw
+  real payload and output only concealment. Playback now tracks the
+  correct slot (`playbackFrame - basePlaybackDelay()`), decodes the exact
+  packet when it has arrived, uses next-packet FEC only for genuinely
+  late/lost slots (without consuming the next packet), and drops stale
+  packets. Jitter is now zero at degradation 0 (direct-feed behaviour).
+* **VST parameter wiring completed** (`TelephonyVoice.cpp`): `process()`
+  previously ignored `kParamG711Law`, `kParamAmrWbMode`, `kParamOpusBitrate`,
+  `kParamEvsDtxSidInterval`, and `kParamEvsScVbr`; the controller never
+  registered AMR-WB Mode / Opus Bitrate / EVS SC-VBR at all. All five are
+  now handled in `process()` and registered in the controller UI. The EVS
+  DTX SID interval `RangeParameter` had `stepCount=1` (only 0 or 100
+  selectable); it is now 100 steps.
+* **State persistence completed**: `getState()`/`setState()` now persist
+  `currentAmrWbMode`, `currentG711Law`, `currentEvsScVbr`, and
+  `currentOpusBitrate` (appended after the existing fields, so older saved
+  states still load with defaults). `setComponentState()` was an empty stub
+  — the UI showed defaults after project reload; it now mirrors the
+  processor stream and restores every parameter position.
+* **Plugin identity fixed**: the factory definition still carried the
+  Voxengo placeholder vendor/URL/email; it now identifies this project
+  (vendor `Rumia Channel`). The placeholder FUIDs were replaced with
+  freshly generated ones. **Note:** hosts identify plugins by FUID, so
+  DAW projects saved with earlier dev builds will not find the plugin
+  under the new IDs. The IDs must stay stable from now on.
+* **`evs_api.c` no longer performs file I/O** — the G.192 round-trip
+  through `tmpfile()` (unsafe on the audio thread; broken for non-admin
+  users on Windows, where the fallback also opened a *shared fixed-name*
+  file in the CWD, corrupting concurrent instances) is gone. The encoder
+  serialises `ind_list` into the caller's buffer directly (replicating the
+  reference `write_indices()` G192 branch), and the decoder repacks the
+  G.192 words into a compact AU and feeds the exported
+  `read_indices_from_djb()`. The decoder also reuses a preallocated PCM
+  buffer instead of a per-frame `calloc`, mirrors the reference decoder
+  main loop by running `FRAMEMODE_MISSING` concealment when the RX DTX
+  handler flags an untransmitted gap, and validates the G.192 header
+  (sync word, frame length, rate allowlist) instead of `exit(-1)`.
+* **Smoke tests added** (`tests/TelephonyDspSmoke.cpp`, ctest name
+  `dsp_smoke`): sweeps every `EraMode` reachable in the build config over
+  a speech-like burst signal (a steady sine is classified as background
+  noise by the EVS VAD / energy VAD and would read as silence) and checks
+  finite, non-silent output; round-trips the raw EVS C API at WB 16 kHz
+  and SWB 32 kHz (the plugin default) with DTX on, covering SID/NO_DATA
+  frames and the PLC path. Run with `ctest --test-dir out/build/x64-release`.
+
+### Done (previous — Tier 0 codec control points)
 
 * **G.711 A-law selection**: `G711Codec` now supports A-law in addition to µ-law.
   VST UI (`kParamG711Law`) + CLI (`--g711-law ulaw|alaw`).
@@ -98,8 +153,9 @@ Internally those user-facing endpoints map to codec-era modes:
   /FORCE:MULTIPLE` link option (MSVC) to resolve basop symbol collisions with
   `opencore-amrnb`.
 * `evs_api.h` / `evs_api.c` – clean C wrapper around the reference
-  `init_encoder` / `evs_enc` / `init_decoder` / `evs_dec` quartet.  Uses
-  `tmpfile()` to round-trip the G.192 bitstream between encoder and decoder.
+  `init_encoder` / `evs_enc` / `init_decoder` / `evs_dec` quartet.
+  Originally staged the G.192 bitstream through `tmpfile()`; now fully
+  in-memory (see the latest "Done" section above).
 * `evs_api_fx.c` – fixed-point wrapper for `TELEPHONY_USE_EVS_FX=ON`.
   This path is now partially wired, but remains experimental and link-blocked
   (see the fixed-point status section below).
@@ -318,11 +374,13 @@ Implemented path:
 ├── evs_api.h              # public C API for the 3GPP EVS wrapper
 ├── evs_api.c              # float variant (working wrapper)
 ├── evs_api_fx.c           # fixed-point wrapper (experimental/link-blocked)
-├── TelephonyDSP.h         # public C++ API of the route-aware SignalProcessor
-├── TelephonyDSP.cpp       # two-leg path, codec emulations, PLC, resampler/filter chain
+├── dsp/                   # route-aware SignalProcessor, per-codec classes,
+│                          # PLC, resampler/filter chain (27 per-class files)
 ├── TelephonyVoice.h       # VST3 processor + edit controller
 ├── TelephonyVoice.cpp     # VST3 glue
 ├── TelephonyRunner.cpp    # CLI: applies every era to a WAV
+├── tests/
+│   └── TelephonyDspSmoke.cpp  # ctest smoke test (mode sweep + EVS API round-trip)
 └── external/
     ├── 3gpp-evs/          # 3GPP EVS reference (TS 26.443 + 26.442)
     ├── G711_G72x/         # G.711/G.721/G.723

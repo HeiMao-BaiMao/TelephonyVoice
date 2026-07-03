@@ -281,3 +281,27 @@ if(MSVC)
     target_compile_options(TelephonyRunner PRIVATE /W3 /MP)
     target_compile_definitions(TelephonyRunner PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
+
+# ---------------------------------------------------------------------------
+# Tests (ctest)
+#
+# TelephonyDspSmoke sweeps every EraMode reachable in the current build
+# configuration through SignalProcessor and, on non-distribution builds,
+# round-trips the raw EVS C API including the DTX SID/NO_DATA path.
+#
+# Skipped under TELEPHONY_USE_EVS_FX because that variant is still
+# link-blocked (see README) - any executable linking TelephonyDSP would
+# fail to link there.
+# ---------------------------------------------------------------------------
+if(NOT TELEPHONY_USE_EVS_FX)
+    enable_testing()
+
+    add_executable(TelephonyDspSmoke tests/TelephonyDspSmoke.cpp)
+    target_link_libraries(TelephonyDspSmoke PRIVATE TelephonyDSP)
+    if(MSVC)
+        target_compile_options(TelephonyDspSmoke PRIVATE /W3 /MP)
+        target_compile_definitions(TelephonyDspSmoke PRIVATE _CRT_SECURE_NO_WARNINGS)
+    endif()
+
+    add_test(NAME dsp_smoke COMMAND TelephonyDspSmoke)
+endif()

@@ -9,8 +9,14 @@ namespace TelephonyDSP {
         float x1, x2, y1, y2;
 
         Biquad() { reset(); }
+        // Reset to an identity pass-through and clear the delay line.
+        // Callers use reset() to mean "no filtering" (e.g. EVS_NATIVE /
+        // OPUS_VOIP skip the band cascade at zero network degradation), so
+        // the neutral state must pass audio through unchanged. Zeroing b0
+        // as well would turn the filter into a mute stage.
         void reset() {
-            b0 = b1 = b2 = a1 = a2 = 0.0f;
+            b0 = 1.0f;
+            b1 = b2 = a1 = a2 = 0.0f;
             x1 = x2 = y1 = y2 = 0.0f;
         }
         
