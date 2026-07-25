@@ -19,7 +19,7 @@ namespace TelephonyDSP {
         : sampleRate(sampleRate)
         , bitrateBps(bitrateBps)
         , maxBw(maxBw)
-        , dtxSidInterval(0)
+        , dtxSidInterval(dtxSidInterval)
         , scVbrEnabled(scVbrEnabled)
         , enc(nullptr)
         , rx(nullptr)
