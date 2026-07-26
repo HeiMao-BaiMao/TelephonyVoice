@@ -9,6 +9,178 @@ set(EVS_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/external/3gpp-evs")
 set(EVS_FX_EXTRAS_LIB_COM
     # gain_inov.c lives under lib_com but is an FX implementation.
     "${EVS_ROOT}/lib_com/gain_inov.c"
+    # get_gain_fx.c is a parent-repo helper for the FX prototype
+    # `Word32 get_gain(Word16 x[], Word16 y[], Word16 n)`.  The
+    # float counterpart (external/3gpp-evs/lib_com/get_gain.c) has the
+    # incompatible signature `float get_gain(float[], float[], int, float*)`
+    # and cannot be compiled into the FX lib (it pulls in the float
+    # prot.h / options.h chain), so we provide a parent-side C
+    # implementation in get_gain_fx.c and attach it here.  The FX
+    # call sites in lib_com/cb_shape_fx.c:110 and
+    # lib_dec/FEC_scale_syn_fx.c:221,363 are tilt estimators that
+    # always use the result in Q16 (L_shr(.., 1) and L_shl(.., 15) in
+    # the call sites) so a Q16 Word32 return is the right contract.
+    # Uses the same FX include wiring (basop, shim) as the rest of
+    # evs-lib-com-fx because it is added to that target's source list.
+    "${CMAKE_CURRENT_SOURCE_DIR}/get_gain_fx.c"
+    # lerp_fx.c is a parent-repo helper for the FX prototype
+    # `void lerp(Word16 *f, Word16 *f_out, Word16 bufferNewSize,
+    # Word16 bufferOldSize)`.  The float counterpart
+    # (external/3gpp-evs/lib_com/lerp.c) has the incompatible
+    # signature `void lerp(float[], float[], int, int)` and pulls in
+    # <math.h>, <stdlib.h>, and the float prot.h, so it cannot be
+    # compiled into the FX lib.  There is no upstream `lerp_fx.c` -
+    # the FX tree relies on the float symbol being callable from
+    # FX, which it is not.  Parent-side fixed-point port lives in
+    # lerp_fx.c and is attached here.  FX call sites include
+    # lib_com/syn_filt_fx.c:251,255,264, lib_enc/core_enc_init.c:370,
+    # 386,402,512,516,612, lib_dec/acelp_core_dec_fx.c:217,218,
+    # lib_dec/amr_wb_dec_fx.c:233,234, lib_dec/core_switching_dec_fx.c:
+    # 420,453,713,717, lib_dec/FEC_clas_estim_fx.c:127, and
+    # lib_dec/er_dec_*.  Uses the same FX include wiring (basop,
+    # shim) as the rest of evs-lib-com-fx because it is added to
+    # that target's source list.
+    "${CMAKE_CURRENT_SOURCE_DIR}/lerp_fx.c"
+    # basop1616_fx.c is a parent-repo helper that provides four small
+    # fixed-point arithmetic primitives - `idiv1616`, `imult1616`,
+    # `divide1616`, `divide3232` - that are *called* by vendored 3GPP
+    # EVS FX sources but have no implementation (and no prototype) in
+    # external/3gpp-evs/.  Upstream equivalent definitions exist only
+    # in the float reference tree (basop_util.c ships the unsigned
+    # variant `idiv1616U`); the signed versions used here are missing
+    # from this vendored snapshot.  FX call sites include
+    # lib_com/modif_fs_fx.c:131, lib_com/lpc_tools_fx.c:625,649,713,725,
+    # lib_com/bitstream_fx.c:960, lib_com/est_tilt_fx.c:240,
+    # lib_enc/pre_proc_fx.c:636,796, lib_dec/core_switching_dec_fx.c:402,
+    # and lib_dec/evs_dec_fx.c:550,565,580.  Plain C99 with
+    # `long long` intermediates so we do not depend on any other
+    # basop helper.  Uses the same FX include wiring as the rest of
+    # evs-lib-com-fx (the typedef shim provides Word16/Word32/MAX_16
+    # /MIN_16 via /FI).
+    "${CMAKE_CURRENT_SOURCE_DIR}/basop1616_fx.c"
+    # basop_extra_fx.c is a parent-repo helper that provides three
+    # additional BASOP utility primitives - `getScaleFactor16`,
+    # `getSqrtWord32`, `getNormReciprocalWord16` - that are called by
+    # vendored 3GPP EVS FX sources but have no implementation in the
+    # vendored snapshot.  FX call sites include
+    # lib_com/lpc_tools_fx.c:835, lib_dec/evs_dec_fx.c:961,964
+    # (getScaleFactor16), lib_com/index_pvq_opt_fx.c:672 and
+    # lib_dec/pvq_core_dec_fx.c:398,406,435,466 (getSqrtWord32), and
+    # lib_com/window_ola_fx.c:612,664 (getNormReciprocalWord16).
+    # Plain C99 with 64-bit intermediates; only typedefs.h is included,
+    # matching the other parent helpers.
+    "${CMAKE_CURRENT_SOURCE_DIR}/basop_extra_fx.c"
+    # tns_base_fx.c is a parent-repo helper that provides the fixed-point
+    # TNS accessor family declared in external/3gpp-evs/lib_com/prot_fx.h
+    # (lines 9747-9778).  The upstream float implementation in
+    # external/3gpp-evs/lib_com/tns_base.c uses the float Decoder_State and
+    # int-based signatures, so it cannot be linked into the FX library.
+    # Uses the FX include wiring (basop, shim) and the FX TNS tables in
+    # external/3gpp-evs/lib_com/rom_com_fx.h / rom_com_fx.c.
+    "${CMAKE_CURRENT_SOURCE_DIR}/tns_base_fx.c"
+    # cldfb_fx.c is a parent-repo helper that provides the fixed-point
+    # CLDFB accessor family declared in external/3gpp-evs/lib_com/prot_fx.h
+    # (cldfbAnalysisFiltering, cldfbSynthesisFiltering, openCldfb,
+    # deleteCldfb, resampleCldfb, cldfb_save/restore/reset_memory and
+    # CLDFB_getNumChannels).  The upstream float implementation in
+    # external/3gpp-evs/lib_com/cldfb.c cannot be linked into the FX
+    # library, and the vendored fixed-point snapshot does not ship the
+    # corresponding FX implementation.  Uses the FX include wiring
+    # (basop, shim) and the FX CLDFB prototype-filter ROM tables in
+    # rom_com_fx.h / rom_com_fx.c.
+    "${CMAKE_CURRENT_SOURCE_DIR}/cldfb_fx.c"
+    # tec_tfa_tbe_fx.c is a parent-repo helper that provides the seven
+    # TEC/TFA TBE FX symbols declared in external/3gpp-evs/lib_com/prot_fx.h
+    # (tfaCalcEnv_fx, tfaEnc_TBE_fx, tecEnc_TBE_fx, set_TEC_TFA_code_fx,
+    # procTecTfa_TBE_Fx, calcGainTemp_TBE_Fx, calcLoEnvCheckCorrHiLo_Fix).
+    # The upstream float implementations in external/3gpp-evs/lib_com/tec_com.c
+    # and external/3gpp-evs/lib_enc/tfa_enc.c cannot be linked into the FX
+    # library, and the vendored fixed-point snapshot does not ship the
+    # corresponding FX implementation.  Uses the FX include wiring (basop,
+    # shim) and the FX TEC/TFA ROM tables in rom_com_fx.h / rom_com_fx.c.
+    "${CMAKE_CURRENT_SOURCE_DIR}/tec_tfa_tbe_fx.c"
+    # basic_utils_fx.c is a parent-repo helper that provides five foundational
+    # FX symbols declared in external/3gpp-evs/lib_com/prot_fx.h:
+    # hp20, lag_wind, adapt_lag_wind, fft16, and BASOP_cfft.  The upstream
+    # float implementations (hp50.c, lag_wind.c, fft.c) have incompatible
+    # float-based ABIs, and the vendored fixed-point snapshot does not ship
+    # the FX variants.  hp20 and the lag-window functions are implemented in
+    # plain fixed-point; fft16 and BASOP_cfft wrap the existing upstream FX
+    # FFT core DoRTFTn_fx() for power-of-two sizes, with a generic complex-DFT
+    # fallback for other sizes so the link can proceed to expose the next
+    # layer of unresolved symbols.
+    "${CMAKE_CURRENT_SOURCE_DIR}/basic_utils_fx.c"
+    # pitch_fx.c is a parent-repo helper that provides the eight pitch-related
+    # FX symbols declared in external/3gpp-evs/lib_com/prot_fx.h:
+    # pitch_ol_init_fx, pitch_ol_fx, pit_decode_fx, pit_Q_dec_fx,
+    # pit16k_Q_dec_fx, abs_pit_dec_fx, delta_pit_dec_fx, and
+    # pitch_pred_linear_fit.  The upstream float implementations in
+    # lib_enc/pitch_ol.c, lib_dec/pit_dec.c, and lib_dec/pitch_extr.c have
+    # incompatible float ABIs, and the vendored fixed-point snapshot does not
+    # ship the FX variants.  The open-loop pitch search and the FEC linear-fit
+    # extrapolation are currently link-unblock stubs; the pitch decoders are
+    # direct fixed-point ports of the float reference.
+    "${CMAKE_CURRENT_SOURCE_DIR}/pitch_fx.c"
+    # fdcng_enc_fx.c is a parent-repo helper that provides the encoder-side
+    # FD-CNG symbols declared in external/3gpp-evs/lib_com/prot_fx.h:
+    # createFdCngEnc, deleteFdCngEnc, initFdCngEnc, configureFdCngEnc,
+    # resetFdCngEnc, perform_noise_estimation_enc, FdCng_exc,
+    # FdCng_encodeSID, generate_comfort_noise_enc, and noisy_speech_detection.
+    # The upstream float implementations in lib_enc/fd_cng_enc.c and
+    # lib_com/fd_cng_com.c are not compiled into the FX static libraries.
+    # Full STFT/MSVQ encoder paths are stubbed where the FX typedef shim's
+    # FD_CNG_COM layout does not carry the required float-only fields.
+    "${CMAKE_CURRENT_SOURCE_DIR}/fdcng_enc_fx.c"
+    # fdcng_dec_fx.c is a parent-repo helper that provides the decoder-side
+    # FD-CNG symbols declared in external/3gpp-evs/lib_com/prot_fx.h:
+    # createFdCngDec, initFdCngDec, deleteFdCngDec, configureFdCngDec,
+    # ApplyFdCng, FdCng_decodeSID, generate_comfort_noise_dec,
+    # generate_comfort_noise_dec_hf, generate_masking_noise, and
+    # noisy_speech_detection.  The upstream float implementations in
+    # lib_dec/fd_cng_dec.c and lib_com/fd_cng_com.c are not compiled into the
+    # FX static libraries.  Comfort-noise / masking-noise synthesis are
+    # link-unblock stubs for now.
+    "${CMAKE_CURRENT_SOURCE_DIR}/fdcng_dec_fx.c"
+    # acelp_core_fx.c is a parent-repo helper that provides the ACELP core
+    # fixed-point symbols declared in external/3gpp-evs/lib_com/prot_fx.h:
+    # E_ACELP_codebook_corr, E_ACELP_codebook_target_update,
+    # E_ACELP_convolve, E_ACELP_correlation, E_ACELP_innovative_codeword,
+    # E_ACELP_q_pulse, E_ACELP_xAq, E_ACELP_xh_corr, E_ACELP_1 algebraic
+    # codebook search, encode_acelp_gains, E_GAIN_closed_loop_search,
+    # BITS_ALLOC_config_acelp, and Unified_weighting_fx.  The upstream float
+    # implementations in lib_enc/acelp_enc.c, lib_enc/g_acelp_enc.c and
+    # lib_enc/enc_lag.c have incompatible float ABIs, and the vendored
+    # fixed-point snapshot does not ship the FX variants.  The algebraic
+    # codebook / gain-quantisation / closed-loop-search paths are currently
+    # link-unblock stubs.
+    "${CMAKE_CURRENT_SOURCE_DIR}/acelp_core_fx.c"
+    # core_enc_vad_fx.c is a parent-repo helper that provides the encoder-side
+    # core / VAD / preprocessing symbols declared in
+    # external/3gpp-evs/lib_com/prot_fx.h: enc_acelp_tcx_main,
+    # core_encode_update, init_coder_ace_plus, MDCT_selector_reset,
+    # InitTransientDetection, enc_prm_rf, SetModeIndex,
+    # analysisCldfbEncoder_fx, MDCT_selector, long_enr_fx, find_uv_fx,
+    # signal_clas_fx, core_acelp_tcx20_switching, analy_sp, AdjustFirstSID,
+    # RunTransientDetection, GetTCXAvgTemporalFlatnessMeasure, SetTCXModeInfo,
+    # and vad_proc.  The upstream float implementations live in
+    # lib_enc/{enc_acelp_tcx_main,core_enc_updt,core_enc_init,mdct_selector,
+    # transient_detection,enc_lag}.c and lib_com/cldfb.c.  They use float
+    # Encoder_State / float arrays and cannot be linked into the FX static
+    # libraries.  Full ACELP/TCX core encoding and RF parameter packing are
+    # currently link-unblock stubs.
+    "${CMAKE_CURRENT_SOURCE_DIR}/core_enc_vad_fx.c"
+    # dec_postfilter_fx.c is a parent-repo helper that provides the decoder-side
+    # post-filter / concealment fixed-point symbols declared in
+    # external/3gpp-evs/lib_com/prot_fx.h: init_decoder_LPD_fx,
+    # open_decoder_LPD, close_decoder_LPD, decode_gn_lpc, speech_music_class,
+    # acelp_mode_dec, core_decoder_signal, tcx_ltp_post, lpd_delay_switch,
+    # decoder_LPD_status, resynch_LPD, lpd_get_closest_freq_arry,
+    # lpd_get_closest_pitch_arry, and scale_st.  The upstream float
+    # implementations live in lib_dec/{dec_acelp,dec_lpd,lpd_dec,
+    # core_dec_signal}.c and lib_com/tcx_ltp.c.  They use float Decoder_State /
+    # float arrays and cannot be linked into the FX static libraries.  Full
+    # LPD decoder state-machine paths are currently link-unblock stubs.
+    "${CMAKE_CURRENT_SOURCE_DIR}/dec_postfilter_fx.c"
 )
 set(EVS_FX_EXTRAS_LIB_ENC
     # vad_basop.c lives under lib_enc but is an FX implementation.
@@ -125,6 +297,12 @@ target_compile_definitions(evs-lib-dec PRIVATE ${EVS_WB_VAD_RENAME_DEFS})
 if(MSVC)
     target_compile_definitions(evs-lib-dec PRIVATE _CRT_SECURE_NO_WARNINGS)
     target_compile_options(evs-lib-dec PRIVATE /wd4244 /wd4267 /wd4018 /wd4305 /O2)
+    # Work around an MSVC internal compiler error (C1001) in avq_dec.c
+    # when compiled with /O2 in this toolchain version.  /Od for this
+    # single file avoids the crash without affecting the rest of the
+    # decoder library.
+    set_source_files_properties("${EVS_ROOT}/lib_dec/avq_dec.c"
+        PROPERTIES COMPILE_FLAGS "/Od")
 endif()
 
 # ---------------------------------------------------------------------------
@@ -1062,6 +1240,34 @@ if(TELEPHONY_USE_EVS_FX)
     )
 
     # ------------------------------------------------------------------
+    # Float ACELP helper for the fixed-point build
+    #
+    # The FX fixed-point snapshot does not ship the algebraic codebook
+    # search / indexing implementations; prot_fx.h declares the FX stubs
+    # but the upstream float reference implementation in
+    # lib_enc/enc_acelp.c, lib_enc/enc_acelpx.c and lib_dec/dec_acelp.c
+    # is reusable with a small amount of glue.  We compile just those
+    # three float sources (renamed so they do not collide with FX
+    # symbols) into a tiny static library and link it into evs-lib-com-fx.
+    #
+    # The helper is compiled with the normal float include paths (not the
+    # FX shim) and therefore sees the float options.h / typedef.h / cnst.h
+    # chain.  Conflicting ROM table names are rewritten with macros, and
+    # helpers referenced only by dead code are stubbed so the linker can
+    # discard that code path without pulling in the rest of the float
+    # encoder library.
+    # ------------------------------------------------------------------
+    add_library(evs-float-acelp STATIC
+        "${CMAKE_CURRENT_SOURCE_DIR}/helpers/acelp_float_wrap.c"
+    )
+    target_include_directories(evs-float-acelp PUBLIC ${EVS_INCLUDE_DIRS})
+    target_compile_definitions(evs-float-acelp PRIVATE ${EVS_WB_VAD_RENAME_DEFS})
+    if(MSVC)
+        target_compile_definitions(evs-float-acelp PRIVATE _CRT_SECURE_NO_WARNINGS)
+        target_compile_options(evs-float-acelp PRIVATE /wd4244 /wd4267 /wd4018 /wd4305 /O2)
+    endif()
+
+    # ------------------------------------------------------------------
     # Helper: per-target FX settings.  We define a function that
     # attaches the include dirs, compile definitions, force-include
     # shim, MSVC warning suppressions, and the wb_vad renames to the
@@ -1083,7 +1289,7 @@ if(TELEPHONY_USE_EVS_FX)
 
         if(MSVC)
             target_compile_definitions(${TGT} PRIVATE _CRT_SECURE_NO_WARNINGS)
-            target_compile_options(${TGT} PRIVATE /wd4244 /wd4267 /wd4018 /wd4305 /O2)
+            target_compile_options(${TGT} PRIVATE /wd4244 /wd4267 /wd4018 /wd4305 /O2 /GS-)
         endif()
     endfunction()
 
@@ -1133,7 +1339,7 @@ if(TELEPHONY_USE_EVS_FX)
         # rename ACTIVE in these TUs.  We do that by giving them the
         # per-source compile definition
         # `TELEPHONY_EVS_FX_KEEP_2ARG_MPY_NAME` (see the
-        # set_source_files_properties loop below), which makes the
+        # set_property loop below), which makes the
         # shim skip its `#undef Mpy_32_16` + `#include "oper_32b.h"`
         # block and lets `Mpy_32_16(x, y)` calls in these files
         # resolve against the renamed 2-arg symbol.  Normal FX codec
@@ -1231,12 +1437,21 @@ if(TELEPHONY_USE_EVS_FX)
     # oper_32b.h.  basop_util.c is intentionally handled by a separate
     # set_property block below because it also needs the BASOP_UTIL_SHIM
     # define.  basop_tcx_utils.c is excluded from the FX build.
+    #
+    # Use set_property(SOURCE <src> APPEND PROPERTY COMPILE_DEFINITIONS
+    # <def>) (the APPEND form) so TELEPHONY_EVS_FX_KEEP_2ARG_MPY_NAME is
+    # added to the source's COMPILE_DEFINITIONS list instead of
+    # replacing it.  This matches the pattern basop_util.c below uses
+    # for its two-definition stack (KEEP_2ARG_MPY_NAME + BASOP_UTIL_SHIM)
+    # and keeps the three basop helpers on the same property-append
+    # convention, so a future block that adds another compile definition
+    # to any of these sources does not silently drop ours.
     foreach(_basop_com_helper_src
             "${EVS_ROOT}/lib_com/basop_mpy.c"
             "${EVS_ROOT}/lib_com/basop_com_lpc.c"
             "${EVS_ROOT}/lib_com/basop_lsf_tools.c")
-        set_source_files_properties("${_basop_com_helper_src}" PROPERTIES
-            COMPILE_DEFINITIONS "TELEPHONY_EVS_FX_KEEP_2ARG_MPY_NAME"
+        set_property(SOURCE "${_basop_com_helper_src}" APPEND
+            PROPERTY COMPILE_DEFINITIONS "TELEPHONY_EVS_FX_KEEP_2ARG_MPY_NAME"
         )
     endforeach()
 
@@ -1284,7 +1499,7 @@ if(TELEPHONY_USE_EVS_FX)
     # (basop_mpy.c, basop_com_lpc.c, basop_lsf_tools.c) ARE included in
     # EVS_FX_BASOP_COM_SOURCES above, and they are tagged with the
     # per-source compile definition TELEPHONY_EVS_FX_KEEP_2ARG_MPY_NAME
-    # (see the set_source_files_properties loop above).  The shim
+    # (see the set_property loop above).  The shim
     # (EVS_FX_TYPEDEF_SHIM) checks that macro: if defined, it skips
     # the `#undef Mpy_32_16` + `#include "oper_32b.h"` block and leaves
     # the 2-arg rename `Mpy_32_16 -> evs_fx_Mpy_32_16_2arg` active so
@@ -1306,6 +1521,7 @@ if(TELEPHONY_USE_EVS_FX)
 
     add_library(evs-lib-com-fx STATIC ${EVS_LIB_COM_FX_SOURCES})
     evs_configure_fx_target(evs-lib-com-fx)
+    target_link_libraries(evs-lib-com-fx PUBLIC evs-float-acelp)
     # evs-lib-com-fx carries the same basic-op / basop_mpy / basop_com_lpc
     # helpers that opencore-amrnb / opencore-amrwb / vo-amrwbenc also
     # define.  Symbols like Isqrt, Deemph2, Dot_product12 are duplicated

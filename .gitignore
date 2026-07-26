@@ -381,3 +381,8 @@ runner_err.txt
 # Execute file
 *.exe
 *.dll
+
+# Parent-repo scratch: EVS FX WIP build/link logs and configure capture
+# are written here so the FX toolchain can be re-run without polluting
+# the repo or the out/ tree.  Kept untracked on purpose.
+tmp/
