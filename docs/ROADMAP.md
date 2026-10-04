@@ -2,8 +2,13 @@
 
 All items are VST-plugin-internal only. No external network I/O, no
 multi-party conferencing, no signaling protocol stacks. The goal is
-perfect emulation of telephony noise, voice quality, packet loss, and
+testable local simulation of telephony noise, voice quality, packet loss, and
 radio degradation within the DAW plugin.
+
+**Current acceptance status:** [FEATURE_MATRIX.md](FEATURE_MATRIX.md) maps every
+item below to real implementation, tests and remaining external-data/conformance
+requirements. The lists below retain the original requested specification; they
+are not a blanket certification or completion claim.
 
 Difficulty estimates: ★ = trivial (<50 lines), ★★ = small (50~150 lines),
 ★★★ = medium (1~3 files, 150~500 lines), ★★★★ = large (cross-cutting,
@@ -34,7 +39,7 @@ Each item below decouples them or adds new independent simulation knobs.
 | # | Item | Difficulty |
 |---|------|-----------|
 | 1.1 | **Degradation parameter separation** — split `networkDegradation` into independent controls for: bandwidth narrowing, jitter amplitude, burst length mean, loss-rate boost, Opus FEC percent, Opus playback delay, filter-cascade enable. New `NetworkProfile` struct + VST knobs (6~8 new params). | ★★★★ |
-| 1.2 | **Gilbert-Elliott 2-state Markov loss model** — replace the current simplified burst model with proper Good↔Bad state transitions (p, r, k, h parameters). Add 3GPP TS 26.131 error patterns (EP1~EP6) as presets. | ★★★ |
+| 1.2 | **Gilbert-Elliott 2-state Markov loss model** — replace the current simplified burst model with proper Good↔Bad state transitions (p, r, k, h parameters). Original request: EP1~EP6 presets. Correction: these are TR45.050 radio-error vectors, not TS26.131 Gilbert presets; source data/mapping remains required. | ★★★ |
 | 1.3 | **Jitter distribution upgrade** — change from uniform LCG jitter to Gamma / Weibull / Pareto distributions with configurable shape parameters. Add AR(1) autocorrelation for bursty jitter (consecutive frames with correlated delays). | ★★★ |
 | 1.4 | **Bit-error injection (BER)** — flip random bits in the encoded bitstream before decoding. Per-codec support: AMR bitstream corruption, EVS G.192 bit-flip, Opus ToC-aware corruption. New `--ber` CLI flag + VST slider. | ★ |
 | 1.5 | **Pure-silence DTX comparison mode** — emit true zero-PCM on DTX silence (bypass CNG) for A/B comparison. | ★ |
@@ -54,7 +59,7 @@ Each item below decouples them or adds new independent simulation knobs.
 | 2.6 | **Codec mode-switching transient artifacts** — simulate audible clicks / bandwidth-transition artifacts when AMR/EVS changes bitrate mid-call. Requires filter-coefficient interpolation and encoder-state preservation across mode changes. | ★★★★ |
 | 2.7 | **VAD→DTX extension to AMR / G.711 / GSM** — wire the existing SpeexDSP energy VAD to the legacy codecs (currently only OPUS_VOIP / EVS_LIKE). | ★ |
 | 2.8 | **EVS AMR-WB IO mode** — enable the 3GPP EVS encoder's inter-op mode that produces AMR-WB-compatible bitstreams. Requires `evs_dec_create` signature change (breaking). | ★★★ |
-| 2.9 | **VSTGUI editor** — route diagram, codec labels, configured-loss readout, grouped controls, host automation binding and zoom are implemented. Live VU meters and measured loss telemetry remain future work; the editor does not present simulated readouts as measurements. | ★★★★★ |
+| 2.9 | **VSTGUI editor** — route diagram, codec labels, configured-loss readout, grouped controls, host automation binding and zoom are implemented. Live peak meters, measured loss/jitter/mode readouts, Opus routes and four advanced pages are now implemented; see acceptance matrix. | ★★★★★ |
 
 ---
 
@@ -81,7 +86,7 @@ realistic codec/PCL/JBM behavior.
 |---|------|-----------|
 | 4.1 | **Wireless fading / C-I rate adaptation** — Rayleigh/Jakes fading model → C/I estimation → dynamic AMR/EVS mode selection per 3GPP TS 45.008 / 36.101 channel models. | ★★★★★ |
 | 4.2 | **Handover gap simulation** — momentary mute (50~200 ms) with rapid codec-state recovery, mimicking inter-base-station handovers. | ★★★★ |
-| 4.3 | **EVS fixed-point v16 (TELEPHONY_USE_EVS_FX)** — WIP. Parent-only shim/source-list work now resolves the original typedef/cnst/stat_com compile blockers and builds the FX static libs plus `TelephonyDSP`, but `TelephonyRunner` still fails final link (`LNK1120: 138 unresolved external references`) because multiple FX helper families still need ports or deliberate stubs. See [CHANGELOG.md](CHANGELOG.md). | — WIP / link-blocked |
+| 4.3 | **EVS fixed-point v16 (TELEPHONY_USE_EVS_FX)** — complete official source-path integration, synthetic reference-CLI byte equivalence and ASan tests. Legacy link-only helpers removed; official vectors not yet run. See [EVS_FIXED_POINT.md](EVS_FIXED_POINT.md). | Reference-data validation remains |
 | 4.4 | **Wideband extension to narrowband transcoding artifacts** — tandem coding effects when WB input is encoded as NB, then decoded and re-encoded. | ★★★★ |
 | 4.5 | **Voice activity detection (VAD-2) with hangover** — implement proper 3GPP-style VAD with primary decision, hangover addition, and burst-length smoothing. Currently only simple energy threshold. | ★★★ |
 

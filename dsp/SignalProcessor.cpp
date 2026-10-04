@@ -30,6 +30,42 @@ namespace TelephonyDSP {
 
     SignalProcessor::~SignalProcessor() {}
 
+    void SignalProcessor::setAdvancedSettings(const AdvancedSettings& settings) {
+        if(advanced==settings) return;
+        const int oldLatency=targetLatencySamples;
+        const bool opusActive=routeModelEnabled?(endpointToMode(inputEndpoint)==EraMode::OPUS_VOIP || endpointToMode(outputEndpoint)==EraMode::OPUS_VOIP):currentMode==EraMode::OPUS_VOIP;
+        const bool frameChanged=opusActive && advanced.get(AdvancedControl::OpusFrameDuration)!=settings.get(AdvancedControl::OpusFrameDuration);
+        const bool impairedLeg=routeModelEnabled?(degradesInputLeg() || degradesOutputLeg()):currentMode!=EraMode::Bypass;
+        const bool streamChanged=impairedLeg && (
+            advanced.enabled(AdvancedControl::NetworkEnabled)!=settings.enabled(AdvancedControl::NetworkEnabled)
+            || ((advanced.enabled(AdvancedControl::NetworkEnabled) || settings.enabled(AdvancedControl::NetworkEnabled)) && advanced.get(AdvancedControl::PlaybackDelayMs)!=settings.get(AdvancedControl::PlaybackDelayMs))
+            || advanced.get(AdvancedControl::ClockDriftPpm)!=settings.get(AdvancedControl::ClockDriftPpm)
+            || advanced.enabled(AdvancedControl::HostClock)!=settings.enabled(AdvancedControl::HostClock));
+        advanced=settings;
+        applyRouteToChannels();
+        updateLatency();
+        if(oldLatency!=targetLatencySamples || frameChanged || streamChanged) reset();
+    }
+    void SignalProcessor::setTransportTime(double seconds,bool playing) {
+        if(!advanced.enabled(AdvancedControl::HostClock) || !std::isfinite(seconds)) return;
+        if(hostTimeKnown && (playing || hostPlaying) && std::abs(seconds-expectedHostTime)>2.0/hostSampleRate) reset();
+        expectedHostTime=seconds; hostTimeKnown=true; hostPlaying=playing;
+        for(auto& ch:inputLegs) ch->setTransportTime(seconds,playing);
+        for(auto& ch:outputLegs) ch->setTransportTime(seconds,playing);
+    }
+    ProcessingTelemetry SignalProcessor::getTelemetry() const {
+        ProcessingTelemetry total; total.inputPeak=inputPeak; total.outputPeak=outputPeak;
+        auto collect=[&](const auto& channels) {
+            for(const auto& ch:channels) { const auto t=ch->getTelemetry();
+                total.packets+=t.packets; total.lost+=t.lost; total.late+=t.late; total.duplicates+=t.duplicates;
+                total.jitterMs=std::max(total.jitterMs,t.jitterMs); if(t.opusMode>=0) total.opusMode=t.opusMode;
+            }
+        };
+        if(routeModelEnabled) collect(inputLegs); collect(outputLegs);
+        total.measuredLoss=total.packets?double(total.lost)/total.packets:0;
+        return total;
+    }
+
     EraMode SignalProcessor::endpointToMode(RouteEndpoint endpoint) const {
         switch (endpoint) {
             case RouteEndpoint::FixedLine:       return EraMode::PSTN_G711;
@@ -38,6 +74,7 @@ namespace TelephonyDSP {
             case RouteEndpoint::Mobile4G:        return distributionSafeMode(EraMode::AMR_WB_VOLTE);
             case RouteEndpoint::Mobile5G:        return EraMode::EVS_LIKE;
             case RouteEndpoint::Mobile5GNative:  return distributionSafeMode(EraMode::EVS_NATIVE);
+            case RouteEndpoint::Opus: return distributionSafeMode(EraMode::OPUS_VOIP);
 #if TELEPHONY_USE_EVS_JBM
             case RouteEndpoint::Mobile5GJbm:     return distributionSafeMode(EraMode::EVS_JBM);
 #endif
@@ -59,6 +96,16 @@ namespace TelephonyDSP {
         for (size_t i = 0; i < outputLegs.size(); ++i) {
             auto& inputLeg = inputLegs[i];
             auto& outputLeg = outputLegs[i];
+            auto forLeg=[&](bool degraded,bool input) {
+                auto s=advanced;
+                if(!degraded) {
+                    for(auto c:{AdvancedControl::NetworkEnabled,AdvancedControl::BitErrorRate,AdvancedControl::FadingEnabled,AdvancedControl::ClockDriftPpm,AdvancedControl::EchoEnabled,AdvancedControl::HandoverIntervalMs}) s.setPlain((size_t)c,0);
+                }
+                if(routeModelEnabled && !input) s.setPlain((size_t)AdvancedControl::DtmfDigit,-1);
+                return s;
+            };
+            inputLeg->setAdvancedSettings(forLeg(routeModelEnabled && degradesInputLeg(),true));
+            outputLeg->setAdvancedSettings(forLeg(!routeModelEnabled || degradesOutputLeg(),false));
             inputLeg->setEVSConfig(evsSampleRate, evsBitrateBps, evsMaxBandwidth);
             outputLeg->setEVSConfig(evsSampleRate, evsBitrateBps, evsMaxBandwidth);
             // Keep the per-channel EVS DTX SID interval in sync so a later
@@ -108,6 +155,7 @@ namespace TelephonyDSP {
         updateLatency();
         for (auto& ch : inputLegs) ch->setSampleRate(sr);
         for (auto& ch : outputLegs) ch->setSampleRate(sr);
+        for(auto& buffer:dryBuffers) buffer->resize(std::max<size_t>(131072,(size_t)std::ceil(sr)+8192));
         reset();
     }
 
@@ -123,18 +171,19 @@ namespace TelephonyDSP {
 
     void SignalProcessor::setRoute(RouteEndpoint input, RouteEndpoint output, DegradationSegment segment) {
         const bool pathChanged = !routeModelEnabled || inputEndpoint != input || outputEndpoint != output;
+        const int oldLatency=targetLatencySamples;
         routeModelEnabled = true;
         inputEndpoint = input;
         outputEndpoint = output;
         degradationSegment = segment;
         updateLatency();
         applyRouteToChannels();
-        if (pathChanged) reset();
+        if (pathChanged || oldLatency!=targetLatencySamples) reset();
     }
 
     void SignalProcessor::setEVSConfig(int sampleRateHz, int bitrateBps, EVS_Bandwidth maxBw) {
         normalizeEvsConfig(sampleRateHz, bitrateBps, maxBw);
-        const bool changed = evsSampleRate != sampleRateHz || evsBitrateBps != bitrateBps || evsMaxBandwidth != maxBw;
+        const bool changed = evsSampleRate != sampleRateHz;
         evsSampleRate   = sampleRateHz;
         evsBitrateBps   = bitrateBps;
         evsMaxBandwidth = maxBw;
@@ -178,7 +227,6 @@ namespace TelephonyDSP {
         amrNbMode = clamped;
         for (auto& ch : inputLegs)  ch->setAmrNbMode(clamped);
         for (auto& ch : outputLegs) ch->setAmrNbMode(clamped);
-        if (routeModelEnabled ? (endpointToMode(inputEndpoint) == EraMode::AMR_NB_3G || endpointToMode(outputEndpoint) == EraMode::AMR_NB_3G) : currentMode == EraMode::AMR_NB_3G) reset();
     }
 
     void SignalProcessor::setAmrWbMode(int mode) {
@@ -191,7 +239,6 @@ namespace TelephonyDSP {
         amrWbMode = clamped;
         for (auto& ch : inputLegs)  ch->setAmrWbMode(clamped);
         for (auto& ch : outputLegs) ch->setAmrWbMode(clamped);
-        if (routeModelEnabled ? (endpointToMode(inputEndpoint) == EraMode::AMR_WB_VOLTE || endpointToMode(outputEndpoint) == EraMode::AMR_WB_VOLTE) : currentMode == EraMode::AMR_WB_VOLTE) reset();
     }
 
     void SignalProcessor::setG711Law(int law) {
@@ -220,13 +267,15 @@ namespace TelephonyDSP {
 
     void SignalProcessor::setParameters(float dryWet, float outGaindB, bool artifacts, float artifactAmount,
                                         float packetLossRate, float networkDegradation) {
+        const int priorLatency=targetLatencySamples;
         paramDryWet = std::isfinite(dryWet) ? std::clamp(dryWet, 0.0f, 1.0f) : 1.0f;
         paramOutGain = std::pow(10.0f, (std::isfinite(outGaindB) ? std::clamp(outGaindB, -60.0f, 24.0f) : 0.0f) / 20.0f);
         paramArtifactsEnabled = artifacts;
         paramArtifactAmount = std::isfinite(artifactAmount) ? std::clamp(artifactAmount, 0.0f, 1.0f) : 0.0f;
         paramPacketLossRate = (std::isfinite(packetLossRate) ? std::clamp(packetLossRate, 0.0f, 0.95f) : 0.0f);
         paramNetworkDegradation = (std::isfinite(networkDegradation) ? std::clamp(networkDegradation, 0.0f, 1.0f) : 0.0f);
-        applyRouteToChannels();
+        applyRouteToChannels(); updateLatency();
+        if(priorLatency!=targetLatencySamples) reset();
     }
 
     void SignalProcessor::setSimulateLatency(bool enable) {
@@ -239,6 +288,7 @@ namespace TelephonyDSP {
     void SignalProcessor::reset() {
         inTotalSamples = 0;
         outTotalSamples = 0;
+        inputPeak=outputPeak=0; hostTimeKnown=false;
         for (auto& ch : inputLegs) ch->reset();
         for (auto& ch : outputLegs) ch->reset();
         for (auto& db : dryBuffers) db->reset();
@@ -250,8 +300,34 @@ namespace TelephonyDSP {
         // callers disable the optional dry/bypass delay. Without it output
         // starvation inserts a different number of zeros for each block size.
         const bool needsCodecReserve = routeModelEnabled || currentMode != EraMode::Bypass;
+        double additional=0;
+        auto legDelay=[&](EraMode mode,bool degraded) {
+            double d=0,frameMs=20;
+            if(mode==EraMode::Bypass) return d;
+#if TELEPHONY_USE_EVS_JBM
+            if(mode==EraMode::EVS_JBM) return d; // adaptive wet-path delay is part of the simulation
+#endif
+            if(mode==EraMode::OPUS_VOIP) {
+                static constexpr double duration[]={2.5,5,10,20,40,60};
+                frameMs=duration[(int)advanced.get(AdvancedControl::OpusFrameDuration)];
+            }
+            if(degraded && advanced.enabled(AdvancedControl::NetworkEnabled)) d+=std::ceil(advanced.get(AdvancedControl::PlaybackDelayMs)/frameMs)*frameMs;
+            else if(mode==EraMode::OPUS_VOIP) d+=(2+(int)((degraded?paramNetworkDegradation:0)*4))*frameMs;
+            if(degraded && advanced.get(AdvancedControl::ClockDriftPpm)!=0
+#if TELEPHONY_USE_EVS_JBM
+                && mode!=EraMode::EVS_JBM
+#endif
+            ) d+=2;
+            return d;
+        };
+        if(needsCodecReserve) {
+            if(routeModelEnabled) {
+                additional+=legDelay(endpointToMode(inputEndpoint),degradesInputLeg());
+                additional+=legDelay(endpointToMode(outputEndpoint),degradesOutputLeg());
+            } else additional=legDelay(currentMode,true);
+        }
         targetLatencySamples = (simulateLatency || needsCodecReserve)
-            ? (int)std::round((LATENCY_MS / 1000.0) * hostSampleRate) : 0;
+            ? (int)std::round(((LATENCY_MS+additional) / 1000.0) * hostSampleRate) : 0;
     }
 
     int SignalProcessor::getLatencySamples() const {
@@ -267,9 +343,13 @@ namespace TelephonyDSP {
             for (int i=0; i<count; ++i) {
                 inputLegs.push_back(std::make_unique<ChannelProcessor>(hostSampleRate));
                 outputLegs.push_back(std::make_unique<ChannelProcessor>(hostSampleRate));
-                dryBuffers.push_back(std::make_unique<RingBuffer>(131072));
+                dryBuffers.push_back(std::make_unique<RingBuffer>(std::max<size_t>(131072,(size_t)std::ceil(hostSampleRate)+8192)));
             }
             applyRouteToChannels();
+            if(hostTimeKnown) {
+                for(auto& ch:inputLegs) ch->setTransportTime(expectedHostTime,hostPlaying);
+                for(auto& ch:outputLegs) ch->setTransportTime(expectedHostTime,hostPlaying);
+            }
         }
     }
 
@@ -277,11 +357,14 @@ namespace TelephonyDSP {
         if (numSamples <= 0 || !outputs || numOuts <= 0) return;
         for (int ch = 0; ch < numOuts; ++ch) if (!outputs[ch]) return;
         if (!inputs || numIns <= 0) {
+            inputPeak=outputPeak=0;
             for (int ch = 0; ch < numOuts; ++ch) std::fill_n(outputs[ch], numSamples, 0.0f);
             return;
         }
         for (int ch = 0; ch < numIns; ++ch) if (!inputs[ch]) return;
         ensureChannels(numIns);
+        if(hostTimeKnown) expectedHostTime+=numSamples/hostSampleRate;
+        inputPeak=outputPeak=0;
 
         // Bound staging and ring-buffer use even for unusually large offline
         // blocks. Read every channel before writing any aliased output.
@@ -293,6 +376,7 @@ namespace TelephonyDSP {
                 for (int i = 0; i < count; ++i) {
                     const float sample = inputs[ch][offset + i];
                     input[i] = std::isfinite(sample) ? sample : 0.0f;
+                    inputPeak=std::max(inputPeak,(double)std::abs(input[i]));
                 }
                 dryBuffers[ch]->write(input.data(), count);
                 if (routeModelEnabled) {
@@ -336,6 +420,7 @@ namespace TelephonyDSP {
                 for (int ch = 0; ch < numOuts; ++ch)
                     std::memcpy(outputs[ch] + offset, processed[ch < numIns ? ch : 0].data(), count * sizeof(float));
             }
+            for(int ch=0;ch<numOuts;++ch) for(int i=0;i<count;++i) outputPeak=std::max(outputPeak,(double)std::abs(outputs[ch][offset+i]));
             outTotalSamples += count;
         }
     }

@@ -13,6 +13,8 @@
 #include "vstgui/uidescription/uiattributes.h"
 #include <cmath>
 #include <cstring>
+#include <cstdio>
+#include <algorithm>
 #include <vector>
 
 namespace Steinberg::Vst {
@@ -96,6 +98,13 @@ const char* codecForEndpoint(int endpoint)
         case 6: return "EVS / simulated jitter buffer";
 #endif
 #endif
+#if !defined(TELEPHONY_DISTRIBUTION_BUILD) && TELEPHONY_EXPERIMENTAL_NETWORK
+#if TELEPHONY_USE_EVS_JBM
+        case 7: return "Opus VoIP / variable bandwidth";
+#else
+        case 6: return "Opus VoIP / variable bandwidth";
+#endif
+#endif
         default: return "Unknown endpoint";
     }
 }
@@ -121,7 +130,7 @@ void enableChildren(VSTGUI::CView* view, bool enabled, VSTGUI::CFrame* frame)
                 while (control->isEditing())
                     control->endEdit();
         }
-        view->setWantsFocus(enabled);
+        view->setWantsFocus(enabled && view->isVisible());
         view->setMouseEnabled(enabled);
     }
     if (auto* container = view->asViewContainer()) {
@@ -278,9 +287,13 @@ void TelephonyEditor::refresh()
         return;
     refreshing = true;
     auto* controller = getController();
-    const auto input = choice(controller, kParamEraMode);
-    const auto output = choice(controller, kParamOutputEndpoint);
+    const auto input = choice(controller, kParamInputRoute);
+    const auto output = choice(controller, kParamOutputRoute);
     const auto uses = [&](int endpoint) { return input == endpoint || output == endpoint; };
+    const int page = choice(controller, kParamEditorPage);
+    setGroupVisible("basic-page", page == 0);
+    for (int advancedPage = 1; advancedPage <= 4; ++advancedPage)
+        setGroupVisible(("advanced-page-" + std::to_string(advancedPage)).c_str(), page == advancedPage);
     const bool bypass = controller->getParamNormalized(kParamMasterBypass) >= 0.5;
     const bool artifacts = controller->getParamNormalized(kParamArtifactsEnabled) >= 0.5;
     const bool scVbr = controller->getParamNormalized(kParamEvsScVbr) >= 0.5;
@@ -350,6 +363,94 @@ void TelephonyEditor::refresh()
         setText("codec-note", "Only the codecs on this route are active.");
     setText("build-note", "PERSONAL BUILD / contains reference codecs");
 #endif
+    using Control = TelephonyDSP::AdvancedControl;
+    TelephonyDSP::AdvancedSettings advanced;
+    for (size_t index = 0; index < advanced.normalized.size(); ++index)
+        advanced.normalized[index] = controller->getParamNormalized(kParamAdvancedBase + (ParamID)index);
+    const bool network = advanced.enabled(Control::NetworkEnabled) && segment != 3;
+    setGroupEnabled("legacy-degradation", segment != 3 && !advanced.enabled(Control::NetworkEnabled));
+    if (network) setText("network-note", "Independent network active. Details on Network page.");
+    const bool gilbert = advanced.enabled(Control::GilbertEnabled);
+    const bool dtx = advanced.enabled(Control::DtxEnabled);
+#ifndef TELEPHONY_DISTRIBUTION_BUILD
+#if TELEPHONY_USE_EVS_JBM
+    const bool opus = TELEPHONY_EXPERIMENTAL_NETWORK && uses(7);
+    const bool jbm = uses(6);
+#else
+    const bool opus = TELEPHONY_EXPERIMENTAL_NETWORK && uses(6);
+    const bool jbm = false;
+#endif
+    const bool nativeDtx = uses(2) || uses(3) || usesEvs;
+    const bool simulatedCodec = uses(0) || uses(1) || uses(4);
+#else
+    const bool opus = false, usesEvs = false, jbm = false;
+    const bool nativeDtx = false;
+    const bool simulatedCodec = uses(0) || uses(1) || uses(2);
+#endif
+    for (size_t index = 0; index < advanced.normalized.size(); ++index) {
+        const auto control = static_cast<Control>(index);
+        bool enabled = true;
+        if ((index >= 1 && index <= 15) || index == 48 || index == 49) enabled = network;
+        if (control == Control::BitErrorRate) enabled = segment != 3;
+        if (index >= 10 && index <= 13) enabled &= gilbert;
+        if (control == Control::JitterShape) enabled &= advanced.get(Control::JitterDistribution) != 0;
+        if (control == Control::DtxEnabled) enabled = true;
+        if (control == Control::PureSilence) enabled = dtx || nativeDtx;
+        if (control == Control::PsdNoise) enabled = simulatedCodec;
+        if (control == Control::VadMode) enabled = dtx;
+#ifdef TELEPHONY_DISTRIBUTION_BUILD
+        if (control == Control::VadMode) enabled = false;
+#endif
+        if (index >= 22 && index <= 24) enabled = advanced.get(Control::DtmfDigit) >= 0;
+        if (index >= 26 && index <= 28) enabled = opus;
+        if (control == Control::OpusFecPercent) enabled &= network && advanced.enabled(Control::OpusFecEnabled);
+        if (index == 29 || index == 30) enabled = usesEvs;
+        if (control == Control::EvsAmrWbIo) enabled &= !jbm;
+        if (index == 32 || index == 33 || index == 37 || index == 41) enabled = segment != 3;
+        if (index >= 34 && index <= 36) enabled = segment != 3 && advanced.enabled(Control::EchoEnabled);
+        if (index >= 38 && index <= 40) enabled = segment != 3 && advanced.enabled(Control::FadingEnabled);
+        if (index == 42) enabled = segment != 3 && advanced.get(Control::HandoverIntervalMs) > 0;
+        if (index >= 44 && index <= 47) enabled = network;
+        if (index >= 45 && index <= 47) enabled &= advanced.enabled(Control::PacketFormat);
+        if (index == 45) {
+#ifndef TELEPHONY_DISTRIBUTION_BUILD
+            enabled &= uses(2) || uses(3);
+#else
+            enabled = false;
+#endif
+        }
+        if (index == 47) enabled &= usesEvs;
+        if (index == 50 || index == 51) enabled = opus;
+        if (index == 51) enabled &= advanced.enabled(Control::OpusFecEnabled);
+        if (index == 52) enabled = usesEvs && !jbm && advanced.enabled(Control::EvsAmrWbIo);
+        setGroupEnabled(("advanced-" + std::to_string(index)).c_str(), enabled);
+    }
+    const bool io = advanced.enabled(Control::EvsAmrWbIo);
+    if (usesEvs && io) {
+        setGroupEnabled("evs-bitrate", false);
+        if (jbm || choice(controller, kParamEvsSampleRate) == 0 || scVbr)
+            setText("speech-note", "EVS IO is unavailable with JBM, 8 kHz or SC-VBR. Select native EVS, 16+ kHz and turn Force VBR off.");
+        else setText("speech-note", "EVS AMR-WB IO uses the separate IO bitrate. The EVS native bitrate choice is inactive.");
+    } else if (opus && advanced.get(Control::OpusFrameDuration) < 2 && advanced.get(Control::OpusForceMode) > 0 && advanced.get(Control::OpusForceMode) < 3)
+        setText("speech-note", "Opus 2.5/5 ms frames require CELT. SILK/Hybrid requests are normalized; the actual encoded mode appears below.");
+    else setText("speech-note", "Codec options apply only to an active route. Opus FEC depends on the encoded speech mode and available redundancy.");
+    setGroupEnabled("advanced-OpusBandwidth", opus);
+    setGroupEnabled("advanced-OpusBitrate", opus);
+    char telemetry[320];
+    const int mode = choice(controller, kParamOpusActualMode);
+    static constexpr const char* modes[] = {"inactive", "SILK", "Hybrid", "CELT"};
+    std::snprintf(telemetry, sizeof(telemetry), "IN %.1f dBFS  OUT %.1f dBFS  LOSS %.1f%%  JITTER %.1f ms  Opus %s",
+        controller->normalizedParamToPlain(kParamInputPeak, controller->getParamNormalized(kParamInputPeak)),
+        controller->normalizedParamToPlain(kParamOutputPeak, controller->getParamNormalized(kParamOutputPeak)),
+        controller->normalizedParamToPlain(kParamMeasuredLoss, controller->getParamNormalized(kParamMeasuredLoss)),
+        controller->normalizedParamToPlain(kParamMeasuredJitter, controller->getParamNormalized(kParamMeasuredJitter)),
+        modes[std::clamp(mode, 0, 3)]);
+    if (!network)
+        std::snprintf(telemetry, sizeof(telemetry), "IN %.1f dBFS  OUT %.1f dBFS  Network meters inactive  Opus %s",
+            controller->normalizedParamToPlain(kParamInputPeak, controller->getParamNormalized(kParamInputPeak)),
+            controller->normalizedParamToPlain(kParamOutputPeak, controller->getParamNormalized(kParamOutputPeak)),
+            modes[std::clamp(mode, 0, 3)]);
+    setText("telemetry", telemetry);
     refreshing = false;
 }
 

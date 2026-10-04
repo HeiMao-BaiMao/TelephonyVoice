@@ -1,337 +1,193 @@
-#include <cstring>
 #include "dsp/OpusCodec.h"
+#include <cstring>
 #if TELEPHONY_EXPERIMENTAL_NETWORK
 #include <opus.h>
+// Pinned submodule private ABI: compile against its real definitions rather
+// than inventing OPUS_GET_MODE or hard-coding an unverified CTL number.
+#include "external/opus/src/opus_private.h"
+static_assert(OPUS_SET_FORCE_MODE_REQUEST == 11002 && MODE_SILK_ONLY == 1000 &&
+              MODE_HYBRID == 1001 && MODE_CELT_ONLY == 1002, "Review pinned Opus force-mode ABI");
 #endif
-#include <cmath>
 
 namespace TelephonyDSP {
-
-    // ---------------------------------------------------------------------------
-    // OpusCodec
-    // ---------------------------------------------------------------------------
+OpusCodec::OpusCodec(int sr, int bitrate, int quality, int maxBw)
+    : sampleRate(sr), bitrateBps(std::clamp(bitrate, 6000, 510000)),
+      frameSize(sr / 50), complexity(std::clamp(quality, 0, 10)),
+      maxBandwidth(std::clamp(maxBw, 1101, 1105)), bitstream(1276 * 3) {
+    fallbackPLC.reset(frameSize, sampleRate);
+    queue.reserve(64);
 #if TELEPHONY_EXPERIMENTAL_NETWORK
-    OpusCodec::OpusCodec(int sr, int bitrate, int complexity, int maxBw)
-        : sampleRate(sr)
-        , bitrateBps(std::clamp(bitrate, 6000, 510000))
-        , frameSize(sr / 50) // 20 ms
-        , complexity(complexity)
-        , maxBandwidth(maxBw)
-        , encoder(nullptr)
-        , decoder(nullptr)
-        , queue()
-        , nextSeq(0)
-        , playbackFrame(0)
-        , cfgPacketLossRate(0.0f)
-        , cfgNetworkDegradation(0.0f)
-        , jitterLcg(0x9E3779B9u)
-    {
-        // Opus bitstream budget: a generous worst case so 64 kbps modes still
-        // fit. 4000 bytes is well over the ~1500 byte RTP payload ceiling.
-        bitstream.resize(4000, 0);
-        fallbackPLC.reset(frameSize);
-        queue.reserve(kMaxQueueSize);
-
-        int err = 0;
-        OpusEncoder* enc = opus_encoder_create(sampleRate, 1, OPUS_APPLICATION_VOIP, &err);
-        if (err != OPUS_OK || !enc) {
-            encoder = nullptr;
-        } else {
-            opus_encoder_ctl(enc, OPUS_SET_BITRATE(bitrateBps));
-            opus_encoder_ctl(enc, OPUS_SET_COMPLEXITY(complexity));
-            // Default CTLs; configureNetwork() may override these.
-            // - FEC on so the decoder can recover from a single lost packet
-            //   via in-band FEC when the next packet arrives.
-            // - Packet loss percent starts at 0; configureNetwork() updates
-            //   it from the network parameters.
-            // - DTX is enabled via Opus's own internal VAD, which is
-            //   self-contained and well-tested, and independent of
-            //   SpeexDSPAux.
-            opus_encoder_ctl(enc, OPUS_SET_INBAND_FEC(1));
-            opus_encoder_ctl(enc, OPUS_SET_PACKET_LOSS_PERC(0));
-            opus_encoder_ctl(enc, OPUS_SET_DTX(1));
-            // Cap the audio bandwidth the encoder is allowed to use. Without
-            // this Opus defaults to FB (20 kHz) at 48 kHz input; we honor the
-            // caller's preference (typically set via setMaxBandwidth()).
-            opus_encoder_ctl(enc, OPUS_SET_MAX_BANDWIDTH(maxBandwidth));
-            encoder = enc;
-        }
-
-        OpusDecoder* dec = opus_decoder_create(sampleRate, 1, &err);
-        if (err != OPUS_OK || !dec) {
-            decoder = nullptr;
-        } else {
-            decoder = dec;
-        }
-    }
-
-    OpusCodec::~OpusCodec() {
-        if (encoder) opus_encoder_destroy(static_cast<OpusEncoder*>(encoder));
-        if (decoder) opus_decoder_destroy(static_cast<OpusDecoder*>(decoder));
-    }
-
-    void OpusCodec::reset() {
-        fallbackPLC.reset(frameSize);
-        // Flush the simulated transport state so a new "session" starts
-        // with an empty jitter buffer and aligned sequence numbers.
-        queue.clear();
-        nextSeq = 0;
-        playbackFrame = 0;
-        // Re-seed the LCG so the jitter pattern stays deterministic across
-        // reset() calls; this matters for repeatable tests.
-        jitterLcg = 0x9E3779B9u;
-        // The decoder has no OPUS_RESET_STATE; recreate it. The encoder has
-        // OPUS_RESET_STATE so we keep it and only flush its state.
-        if (encoder) {
-            opus_encoder_ctl(static_cast<OpusEncoder*>(encoder), OPUS_RESET_STATE);
-        }
-        if (decoder) {
-            opus_decoder_destroy(static_cast<OpusDecoder*>(decoder));
-            int err = 0;
-            decoder = opus_decoder_create(sampleRate, 1, &err);
-        }
-    }
-
-    int OpusCodec::basePlaybackDelay() const {
-        // 2 frames (40 ms) minimum, plus 0..4 frames extra driven by
-        // networkDegradation. Clamp so a heavily degraded path doesn't
-        // grow the buffer past the queue cap.
-        const int extra = (int)std::clamp(cfgNetworkDegradation * 4.0f, 0.0f, 4.0f);
-        return 2 + extra;
-    }
-
-    int OpusCodec::derivedPacketLossPercent() const {
-        // PACKET_LOSS_PERC takes an int in [0, 100]. Combine the user-supplied
-        // loss rate with a degradation-dependent boost so higher degradation
-        // also implies higher expected loss on the encoder side, mirroring
-        // what ChannelProcessor::shouldDropPacket() does on the caller side.
-        const float d = std::clamp(cfgNetworkDegradation, 0.0f, 1.0f);
-        const float combined = std::clamp(cfgPacketLossRate + d * d * 0.08f, 0.0f, 0.95f);
-        return (int)std::round(combined * 100.0f);
-    }
-
-    void OpusCodec::applyNetworkCtls() {
-        if (!encoder) return;
-        OpusEncoder* enc = static_cast<OpusEncoder*>(encoder);
-        opus_encoder_ctl(enc, OPUS_SET_INBAND_FEC(1));
-        opus_encoder_ctl(enc, OPUS_SET_PACKET_LOSS_PERC(derivedPacketLossPercent()));
-        // Re-apply the user's chosen max bandwidth in case it changed
-        // (e.g. live setMaxBandwidth() call) and to keep this in lockstep
-        // with the other network-driven CTLs.
-        opus_encoder_ctl(enc, OPUS_SET_MAX_BANDWIDTH(maxBandwidth));
-        // Re-apply the cached target bitrate so a later setBitrate() call is
-        // honored even if applyNetworkCtls() runs for an unrelated reason
-        // (e.g. after configureNetwork() or recreateCodec()).
-        opus_encoder_ctl(enc, OPUS_SET_BITRATE(bitrateBps));
-        // DTX stays off; see OpusCodec ctor comment.
-    }
-
-    void OpusCodec::setBitrate(int bps) {
-        // Keep the supported telephony range at 6000..510000 bps. Clamp so an
-        // out-of-range caller value (e.g. from automation or a typo in
-        // the host UI) cannot trigger an OPUS_BAD_ARG error from
-        // OPUS_SET_BITRATE.
-        const int clamped = std::clamp(bps, 6000, 510000);
-        bitrateBps = clamped;
-        if (encoder) {
-            opus_encoder_ctl(static_cast<OpusEncoder*>(encoder),
-                             OPUS_SET_BITRATE(bitrateBps));
-        }
-    }
-
-    void OpusCodec::setMaxBandwidth(int bw) {
-        // Cache the new value first so a subsequent encoder creation
-        // (e.g. reset() path) picks it up. If the encoder already exists
-        // we push the change immediately.
-        maxBandwidth = bw;
-        if (encoder) {
-            opus_encoder_ctl(static_cast<OpusEncoder*>(encoder),
-                             OPUS_SET_MAX_BANDWIDTH(maxBandwidth));
-        }
-    }
-
-    int OpusCodec::arrivalFrameFor(uint32_t seq) {
-        // Linear congruential generator step (Numerical Recipes constants).
-        jitterLcg = jitterLcg * 1664525u + 1013904223u;
-        // Map the upper bits of the LCG state to a non-negative jitter
-        // offset in frames. degradation scales the magnitude: a clean
-        // network (degradation 0) has zero jitter so every packet arrives
-        // exactly basePlaybackDelay frames after it was sent, and a heavily
-        // degraded one can drift several frames past its playback slot
-        // (concealed by FEC/PLC below).
-        const float d = std::clamp(cfgNetworkDegradation, 0.0f, 1.0f);
-        const float maxJitter = d * 4.0f; // up to ~4 frames
-        const uint32_t r = (jitterLcg >> 8) & 0xFFFFu;
-        const float u = (float)r / 65535.0f;     // [0,1]
-        const int offset = (int)std::round(u * maxJitter);
-        // arrivalFrame is a non-negative playback-frame index. Each encoded
-        // packet is associated with the playback frame at which it should
-        // become available.
-        const int baseDelay = basePlaybackDelay();
-        return baseDelay + offset;
-    }
-
-    void OpusCodec::trimQueue() {
-        // Drop the oldest packets if we're at or above the cap. We compare
-        // against the highest sequence we've seen so a wraparound can't
-        // make stale packets look fresh.
-        if (queue.size() >= (size_t)kMaxQueueSize) {
-            // Sort by seq ascending then drop the head until under cap.
-            // Insertion order is already ascending (we only append), so the
-            // oldest packets live at the front.
-            size_t excess = queue.size() - (size_t)kMaxQueueSize + 1;
-            queue.erase(queue.begin(), queue.begin() + (std::ptrdiff_t)excess);
-        }
-    }
-
-    void OpusCodec::configureNetwork(float packetLossRate, float networkDegradation) {
-        cfgPacketLossRate = std::clamp(packetLossRate, 0.0f, 0.95f);
-        cfgNetworkDegradation = std::clamp(networkDegradation, 0.0f, 1.0f);
-        applyNetworkCtls();
-    }
-
-    void OpusCodec::processFrame(const int16_t* in, int16_t* out, bool packetLost) {
-        const int fs = frameSize;
-        OpusEncoder* enc = static_cast<OpusEncoder*>(encoder);
-        OpusDecoder* dec = static_cast<OpusDecoder*>(decoder);
-
-        // -----------------------------------------------------------------
-        // Stage 1: encode / drop on the send side of the simulated network.
-        // -----------------------------------------------------------------
-        // The caller already folds ChannelProcessor::shouldDropPacket() into
-        // `packetLost`, so we honor it here: if the caller says this frame's
-        // packet should not enter the transport, we skip encoding and the
-        // packet will simply never arrive at the receiver.
-        if (packetLost) {
-            // Reserve the sequence number anyway so the receiver-side target
-            // advances in lockstep with the encoder, which keeps the
-            // simulated jitter-buffer math deterministic.
-            (void)nextSeq++;
-        } else if (enc) {
-            int nbBytes = opus_encode(enc, in, fs, bitstream.data(), (opus_int32)bitstream.size());
-            if (nbBytes > 0) {
-                VoipPacket p;
-                p.seq = nextSeq++;
-                // arrivalFrame = send frame (== seq for this steady 1-in
-                // 1-out transport) + base transport delay + LCG jitter.
-                p.arrivalFrame = (int)p.seq + arrivalFrameFor(p.seq);
-                p.data.assign(bitstream.begin(), bitstream.begin() + nbBytes);
-                queue.push_back(std::move(p));
-                trimQueue();
-            } else {
-                // Encode failure - reserve the seq number so timing stays in
-                // sync but don't put anything in the queue.
-                (void)nextSeq++;
-            }
-        } else {
-            // No encoder available; advance the seq counter so the receiver
-            // side keeps moving even in degenerate paths.
-            (void)nextSeq++;
-        }
-
-        // -----------------------------------------------------------------
-        // Stage 2: receive / decode on the playback side of the simulated
-        // network. We always emit exactly one output frame so the
-        // surrounding ChannelProcessor / ring-buffer contract stays the
-        // same; missing packets are concealed by Opus's PLC / FEC / our
-        // fallback concealer in that order.
-        // -----------------------------------------------------------------
-        const int targetFrame = playbackFrame;
-        bool decoded = false;
-
-        if (dec) {
-            // The playback slot for this frame: with a steady 1-in/1-out
-            // transport the packet played at frame T is the one sent
-            // basePlaybackDelay() frames earlier. During the initial
-            // warm-up (T < baseDelay) no packet is due yet and the PLC
-            // below emits decoder silence.
-            const int64_t seqToPlay = (int64_t)targetFrame - basePlaybackDelay();
-
-            // Drop packets for slots that have already been played; they
-            // arrived too late to be useful (their slot was concealed).
-            size_t w = 0;
-            for (size_t i = 0; i < queue.size(); ++i) {
-                if ((int64_t)queue[i].seq >= seqToPlay) {
-                    if (w != i) queue[w] = std::move(queue[i]);
-                    ++w;
-                }
-            }
-            queue.resize(w);
-
-            if (seqToPlay >= 0) {
-                // Exact packet for this slot, if it has arrived by now.
-                size_t idx = queue.size();
-                size_t next = queue.size();
-                for (size_t i = 0; i < queue.size(); ++i) {
-                    if ((int64_t)queue[i].seq == seqToPlay) idx = i;
-                    else if ((int64_t)queue[i].seq == seqToPlay + 1) next = i;
-                }
-
-                if (idx < queue.size() && queue[idx].arrivalFrame <= targetFrame) {
-                    int n = opus_decode(dec, queue[idx].data.data(),
-                                        (opus_int32)queue[idx].data.size(),
-                                        out, fs, 0);
-                    if (n == fs) {
-                        decoded = true;
-                    }
-                    queue.erase(queue.begin() + (std::ptrdiff_t)idx);
-                } else if (next < queue.size() && queue[next].arrivalFrame <= targetFrame) {
-                    // This slot's packet is missing or late, but the packet
-                    // for the NEXT slot has already arrived: recover this
-                    // frame from its in-band FEC (LBRR) data. The packet
-                    // stays queued so the next slot still decodes it
-                    // normally - that is the standard Opus FEC sequence.
-                    int n = opus_decode(dec, queue[next].data.data(),
-                                        (opus_int32)queue[next].data.size(),
-                                        out, fs, 1);
-                    if (n == fs) {
-                        decoded = true;
-                    }
-                }
-            }
-
-            if (!decoded) {
-                // Pure PLC: Opus's built-in concealment for missing frames.
-                int n = opus_decode(dec, nullptr, 0, out, fs, 0);
-                if (n == fs) {
-                    decoded = true;
-                }
-            }
-        }
-
-        if (!decoded) {
-            if (packetLost && !enc && !dec) {
-                // Encoder and decoder missing - pass-through path.
-                std::memcpy(out, in, fs * sizeof(int16_t));
-            } else {
-                // Last-resort concealer.
-                fallbackPLC.conceal(out, fs);
-            }
-        } else {
-            // Good output - feed the concealer so it has recent history
-            // if subsequent frames are lost.
-            fallbackPLC.storeGoodFrame(out, fs);
-        }
-
-        // Advance playback bookkeeping.
-        ++playbackFrame;
-    }
-#else
-    // Stub implementations keep TelephonyDSP compilable when the experimental
-    // libraries are disabled (e.g. distribution build). OpusCodec instances
-    // should never be created in that path; this is a defensive no-op.
-    OpusCodec::OpusCodec(int, int, int, int maxBw) : sampleRate(0), bitrateBps(0), frameSize(0), complexity(0), maxBandwidth(maxBw), encoder(nullptr), decoder(nullptr) {
-        fallbackPLC.reset(0);
-    }
-    OpusCodec::~OpusCodec() {}
-    void OpusCodec::reset() { fallbackPLC.reset(frameSize); }
-    void OpusCodec::configureNetwork(float, float) {}
-    void OpusCodec::setMaxBandwidth(int bw) { maxBandwidth = bw; }
-    void OpusCodec::setBitrate(int bps) { bitrateBps = std::clamp(bps, 6000, 510000); }
-    void OpusCodec::processFrame(const int16_t* in, int16_t* out, bool) {
-        const int fs = frameSize;
-        std::memcpy(out, in, fs * sizeof(int16_t));
-    }
+    int error = 0;
+    encoder = opus_encoder_create(sampleRate, 1, OPUS_APPLICATION_VOIP, &error);
+    if (error != OPUS_OK) encoder = nullptr;
+    decoder = opus_decoder_create(sampleRate, 1, &error);
+    if (error != OPUS_OK) decoder = nullptr;
+    if (encoder) opus_encoder_ctl((OpusEncoder*)encoder, OPUS_SET_COMPLEXITY(complexity));
+    applyNetworkCtls();
 #endif
-
+}
+OpusCodec::~OpusCodec() {
+#if TELEPHONY_EXPERIMENTAL_NETWORK
+    if (encoder) opus_encoder_destroy((OpusEncoder*)encoder);
+    if (decoder) opus_decoder_destroy((OpusDecoder*)decoder);
+#endif
+}
+void OpusCodec::reset() {
+    fallbackPLC.reset(frameSize, sampleRate); resetImpairments();
+    queue.clear(); nextSeq = 0; playbackFrame = 0; jitterLcg = 0x9E3779B9u;
+    actualMode = OpusMode::Unknown; fecAttempts = fecRecoveredFrames = 0;
+    internalTransportWarming = basePlaybackDelay() > 0;
+#if TELEPHONY_EXPERIMENTAL_NETWORK
+    if (encoder) opus_encoder_ctl((OpusEncoder*)encoder, OPUS_RESET_STATE);
+    if (decoder) opus_decoder_ctl((OpusDecoder*)decoder, OPUS_RESET_STATE);
+    applyNetworkCtls();
+#endif
+}
+int OpusCodec::basePlaybackDelay() const {
+    return playbackDelayFrames >= 0 ? playbackDelayFrames : 2 + (int)(cfgNetworkDegradation * 4);
+}
+int OpusCodec::derivedPacketLossPercent() const {
+    return fecPacketLossPercent >= 0 ? fecPacketLossPercent : (int)std::round(100 *
+        std::clamp(cfgPacketLossRate + cfgNetworkDegradation * cfgNetworkDegradation * .08f, 0.0f, .95f));
+}
+void OpusCodec::applyNetworkCtls() {
+#if TELEPHONY_EXPERIMENTAL_NETWORK
+    if (!encoder) return;
+    auto* enc = (OpusEncoder*)encoder;
+    opus_encoder_ctl(enc, OPUS_SET_INBAND_FEC(fecEnabled ? 1 : 0));
+    opus_encoder_ctl(enc, OPUS_SET_PACKET_LOSS_PERC(derivedPacketLossPercent()));
+    opus_encoder_ctl(enc, OPUS_SET_MAX_BANDWIDTH(maxBandwidth));
+    opus_encoder_ctl(enc, OPUS_SET_BITRATE(bitrateBps));
+    opus_encoder_ctl(enc, OPUS_SET_DTX(dtxEnabled ? 1 : 0));
+    const int mode = forcedMode == OpusMode::Silk ? MODE_SILK_ONLY : forcedMode == OpusMode::Hybrid ? MODE_HYBRID :
+                     forcedMode == OpusMode::Celt ? MODE_CELT_ONLY : OPUS_AUTO;
+    opus_encoder_ctl(enc, OPUS_SET_FORCE_MODE(mode));
+    const int bandwidth = forcedMode == OpusMode::Silk ? std::min(maxBandwidth, OPUS_BANDWIDTH_WIDEBAND) :
+                          forcedMode == OpusMode::Hybrid ? maxBandwidth : OPUS_AUTO;
+    opus_encoder_ctl(enc, OPUS_SET_BANDWIDTH(bandwidth));
+#endif
+}
+void OpusCodec::configureNetwork(float loss, float degradation) {
+    cfgPacketLossRate = std::clamp(loss, 0.0f, .95f);
+    cfgNetworkDegradation = std::clamp(degradation, 0.0f, 1.0f); applyNetworkCtls();
+}
+void OpusCodec::configureDtx(bool enabled, bool pureSilence) {
+    ICodec::configureDtx(enabled, pureSilence); applyNetworkCtls();
+}
+void OpusCodec::setBitrate(int bps) { bitrateBps = std::clamp(bps, 6000, 510000); applyNetworkCtls(); }
+void OpusCodec::setMaxBandwidth(int bw) { maxBandwidth = std::clamp(bw, 1101, 1105); applyNetworkCtls(); }
+bool OpusCodec::supportsForceMode() {
+#if TELEPHONY_EXPERIMENTAL_NETWORK
+    return true;
+#else
+    return false;
+#endif
+}
+bool OpusCodec::setForceMode(OpusMode mode) {
+#if TELEPHONY_EXPERIMENTAL_NETWORK
+    if (mode != OpusMode::Auto && mode != OpusMode::Silk && mode != OpusMode::Hybrid && mode != OpusMode::Celt) return false;
+    if ((mode == OpusMode::Silk || mode == OpusMode::Hybrid) && frameDurationMs < 10) return false;
+    if (mode == OpusMode::Hybrid && (sampleRate < 24000 || maxBandwidth < kOpusBandwidthSuperwideband || bitrateBps < 16000)) return false;
+    if (!encoder) return false;
+    const int value = mode == OpusMode::Silk ? MODE_SILK_ONLY : mode == OpusMode::Hybrid ? MODE_HYBRID :
+                      mode == OpusMode::Celt ? MODE_CELT_ONLY : OPUS_AUTO;
+    if (opus_encoder_ctl((OpusEncoder*)encoder, OPUS_SET_FORCE_MODE(value)) != OPUS_OK) return false;
+    forcedMode = mode; applyNetworkCtls(); return true;
+#else
+    return mode == OpusMode::Auto;
+#endif
+}
+void OpusCodec::setFecEnabled(bool enabled) { fecEnabled = enabled; applyNetworkCtls(); }
+void OpusCodec::setFecPacketLossPercent(int percent) {
+    fecPacketLossPercent = std::clamp(percent, -1, 100); applyNetworkCtls();
+}
+void OpusCodec::setPlaybackDelayFrames(int frames) { playbackDelayFrames = std::clamp(frames, -1, 48); }
+bool OpusCodec::setExpertFrameDuration(float ms) {
+    static const float durations[] = {2.5f, 5, 10, 20, 40, 60};
+    int index = -1;
+    for (int i = 0; i < 6; ++i) if (ms == durations[i]) index = i;
+    if (index < 0 || (ms < 10 && (forcedMode == OpusMode::Silk || forcedMode == OpusMode::Hybrid))) return false;
+#if TELEPHONY_EXPERIMENTAL_NETWORK
+    if (!encoder || opus_encoder_ctl((OpusEncoder*)encoder,
+            OPUS_SET_EXPERT_FRAME_DURATION(OPUS_FRAMESIZE_2_5_MS + index)) != OPUS_OK) return false;
+#else
+    return false;
+#endif
+    if (frameDurationMs != ms) {
+        frameDurationMs = ms; frameSize = (int)std::lround(sampleRate * ms / 1000.0);
+        queue.clear(); nextSeq = 0; playbackFrame = 0; fallbackPLC.reset(frameSize, sampleRate);
+    }
+    return true;
+}
+void OpusCodec::corruptOpusPacket(int bytes) {
+#if TELEPHONY_EXPERIMENTAL_NETWORK
+    const unsigned char* frames[48]; opus_int16 sizes[48]; unsigned char toc; int offset = 0;
+    const int count = opus_packet_parse(bitstream.data(), bytes, &toc, frames, sizes, &offset);
+    // Parsing gives each coded frame, preserving the ToC, lacing and padding.
+    if (count > 0) for (int i = 0; i < count; ++i)
+        corruptPacked(bitstream.data() + (frames[i] - bitstream.data()), (size_t)sizes[i]);
+#else
+    (void)bytes;
+#endif
+}
+bool OpusCodec::internalExchange(int bytes, bool lost, bool dtx) {
+    playout.payload.clear(); playout.nextPayload.clear(); playout.dtx = false;
+    const uint32_t seq = nextSeq++;
+    jitterLcg = jitterLcg * 1664525u + 1013904223u;
+    if (!lost && bytes > 0) {
+        const int jitter = (int)std::round(((jitterLcg >> 8) & 0xffffu) / 65535.0f * cfgNetworkDegradation * 4);
+        // Network arrival is separate from playout delay. The extra buffered
+        // packet is what makes next-packet FEC actually reachable.
+        queue.push_back({seq, (int)seq + jitter, dtx,
+                         std::vector<unsigned char>(bitstream.begin(), bitstream.begin() + bytes)});
+    }
+    const int64_t wanted = (int64_t)playbackFrame - basePlaybackDelay();
+    internalTransportWarming = wanted < 0;
+    queue.erase(std::remove_if(queue.begin(), queue.end(), [wanted](const VoipPacket& p) {
+        return (int64_t)p.seq < wanted;
+    }), queue.end());
+    bool found = false;
+    for (auto& p : queue) if (wanted >= 0 && p.arrivalFrame <= playbackFrame) {
+        if ((int64_t)p.seq == wanted) { playout.payload = p.data; playout.dtx = p.dtx; found = true; }
+        if ((int64_t)p.seq == wanted + 1) playout.nextPayload = p.data;
+    }
+    if (queue.size() > 64) queue.erase(queue.begin(), queue.begin() + (queue.size() - 64));
+    ++playbackFrame;
+    return found;
+}
+void OpusCodec::processFrame(const int16_t* in, int16_t* out, bool packetLost) {
+#if TELEPHONY_EXPERIMENTAL_NETWORK
+    auto* enc = (OpusEncoder*)encoder; auto* dec = (OpusDecoder*)decoder;
+    // Always encode a lost frame: Opus LBRR in the NEXT packet depends on it.
+    const int bytes = enc ? opus_encode(enc, in, frameSize, bitstream.data(), (opus_int32)bitstream.size()) : 0;
+    int inDtx = 0;
+    if (enc) opus_encoder_ctl(enc, OPUS_GET_IN_DTX(&inDtx));
+    if (bytes > 0) {
+        const auto toc = bitstream[0];
+        actualMode = (toc & 0x80) ? OpusMode::Celt : (toc & 0x60) == 0x60 ? OpusMode::Hybrid : OpusMode::Silk;
+        corruptOpusPacket(bytes);
+    }
+    if (packetTransport) internalTransportWarming = false;
+    const bool available = packetTransport ? exchangePacket(CodecPacketFormat::Opus, bitstream.data(),
+        bytes > 0 ? (size_t)bytes : 0, packetLost || bytes <= 0, inDtx != 0) :
+        internalExchange(bytes, packetLost || bytes <= 0, inDtx != 0);
+    int decoded = -1;
+    if (dec && available && !fecOnly)
+        decoded = opus_decode(dec, playout.payload.data(), (opus_int32)playout.payload.size(), out, frameSize, 0);
+    if (dec && (decoded != frameSize) && fecRecoveryEnabled && !playout.nextPayload.empty()) {
+        ++fecAttempts;
+        const bool hasLbrr = opus_packet_has_lbrr(playout.nextPayload.data(), (opus_int32)playout.nextPayload.size()) > 0;
+        decoded = opus_decode(dec, playout.nextPayload.data(), (opus_int32)playout.nextPayload.size(), out, frameSize, 1);
+        if (decoded == frameSize && hasLbrr) ++fecRecoveredFrames;
+    }
+    if (dec && decoded != frameSize) decoded = opus_decode(dec, nullptr, 0, out, frameSize, 0);
+    if (decoded != frameSize) fallbackPLC.conceal(out, frameSize);
+    applyDtxOutput(out, available ? playout.dtx : lastDtx);
+    if (available && decoded == frameSize) fallbackPLC.storeGoodFrame(out, frameSize);
+#else
+    std::memcpy(out, in, (size_t)frameSize * sizeof(int16_t));
+    applyDtxOutput(out, dtxEnabled && hasVoiceActivity && !voiceActive);
+    (void)packetLost;
+#endif
+}
 } // namespace TelephonyDSP

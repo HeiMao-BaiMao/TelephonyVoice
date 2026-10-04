@@ -98,6 +98,10 @@ typedef struct EVS_EncOptions {
     //   the selected native bitrate and limiting bandwidth to NB/WB.
     //   SC-VBR requires dtx_enable != 0. Internally the codec uses 7200 bps.
     int  sc_vbr_enable;
+
+    // 1 selects genuine AMR-WB interoperable encoding (6600..23850 bps).
+    // SC-VBR and RF are unavailable in this mode; bandwidth is WB.
+    int amr_wb_io;
 } EVS_EncOptions;
 
 // Convenience initializer. Equivalent to a zero-initialised struct, but
@@ -110,6 +114,7 @@ static inline void evs_enc_options_init(EVS_EncOptions* opts) {
     opts->rf_fec_offset    = 0;
     opts->rf_fec_hi        = 1;
     opts->sc_vbr_enable    = 0;
+    opts->amr_wb_io        = 0;
 }
 
 // Validate and normalize an encoder request without initializing the codec.
@@ -136,14 +141,24 @@ static inline int evs_enc_normalize_config(int sample_rate_hz, int* bitrate_bps,
         default: return EVS_ERROR;
     }
     if (bw < EVS_NB || bw > EVS_FB) return EVS_ERROR;
-    switch (bitrate) {
+    evs_enc_options_init(&local);
+    if (opts) local = *opts;
+    local.amr_wb_io = local.amr_wb_io != 0;
+    if (local.amr_wb_io) {
+        switch (bitrate) {
+            case 6600: case 8850: case 12650: case 14250: case 15850:
+            case 18250: case 19850: case 23050: case 23850: break;
+            default: return EVS_ERROR;
+        }
+        if (sample_rate_hz < 16000 || local.sc_vbr_enable) return EVS_ERROR;
+        bw = EVS_WB;
+        local.rf_enable = 0;
+    } else switch (bitrate) {
         case 5900: case 7200: case 8000: case 9600: case 13200:
         case 16400: case 24400: case 32000: case 48000: case 64000:
         case 96000: case 128000: break;
         default: return EVS_ERROR;
     }
-    evs_enc_options_init(&local);
-    if (opts) local = *opts;
     local.dtx_enable = local.dtx_enable != 0;
     local.sc_vbr_enable = local.sc_vbr_enable != 0 || bitrate == 5900;
     local.rf_enable = local.rf_enable != 0;
@@ -194,6 +209,16 @@ EVS_Encoder* evs_enc_create_ex(int sample_rate_hz, int bitrate_bps, EVS_Bandwidt
 EVS_Encoder* evs_enc_create(int sample_rate_hz, int bitrate_bps, EVS_Bandwidth max_bw);
 void         evs_enc_destroy(EVS_Encoder* enc);
 
+// Runtime changes mirror the reference bitrate/bandwidth profile input.
+// Preserve predictor/filter/DTX history. Validation failure leaves state unchanged.
+// Sample rate is fixed at construction; switching native/IO is supported.
+int evs_enc_reconfigure(EVS_Encoder* enc, int bitrate_bps, EVS_Bandwidth max_bw,
+                        const EVS_EncOptions* opts);
+// Metadata captured from the just-encoded frame before clearing its indices.
+// SID update follows reference MIME writer (STI=1); mode is AMR-WB 0..8.
+int evs_enc_get_last_frame_info(const EVS_Encoder* enc, int* num_bits,
+                                int* amr_wb_sid_update, int* amr_wb_sid_mode);
+
 // ---------------------------------------------------------------------------
 // Encode one 20 ms frame.
 // pcm_in         : 16-bit linear PCM, exactly sample_rate_hz/50 samples
@@ -239,6 +264,7 @@ void evs_enc_set_rf(EVS_Encoder* enc, int rf_on, int rf_fec_offset, int rf_fec_i
 // bitrate_bps    : bitrate that the encoder was configured with
 // ---------------------------------------------------------------------------
 EVS_Decoder* evs_dec_create(int sample_rate_hz, int bitrate_bps);
+EVS_Decoder* evs_dec_create_ex(int sample_rate_hz, int bitrate_bps, int amr_wb_io);
 void         evs_dec_destroy(EVS_Decoder* dec);
 
 // ---------------------------------------------------------------------------
@@ -249,7 +275,8 @@ void         evs_dec_destroy(EVS_Decoder* dec);
 // n_samples      : on return, number of samples produced (sample_rate_hz/50)
 //
 // Returns EVS_OK or EVS_ERROR.
-// Only native EVS payloads are supported; AMR-WB IO packets are rejected.
+// Native EVS and genuine AMR-WB IO G.192 payloads are supported.
+// Speech/SID packet length selects its family; no-data retains the last mode.
 // ---------------------------------------------------------------------------
 int evs_dec_process(EVS_Decoder* dec,
                     const unsigned char* bitstream_in, int bitstream_len,

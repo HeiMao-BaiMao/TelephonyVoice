@@ -191,11 +191,15 @@ static void routeTransitionsAndQuietAudio() {
         automated.setEVSConfig(32000, 16400, EVS_SWB);
         SignalProcessor newConfig;
         newConfig.setSampleRate(48000); newConfig.setMode(mode); newConfig.setEVSConfig(32000, 16400, EVS_SWB);
-        check(matches(render(automated, input, 512), render(newConfig, input, 512)), "EVS configuration changes re-prime a consistent compensated timeline");
+        const auto switched=render(automated,input,512);
+        check(std::any_of(switched.begin(),switched.begin()+512,[](float value){return std::abs(value)>1e-5f;}), "EVS bitrate changes preserve the streaming timeline without startup silence");
+        automated.reset();
+        check(matches(render(automated,input,512),render(newConfig,input,512)), "EVS reset uses the selected runtime configuration");
         continuous.setEVSConfig(8000, 13200, EVS_NB);
         continuous.setEVSConfig(8000, 32000, EVS_NB);
         newConfig.setEVSConfig(8000, 32000, EVS_NB);
-        check(matches(render(continuous, input, 512), render(newConfig, input, 512)), "unsupported NB/high-rate choice normalizes independently of prior state");
+        continuous.reset(); newConfig.reset();
+        check(matches(render(continuous, input, 512), render(newConfig, input, 512)), "unsupported NB/high-rate choice normalizes independently of prior state after explicit reset");
     }
 #endif
 }

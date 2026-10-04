@@ -1,90 +1,50 @@
-#define NOMINMAX
 #include "dsp/WaveformConcealer.h"
-#include "dsp/Types.h"
-#include <cstring>
-#include <cmath>
 #include <algorithm>
+#include <cmath>
 
 namespace TelephonyDSP {
-
-    void WaveformConcealer::reset(int frameSize) {
-        history.assign((std::max)(frameSize * 4, frameSize), 0);
-        attenuation = 1.0f;
-        lastPitch = (std::max)(20, frameSize / 2);
+void WaveformConcealer::reset(int frameSize) {
+    // Existing codec callers supply 20 ms frame sizes. The spectral estimator
+    // remains streaming and does not depend on later call partition sizes.
+    reset(frameSize, static_cast<int>(std::clamp(static_cast<double>(frameSize) * 50.0, 8000.0, 384000.0)));
+}
+void WaveformConcealer::reset(int frameSize, int sampleRate) {
+    const double rate = std::clamp(static_cast<double>(sampleRate), 8000.0, 384000.0);
+    comfortNoise.configure(rate);
+    lastGoodFrame.assign(static_cast<std::size_t>(std::max(0, frameSize)), 0);
+    repeatPosition = 0;
+    attenuation = 1.0;
+    sampleDecay = std::pow(0.82, 1.0 / (rate * 0.02));
+    haveGoodFrame = false;
+}
+void WaveformConcealer::storeGoodFrame(const int16_t* frame, int frameSize) {
+    if (!frame || frameSize <= 0) return;
+    const auto count = static_cast<std::size_t>(frameSize);
+    comfortNoise.observePCM16(frame, count);
+    lastGoodFrame.resize(count);
+    std::copy_n(frame, count, lastGoodFrame.begin());
+    repeatPosition = 0;
+    attenuation = 1.0;
+    haveGoodFrame = true;
+}
+void WaveformConcealer::conceal(int16_t* out, int frameSize) {
+    if (!out || frameSize <= 0) return;
+    const auto count = static_cast<std::size_t>(frameSize);
+    if (spectralNoise) {
+        comfortNoise.generatePCM16(out, count);
+        return;
     }
-
-    void WaveformConcealer::storeGoodFrame(const int16_t* frame, int frameSize) {
-        if (frameSize <= 0) return;
-        if (history.size() < (size_t)(frameSize * 4)) {
-            reset(frameSize);
-        }
-
-        std::memmove(history.data(), history.data() + frameSize,
-                     (history.size() - frameSize) * sizeof(int16_t));
-        std::memcpy(history.data() + history.size() - frameSize, frame, frameSize * sizeof(int16_t));
-        attenuation = 1.0f;
-        lastPitch = estimatePitch(frameSize);
+    if (!haveGoodFrame || lastGoodFrame.empty()) {
+        std::fill_n(out, count, int16_t(0));
+        return;
     }
-
-    int WaveformConcealer::estimatePitch(int frameSize) const {
-        if (frameSize <= 0 || history.size() < (size_t)(frameSize * 2)) {
-            return (std::max)(20, frameSize / 2);
-        }
-
-        const int histSize = (int)history.size();
-        const int current = histSize - frameSize;
-        const int minLag = (std::max)(20, frameSize / 8);
-        const int maxLag = (std::min)(frameSize * 2, current - 1);
-        if (maxLag <= minLag) return (std::max)(20, frameSize / 2);
-
-        float bestScore = -1.0f;
-        int bestLag = lastPitch;
-        for (int lag = minLag; lag <= maxLag; ++lag) {
-            const int ref = current - lag;
-            if (ref < 0) break;
-
-            double corr = 0.0;
-            double e1 = 1.0;
-            double e2 = 1.0;
-            for (int i = 0; i < frameSize; ++i) {
-                const double a = history[current + i];
-                const double b = history[ref + i];
-                corr += a * b;
-                e1 += a * a;
-                e2 += b * b;
-            }
-            const float score = (float)(corr / std::sqrt(e1 * e2));
-            if (score > bestScore) {
-                bestScore = score;
-                bestLag = lag;
-            }
-        }
-
-        return bestScore > 0.15f ? bestLag : (std::max)(20, frameSize / 2);
+    for (std::size_t i = 0; i < count; ++i) {
+        out[i] = static_cast<int16_t>(lastGoodFrame[repeatPosition] * attenuation);
+        if (++repeatPosition == lastGoodFrame.size()) repeatPosition = 0;
+        attenuation *= sampleDecay;
+        // Once even full-scale PCM would round to silence, stop the decay
+        // before extremely long loss bursts can enter the denormal range.
+        if (attenuation < 0.5 / 32768.0) attenuation = 0.0;
     }
-
-    void WaveformConcealer::conceal(int16_t* out, int frameSize) {
-        if (frameSize <= 0) return;
-        if (history.size() < (size_t)(frameSize * 2)) {
-            reset(frameSize);
-        }
-
-        const int histSize = (int)history.size();
-        const int pitch = std::clamp(lastPitch, 1, histSize);
-        const int start = histSize - pitch;
-        std::vector<int16_t> concealed(frameSize);
-
-        for (int i = 0; i < frameSize; ++i) {
-            const float intraFrameFade = 1.0f - 0.15f * ((float)i / (float)(std::max)(1, frameSize - 1));
-            const int idx = start + (i % pitch);
-            concealed[i] = clampToInt16((float)history[idx] * attenuation * intraFrameFade);
-        }
-
-        std::memcpy(out, concealed.data(), frameSize * sizeof(int16_t));
-        std::memmove(history.data(), history.data() + frameSize,
-                     (history.size() - frameSize) * sizeof(int16_t));
-        std::memcpy(history.data() + history.size() - frameSize, concealed.data(), frameSize * sizeof(int16_t));
-        attenuation = (std::max)(0.05f, attenuation * 0.82f);
-    }
-
+}
 } // namespace TelephonyDSP

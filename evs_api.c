@@ -16,6 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
+#include <math.h>
 
 // 3GPP EVS reference headers (float variant)
 #include "options.h"
@@ -31,6 +32,8 @@ struct EVS_Encoder {
     int            rf_on;      // requested RF state, reapplied after SID frames
     int            rf_offset;
     int            rf_hi;
+    EVS_EncOptions options;
+    int last_num_bits, last_sid_update, last_sid_mode;
 };
 
 struct EVS_Decoder {
@@ -48,6 +51,8 @@ struct EVS_Decoder {
 static int is_valid_g192_rate(long rate) {
     switch (rate) {
         // EVS primary modes
+        case 1750: case 6600: case 8850: case 12650: case 14250:
+        case 15850: case 18250: case 19850: case 23050: case 23850:
         case 0:      case 2400:  case 2800:  case 7200:  case 8000:
         case 9600:   case 13200: case 16400: case 24400: case 32000:
         case 48000:  case 64000: case 96000: case 128000:
@@ -119,7 +124,9 @@ EVS_Encoder* evs_enc_create_ex(int sample_rate_hz, int bitrate_bps, EVS_Bandwidt
     enc->bitrate_bps         = bitrate_bps;
     enc->st->total_brate     = local.sc_vbr_enable ? ACELP_7k20 : bitrate_bps;
     enc->st->max_bwidth      = (short)bandwidth_to_enum(max_bw);
-    enc->st->Opt_AMR_WB      = 0;          // 0 = native EVS (not AMR-WB IO)
+    enc->st->Opt_AMR_WB      = local.amr_wb_io;
+    enc->options             = local;
+    enc->last_sid_mode       = -1;
     enc->st->bitstreamformat = G192;
     enc->st->ind_list        = enc->ind_buf;
 
@@ -227,6 +234,48 @@ void evs_enc_set_rf(EVS_Encoder* enc, int rf_on, int rf_fec_offset, int rf_fec_i
     }
 }
 
+static int amr_wb_mode_from_rate(long bitrate) {
+    static const int rates[] = {6600,8850,12650,14250,15850,18250,19850,23050,23850};
+    for (int i = 0; i < 9; ++i) if (bitrate == rates[i]) return i;
+    return -1;
+}
+
+int evs_enc_get_last_frame_info(const EVS_Encoder* enc, int* bits, int* update, int* mode) {
+    if (!enc) return EVS_ERROR;
+    if (bits) *bits = enc->last_num_bits;
+    if (update) *update = enc->last_sid_update;
+    if (mode) *mode = enc->last_sid_mode;
+    return EVS_OK;
+}
+
+int evs_enc_reconfigure(EVS_Encoder* enc, int bitrate, EVS_Bandwidth max_bw,
+                        const EVS_EncOptions* opts) {
+    if (!enc || !enc->st) return EVS_ERROR;
+    EVS_EncOptions options = opts ? *opts : enc->options;
+    if (evs_enc_normalize_config(enc->st->input_Fs, &bitrate, &max_bw, &options) != EVS_OK)
+        return EVS_ERROR;
+    if (enc->bitrate_bps == bitrate && enc->st->max_bwidth == bandwidth_to_enum(max_bw) &&
+        memcmp(&enc->options, &options, sizeof(options)) == 0) return EVS_OK;
+    enc->options = options;
+    enc->bitrate_bps = bitrate;
+    enc->st->total_brate = options.sc_vbr_enable ? ACELP_7k20 : bitrate;
+    enc->st->max_bwidth = (short)bandwidth_to_enum(max_bw);
+    enc->st->Opt_AMR_WB = options.amr_wb_io;
+    enc->st->Opt_SC_VBR = options.sc_vbr_enable;
+    enc->st->Opt_DTX_ON = options.dtx_enable;
+    enc->st->var_SID_rate_flag = options.dtx_sid_interval == 0;
+    enc->st->interval_SID = (short)(options.dtx_sid_interval ? options.dtx_sid_interval : FIXED_SID_RATE);
+    // Reference read_next_brate profile changes preserve all previous-frame
+    // fields so the core performs its supported overlap/filter transitions.
+    switch (enc->st->total_brate) {
+        case 9600: case 16400: case 24400: case 48000: case 96000: case 128000:
+            enc->st->codec_mode = MODE2; break;
+        default: enc->st->codec_mode = MODE1; break;
+    }
+    evs_enc_set_rf(enc, options.rf_enable, options.rf_fec_offset, options.rf_fec_hi);
+    return EVS_OK;
+}
+
 int evs_enc_process(EVS_Encoder* enc,
                     const short* pcm_in, int n_samples,
                     unsigned char* bitstream_out, int bitstream_max,
@@ -244,7 +293,12 @@ int evs_enc_process(EVS_Encoder* enc,
     // executable reapplies its requested RF settings before every frame;
     // omitting this step corrupts the MODE2 transition out of CNG.
     evs_enc_set_rf(enc, enc->rf_on, enc->rf_offset, enc->rf_hi);
-    evs_enc(enc->st, pcm_in, (short)n_samples);
+    if (enc->st->Opt_AMR_WB) amr_wb_enc(enc->st, pcm_in, (short)n_samples);
+    else evs_enc(enc->st, pcm_in, (short)n_samples);
+    enc->last_num_bits = enc->st->nb_bits_tot;
+    // Mirror indices_to_serial's explicit STI bit and current CMI selection.
+    enc->last_sid_update = enc->st->Opt_AMR_WB && enc->last_num_bits == 35;
+    enc->last_sid_mode = enc->st->Opt_AMR_WB ? amr_wb_mode_from_rate(enc->st->total_brate) : -1;
 
     // The encoder filled st->ind_list via push_indice(). Serialise it into
     // the G.192 word stream directly, replicating the G192 branch of the
@@ -289,9 +343,14 @@ int evs_enc_process(EVS_Encoder* enc,
 // Decoder
 // ---------------------------------------------------------------------------
 EVS_Decoder* evs_dec_create(int sample_rate_hz, int bitrate_bps) {
+    return evs_dec_create_ex(sample_rate_hz, bitrate_bps, 0);
+}
+EVS_Decoder* evs_dec_create_ex(int sample_rate_hz, int bitrate_bps, int amr_wb_io) {
     if (sample_rate_to_index(sample_rate_hz) < 0) return NULL;
-    if (bitrate_bps != 5900 &&
-        (!is_valid_g192_rate(bitrate_bps) || bitrate_bps < 7200)) return NULL;
+    if (amr_wb_io) {
+        if (amr_wb_mode_from_rate(bitrate_bps) < 0) return NULL;
+    } else if (bitrate_bps != 5900 &&
+        (!is_valid_g192_rate(bitrate_bps) || bitrate_bps < 7200 || amr_wb_mode_from_rate(bitrate_bps) >= 0)) return NULL;
 
     EVS_Decoder* dec = (EVS_Decoder*)calloc(1, sizeof(EVS_Decoder));
     if (!dec) return NULL;
@@ -311,7 +370,7 @@ EVS_Decoder* evs_dec_create(int sample_rate_hz, int bitrate_bps) {
 
     dec->st->output_Fs       = sample_rate_hz;
     dec->st->total_brate     = bitrate_bps == 5900 ? ACELP_7k20 : bitrate_bps;
-    dec->st->Opt_AMR_WB      = 0;
+    dec->st->Opt_AMR_WB      = amr_wb_io != 0;
     dec->st->bitstreamformat = G192;
     dec->st->bfi             = 0;
     dec->st->prev_bfi        = 0;
@@ -367,6 +426,7 @@ int evs_dec_process(EVS_Decoder* dec,
     words = bitstream_in + 2 * sizeof(unsigned short);
     for (k = 0; k < (int)num_bits; k++) {
         memcpy(&w, words + (size_t)k * sizeof(unsigned short), sizeof(unsigned short));
+        if (w != G192_BIN0 && w != G192_BIN1) return EVS_ERROR;
         if (w == G192_BIN1) {
             au[k >> 3] |= (unsigned char)(0x80 >> (k & 7));
         }
@@ -377,7 +437,8 @@ int evs_dec_process(EVS_Decoder* dec,
     // read_indices_from_djb() flags an untransmitted DTX gap (zero-length
     // frame while not in CNG) as bfi; mirror the reference decoder main
     // loop and run concealment for it.
-    evs_dec(dec->st, dec->pcm_buf, dec->st->bfi ? FRAMEMODE_MISSING : FRAMEMODE_NORMAL);
+    if (dec->st->Opt_AMR_WB) amr_wb_dec(dec->st, dec->pcm_buf);
+    else evs_dec(dec->st, dec->pcm_buf, dec->st->bfi ? FRAMEMODE_MISSING : FRAMEMODE_NORMAL);
     // decoder.c advances this outside evs_dec(). Keeping it at zero makes
     // every packet look like the first frame and breaks later mode changes.
     if (dec->st->ini_frame < MAX_FRAME_COUNTER) ++dec->st->ini_frame;
@@ -385,6 +446,7 @@ int evs_dec_process(EVS_Decoder* dec,
     N = dec->st->output_Fs / 50;
     for (i = 0; i < N; ++i) {
         float v = dec->pcm_buf[i];
+        if (!isfinite(v)) v = 0.0f;
         if (v >  32767.0f) v =  32767.0f;
         if (v < -32768.0f) v = -32768.0f;
         pcm_out[i] = (short)v;
@@ -408,11 +470,13 @@ int evs_dec_process_lost(EVS_Decoder* dec,
         dec->st->codec_mode = dec->st->last_codec_mode;
     }
 
-    evs_dec(dec->st, dec->pcm_buf, dec->st->bfi ? FRAMEMODE_MISSING : FRAMEMODE_NORMAL);
+    if (dec->st->Opt_AMR_WB) amr_wb_dec(dec->st, dec->pcm_buf);
+    else evs_dec(dec->st, dec->pcm_buf, dec->st->bfi ? FRAMEMODE_MISSING : FRAMEMODE_NORMAL);
     if (dec->st->ini_frame < MAX_FRAME_COUNTER) ++dec->st->ini_frame;
 
     for (int i = 0; i < N; ++i) {
         float v = dec->pcm_buf[i];
+        if (!isfinite(v)) v = 0.0f;
         if (v >  32767.0f) v =  32767.0f;
         if (v < -32768.0f) v = -32768.0f;
         pcm_out[i] = (short)v;

@@ -213,6 +213,29 @@ void inspectRender(const fs::path& input, int rate, int channels, int inputFrame
     check(load(getOutputFilename(input.string(), "g711")) == firstRun, "repeated conversion is deterministic");
 }
 
+void testAdvancedOptions(const fs::path& input) {
+    for(const auto& d:TelephonyDSP::advancedDescriptors) {
+        const std::string flag=std::string("--")+d.key;
+        for(const auto* invalid:{"nan","inf","1oops"})
+            check(run({input.string(),"--mode","g711",flag,invalid})!=0,"advanced option rejects nonfinite/partial value: "+flag);
+        check(run({input.string(),"--mode","g711",flag,std::to_string(d.maximum+1)})!=0,"advanced option enforces bound: "+flag);
+    }
+    check(run({input.string(),"--mode","g711","--host-clock","1"})!=0,"CLI rejects host-only clock");
+    check(run({input.string(),"--mode","g711","--redundancy","1"})!=0,"RED requires real RTP queue");
+    check(run({input.string(),"--mode","g711","--network-enabled","1","--packet-format","1","--redundancy","1","--jitter-ms","9","--playback-delay-ms","40"})==0,"CLI executes encoded packet queue with RTP/RED");
+    check(run({input.string(),"--mode","g711","--dtmf-digit","5"})==0,"CLI DTMF generator renders successfully");
+    check(fs::file_size(getOutputFilename(input.string(),"g711"))<48000*2*3,"DTMF generator stops before codec tail drain");
+#if TELEPHONY_EXPERIMENTAL_NETWORK
+    check(run({input.string(),"--mode","opus_voip","--opus-force-mode","1","--opus-frame-duration","0"})!=0,"incompatible force mode/framing rejected before output");
+#endif
+#ifdef TELEPHONY_DISTRIBUTION_BUILD
+    check(run({input.string(),"--mode","g711","--vad-mode","1"})!=0,"distribution rejects unavailable reference VAD2");
+#else
+    check(run({input.string(),"--mode","evs_native","--evs-amr-wb-io","1","--evs-io-mode","8"})==0,"CLI uses genuine EVS AMR-WB IO highest mode");
+    check(run({input.string(),"--mode","evs_native","--evs-amr-wb-io","1","--evs-sr","8000"})!=0,"IO incompatible sample rate rejected");
+#endif
+}
+
 void testFiles(const fs::path& root) {
     check(fs::path(getOutputFilename((root / "dir.with.dots" / "input").string(), "g711")) == root / "dir.with.dots" / "input.g711.wav", "dotted directory does not become the input extension");
     check(fs::path(getOutputFilename((root / ".hidden").string(), "g711")) == root / ".hidden.g711.wav", "extensionless hidden filename is preserved");
@@ -324,6 +347,7 @@ int main() {
         testParsing(input);
         testInvalidWavs(scratch.path);
         testFiles(scratch.path);
+        testAdvancedOptions(input);
     } catch (const std::exception& error) {
         check(false, std::string("unexpected exception: ") + error.what());
     }

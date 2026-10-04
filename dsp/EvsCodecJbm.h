@@ -27,6 +27,17 @@ namespace TelephonyDSP {
         // offset); no encoder CTLs are issued yet because EVS_NATIVE
         // does not expose a public loss-percent / FEC control.
         void configureNetwork(float packetLossRate, float networkDegradation) override;
+        void configureDtx(bool enabled, bool pureSilence) override;
+        bool reconfigure(int bitrate, EVS_Bandwidth bandwidth);
+        void setAutoBandwidth(bool enabled);
+        void setClockDriftPpm(double ppm);
+        void setSafetyMarginMs(int milliseconds);
+        int getSafetyMarginMs() const { return safetyMarginMs; }
+        bool isWarmingUp() const;
+        double getReceiverClockSkewMs() const { return receiverClockMs - lastSourcePlayoutMs; }
+        uint64_t getEncodedFrameCount() const { return encodedFrameCount; }
+        uint64_t getGeneratedSourceSamples() const { return generatedSourceSamples; }
+        EVS_Bandwidth getActiveBandwidth() const { return activeBw; }
 
         int getBitrate() const { return bitrateBps; }
         EVS_Bandwidth getMaxBandwidth() const { return maxBw; }
@@ -43,13 +54,30 @@ namespace TelephonyDSP {
         // persisted on the instance and applied the next time reset() (or
         // the ctor) builds the encoder, so callers do not need to time
         // the call against the audio thread.
-        void setScVbrEnabled(bool enable) { if (scVbrEnabled != enable) { scVbrEnabled = enable; reset(); } }
+        void setScVbrEnabled(bool enable);
         bool getScVbrEnabled() const { return scVbrEnabled; }
 
     private:
         int sampleRate;
         int bitrateBps;
+        int fixedBitrateBps = 13200;
+        EVS_Bandwidth fixedMaxBw = EVS_SWB;
         EVS_Bandwidth maxBw;
+        EVS_Bandwidth activeBw = EVS_SWB, pendingBw = EVS_SWB;
+        bool autoBandwidth = false;
+        int bandwidthHold = 0;
+        int safetyMarginMs = 60;
+        double clockDriftPpm = 0, receiverClockMs = 0, lastSourcePlayoutMs = 0;
+        bool havePlayoutClock = false;
+        double sourceSampleAccumulator = 0;
+        int16_t previousSourceSample = 0;
+        bool havePreviousSourceSample = false;
+        uint64_t generatedSourceSamples = 0, encodedFrameCount = 0;
+        std::vector<int16_t> pendingEncoderPcm;
+        std::vector<CodecEncodedPacket> encodedBatch;
+        std::vector<CodecPlayout> arrivedBatch;
+        void estimateBandwidth(const int16_t* input);
+        bool applyConfiguration(int bitrate, EVS_Bandwidth bandwidth, bool storeCeiling);
         // 0 = variable SID interval (default), 3..100 = fixed frames.
         int dtxSidInterval;
 

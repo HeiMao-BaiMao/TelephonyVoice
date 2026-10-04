@@ -29,7 +29,18 @@ namespace Vst {
         kParamG711Law,               // 0 = mu-law, 1 = A-law
         kParamEvsDtxSidInterval,     // 0 = variable SID, 3..100 = fixed frames
         kParamEvsScVbr,              // EVS Source-Controlled VBR toggle
-        kParamOpusBitrate            // Opus target bitrate in bps (6000..510000)
+        kParamOpusBitrate,           // Opus target bitrate in bps (6000..510000)
+        // Legacy route IDs retain their original normalized mappings forever.
+        kParamInputRoute = 120,
+        kParamOutputRoute,
+        kParamAdvancedBase = 200,
+        kParamInputPeak = 300,
+        kParamOutputPeak,
+        kParamMeasuredLoss,
+        kParamMeasuredJitter,
+        kParamOpusActualMode,
+        kParamLatencySamples,
+        kParamEditorPage = 900
     };
 
     // --------------------------------------------------------------------------
@@ -81,6 +92,10 @@ namespace Vst {
         float currentPacketLossRate;
         float currentNetworkDegradation;
         bool currentBypass;
+        TelephonyDSP::AdvancedSettings currentAdvanced;
+        double reportedLatency = -1.0;
+        double expectedTransportTime = 0.0;
+        bool transportTimeKnown = false, transportWasPlaying = false;
 
         // Latency-compensated bypass: the plugin reports getLatencySamples()
         // to the host, so the bypass path must delay the dry signal by the
@@ -92,6 +107,7 @@ namespace Vst {
         int bypassDelayPos;
 
         void updateDSPParameters();
+        void publishTelemetry(ProcessData& data, float** output = nullptr, int channels = 0);
     };
 
     // --------------------------------------------------------------------------
@@ -104,6 +120,7 @@ namespace Vst {
 
         tresult PLUGIN_API initialize(FUnknown* context) override;
         tresult PLUGIN_API setComponentState(IBStream* state) override;
+        tresult PLUGIN_API setParamNormalized(ParamID tag, ParamValue value) override;
         IPlugView* PLUGIN_API createView(FIDString name) override;
 
         static FUnknown* createInstance(void*) { return (IEditController*)new TelephonyVoiceController; }

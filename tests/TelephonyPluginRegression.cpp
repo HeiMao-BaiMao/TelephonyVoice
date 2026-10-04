@@ -1,6 +1,8 @@
 #include "TelephonyVoice.h"
 #include "public.sdk/source/common/memorystream.h"
 #include "pluginterfaces/vst/ivstparameterchanges.h"
+#include "pluginterfaces/vst/ivstprocesscontext.h"
+#include <map>
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -36,7 +38,33 @@ public:
         if (index != 0 || empty) return kResultFalse;
         offset = 0; result = value; return kResultOk;
     }
-    tresult PLUGIN_API addPoint(int32, ParamValue, int32&) override { return kNotImplemented; }
+    tresult PLUGIN_API addPoint(int32, ParamValue input, int32& index) override { value = input; empty = false; index = 0; return kResultOk; }
+};
+class CapturedChanges final : public IParameterChanges {
+public:
+    std::map<ParamID, SingleChange> values;
+    tresult PLUGIN_API queryInterface(const TUID, void** obj) override { *obj = nullptr; return kNoInterface; }
+    uint32 PLUGIN_API addRef() override { return 1; }
+    uint32 PLUGIN_API release() override { return 1; }
+    int32 PLUGIN_API getParameterCount() override { return (int32)values.size(); }
+    IParamValueQueue* PLUGIN_API getParameterData(int32 index) override {
+        if (index < 0 || index >= (int32)values.size()) return nullptr;
+        auto it = values.begin(); std::advance(it, index); return &it->second;
+    }
+    IParamValueQueue* PLUGIN_API addParameterData(const ParamID& id, int32& index) override {
+        index = 0; return &values.try_emplace(id, id, 0.0).first->second;
+    }
+};
+class TestComponentHandler final : public IComponentHandler {
+public:
+    int restarts = 0; int32 flags = 0;
+    tresult PLUGIN_API queryInterface(const TUID, void** obj) override { *obj = nullptr; return kNoInterface; }
+    uint32 PLUGIN_API addRef() override { return 1; }
+    uint32 PLUGIN_API release() override { return 1; }
+    tresult PLUGIN_API beginEdit(ParamID) override { return kResultOk; }
+    tresult PLUGIN_API performEdit(ParamID, ParamValue) override { return kResultOk; }
+    tresult PLUGIN_API endEdit(ParamID) override { return kResultOk; }
+    tresult PLUGIN_API restartComponent(int32 input) override { ++restarts; flags |= input; return kResultOk; }
 };
 static void automate(TelephonyVoiceProcessor& p, ParamID id, ParamValue value) {
     SingleChange change(id, value);
@@ -86,8 +114,23 @@ static void stateAndParameters() {
     check(controller.normalizedParamToPlain(kParamDryWet, 0.5) == 50.0
         && controller.normalizedParamToPlain(kParamArtifactAmount, 0.5) == 50.0, "percent controls display actual percentages");
     auto defaults = save(processor);
-    check(defaults.size() == 76, "saved state retains its existing 76-byte layout");
+    check(defaults.size() == 96 + 8 * TelephonyDSP::advancedDescriptors.size(), "saved state retains legacy prefix and appends versioned advanced extension");
+    check(readInt(defaults, 76) == 0x58415654 && readInt(defaults, 80) == 1, "advanced state has explicit magic and version");
     check(restore(controller, defaults) == kResultOk, "controller restores default component state");
+    auto olderExtension = defaults; writeBits(olderExtension, 84, 1); olderExtension.resize(104);
+    check(restore(processor, olderExtension) == kResultOk && restore(controller, olderExtension) == kResultOk,
+          "complete earlier extension counts retain defaults for appended controls");
+    check(restore(processor, defaults) == kResultOk && restore(controller, defaults) == kResultOk, "current state restored after prior-extension test");
+    for (ParamID id : {ParamID(kParamInputPeak), ParamID(kParamOutputPeak), ParamID(kParamMeasuredLoss), ParamID(kParamMeasuredJitter), ParamID(kParamOpusActualMode)}) {
+        const auto& meter = controller.getParameterObject(id)->getInfo();
+        check((meter.flags & ParameterInfo::kIsReadOnly) && !(meter.flags & ParameterInfo::kCanAutomate),
+              "live telemetry is read-only and cannot be automated");
+    }
+    String128 label{};
+    controller.getParamStringByValue(kParamAdvancedBase + (ParamID)TelephonyDSP::AdvancedControl::JitterDistribution, 1.0 / 3.0, label);
+    check(label[0] == 'G' && label[1] == 'a', "jitter option labels match actual Gamma distribution enum");
+    controller.getParamStringByValue(kParamAdvancedBase + (ParamID)TelephonyDSP::AdvancedControl::EvsPayloadStyle, 0.0, label);
+    check(label[0] == 'A' && label[1] == 'u', "EVS payload list begins with actual Auto wire mode");
     for (int index = 0; index <= maxEndpoint; ++index) {
         const auto normalized = controller.plainParamToNormalized(kParamEraMode, index);
         automate(processor, kParamEraMode, normalized);
@@ -100,13 +143,51 @@ static void stateAndParameters() {
     }
     for (size_t length = 0; length <= defaults.size(); ++length) {
         auto prefix = std::vector<char>(defaults.begin(), defaults.begin() + length);
-        const bool legal = length >= 20 && (length - 20) % 4 == 0;
+        const bool legal = length == defaults.size() || (length >= 20 && length <= 76 && (length - 20) % 4 == 0);
         const auto before = save(processor);
         const bool accepted = restore(processor, prefix) == kResultOk;
         check(accepted == legal, "only complete legacy field boundaries are accepted");
         if (!accepted) check(save(processor) == before, "failed restore is atomic");
         check((restore(controller, prefix) == kResultOk) == legal, "controller uses the same legacy-state validation");
     }
+    // Appended controls are individually automatable and survive processor/controller restore.
+    for (size_t index = 0; index < TelephonyDSP::advancedDescriptors.size(); ++index) {
+        const ParamID id = kParamAdvancedBase + (ParamID)index;
+        const double setting = double(index % 3) / 2.0;
+        automate(processor, id, setting);
+        auto bytes = save(processor);
+        check(restore(controller, bytes) == kResultOk && controller.getParamNormalized(id) == setting,
+              "advanced automation survives component-state round trip");
+    }
+    check(restore(processor, defaults) == kResultOk && restore(controller, defaults) == kResultOk, "default advanced state restores");
+    for (size_t offset : {76u, 80u, 84u}) {
+        auto invalid = defaults; writeBits(invalid, offset, 0xffffffffu);
+        const auto before = save(processor);
+        check(restore(processor, invalid) != kResultOk && save(processor) == before
+            && restore(controller, invalid) != kResultOk, "invalid extension header is rejected atomically");
+    }
+    for (uint32 highBits : {0x7ff80000u, 0x7ff00000u, 0xbff00000u, 0x40000000u}) {
+        auto invalid = defaults; writeBits(invalid, 96, 0); writeBits(invalid, 100, highBits);
+        const auto before = save(processor);
+        check(restore(processor, invalid) != kResultOk && save(processor) == before
+            && restore(controller, invalid) != kResultOk, "non-finite and out-of-range advanced state rejected atomically");
+    }
+#if !defined(TELEPHONY_DISTRIBUTION_BUILD) && TELEPHONY_EXPERIMENTAL_NETWORK
+    automate(processor, kParamInputRoute, 1.0); automate(processor, kParamOutputRoute, 1.0);
+    auto opusState = save(processor);
+    check(readInt(opusState, 0) == 4 && readInt(opusState, 20) == 4
+        && readInt(opusState, 88) == 100 && readInt(opusState, 92) == 100,
+        "Opus state uses compatible legacy fallback plus exact semantic route extension");
+    check(restore(controller, opusState) == kResultOk && controller.getParamNormalized(kParamInputRoute) == 1.0
+        && controller.getParamNormalized(kParamOutputRoute) == 1.0, "modern Opus routes restore in controller");
+    automate(processor, kParamEraMode, 1.0);
+    auto legacyAutomation = save(processor);
+    check(readInt(legacyAutomation, 88) == maxEndpoint, "legacy route automation keeps historical normalized meaning after Opus");
+    check(controller.setParamNormalized(kParamEraMode, 1.0) == kResultOk
+        && controller.normalizedParamToPlain(kParamInputRoute, controller.getParamNormalized(kParamInputRoute)) == maxEndpoint,
+        "controller legacy and modern route aliases stay synchronized");
+#endif
+    check(restore(processor, defaults) == kResultOk && restore(controller, defaults) == kResultOk, "defaults restored after modern route tests");
     for (size_t offset : {4u, 8u, 14u, 28u, 32u}) {
         for (uint32 bits : {0x7fc00000u, 0x7f800000u, 0xff800000u}) {
             auto invalid = defaults;
@@ -213,4 +294,108 @@ static void stereoDownmix() {
     check(correct, "stereo-to-mono sums both channels consistently during bypass toggles");
     processor.setActive(false); processor.terminate();
 }
-int main() { stateAndParameters(); audioProcessing(); stereoDownmix(); return failures ? 1 : 0; }
+static void telemetryAndTransport() {
+    TelephonyVoiceProcessor processor;
+    TelephonyVoiceController controller;
+    TestComponentHandler handler;
+    processor.initialize(nullptr); controller.initialize(nullptr); controller.setComponentHandler(&handler);
+    ProcessSetup setup{}; setup.sampleRate = 48000; setup.maxSamplesPerBlock = 512; setup.symbolicSampleSize = kSample32;
+    processor.setupProcessing(setup);
+    const auto needs = processor.getProcessContextRequirements();
+    check((needs & IProcessContextRequirements::kNeedTransportState) && (needs & IProcessContextRequirements::kNeedTempo)
+        && (needs & IProcessContextRequirements::kNeedProjectTimeMusic), "host is asked to supply transport and musical timing");
+    SpeakerArrangement mono = SpeakerArr::kMono; processor.setBusArrangements(&mono, 1, &mono, 1);
+    automate(processor, kParamOutputEndpoint, 0.0);
+    automate(processor, kParamDryWet, 0.0);
+    automate(processor, kParamAdvancedBase + (ParamID)TelephonyDSP::AdvancedControl::HostClock, 1.0);
+    processor.setActive(true);
+    float input[512], output[512]; std::fill_n(input, 512, 0.25f);
+    float* in[] = {input}; float* out[] = {output};
+    AudioBusBuffers inputBus{}; inputBus.numChannels = 1; inputBus.channelBuffers32 = in;
+    AudioBusBuffers outputBus{}; outputBus.numChannels = 1; outputBus.channelBuffers32 = out;
+    CapturedChanges changes;
+    ProcessContext context{}; context.sampleRate = 48000; context.state = ProcessContext::kPlaying;
+    ProcessData data{}; data.numInputs = data.numOutputs = 1; data.inputs = &inputBus; data.outputs = &outputBus;
+    data.numSamples = 512; data.symbolicSampleSize = kSample32; data.outputParameterChanges = &changes; data.processContext = &context;
+    bool finite = true;
+    for (int block = 0; block < 35; ++block) {
+        context.projectTimeSamples = block * 512;
+        finite &= processor.process(data) == kResultOk;
+        for (const auto& [id, queue] : changes.values) {
+            finite &= std::isfinite(queue.value) && queue.value >= 0.0 && queue.value <= 1.0;
+            controller.setParamNormalized(id, queue.value);
+        }
+    }
+    check(finite && changes.values.size() == 6, "processor sends finite, normalized live telemetry and latency through output parameter queues");
+    const double expectedPeak = (20.0 * std::log10(0.25) + 96.0) / 108.0;
+    check(std::abs(changes.values.at(kParamInputPeak).value - expectedPeak) < 1e-6
+        && std::abs(changes.values.at(kParamOutputPeak).value - expectedPeak) < 1e-6,
+        "meters report actual input and audible output amplitudes");
+    check(handler.restarts == 1 && (handler.flags & kLatencyChanged), "controller requests host latency recalculation exactly once for initial latency");
+    // Turning on the queue changes latency during an active session.
+    automate(processor, kParamAdvancedBase + (ParamID)TelephonyDSP::AdvancedControl::NetworkEnabled, 1.0);
+    changes.values.clear(); context.projectTimeSamples += 512;
+    check(processor.process(data) == kResultOk && changes.values.count(kParamLatencySamples), "advanced queue latency change reaches the controller");
+    controller.setParamNormalized(kParamLatencySamples, changes.values.at(kParamLatencySamples).value);
+    check(handler.restarts == 2 && processor.getLatencySamples() > 7200, "advanced queue updates reported host latency");
+    // A seek also clears latency-compensated bypass, avoiding stale dry audio.
+    automate(processor, kParamMasterBypass, 1.0);
+    for (int block = 0; block < 30; ++block) { context.projectTimeSamples += 512; processor.process(data); }
+    context.projectTimeSamples = 0;
+    processor.process(data);
+    check(std::all_of(output, output + 512, [](float sample) { return sample == 0.0f; }), "host timeline seek clears bypass delay together with DSP");
+    // Quarter notes are converted to seconds, never milliseconds.
+    context.sampleRate = 0; context.state |= ProcessContext::kProjectTimeMusicValid | ProcessContext::kTempoValid;
+    context.projectTimeMusic = 4; context.tempo = 120;
+    check(processor.process(data) == kResultOk, "valid music/tempo fallback accepts quarter-note host timing");
+    processor.setActive(false); controller.setComponentHandler(nullptr); controller.terminate(); processor.terminate();
+}
+static void disconnectedInput() {
+    for (bool bypass : {false, true}) {
+        TelephonyVoiceProcessor processor; processor.initialize(nullptr);
+        SpeakerArrangement mono = SpeakerArr::kMono, stereo = SpeakerArr::kStereo;
+        processor.setBusArrangements(&mono, 1, &stereo, 1);
+        ProcessSetup setup{}; setup.sampleRate = 48000; setup.maxSamplesPerBlock = 512; setup.symbolicSampleSize = kSample32;
+        processor.setupProcessing(setup);
+        automate(processor, kParamOutputEndpoint, 0.0);
+        automate(processor, kParamDryWet, 0.0);
+        automate(processor, kParamMasterBypass, bypass ? 1.0 : 0.0);
+        processor.setActive(true);
+        float input[512], left[512], right[512]; std::fill_n(input, 512, 0.5f);
+        float* in[] = {input}; float* out[] = {left, right};
+        AudioBusBuffers inputBus{}; inputBus.numChannels = 1; inputBus.channelBuffers32 = in;
+        AudioBusBuffers outputBus{}; outputBus.numChannels = 2; outputBus.channelBuffers32 = out;
+        CapturedChanges changes;
+        ProcessData data{}; data.numSamples = 512; data.symbolicSampleSize = kSample32;
+        data.numInputs = data.numOutputs = 1; data.inputs = &inputBus; data.outputs = &outputBus;
+        data.outputParameterChanges = &changes;
+        for (int block = 0; block < 35; ++block) processor.process(data);
+        check(left[511] == 0.5f && right[511] == 0.5f, "disconnect regression first primes real audible delay history");
+        data.numInputs = 0; data.inputs = nullptr;
+        bool silent = true;
+        for (int block = 0; block < 3; ++block) {
+            std::fill_n(left, 512, -99.0f); std::fill_n(right, 512, 99.0f); outputBus.silenceFlags = 0;
+            changes.values.clear();
+            silent &= processor.process(data) == kResultOk && outputBus.silenceFlags == 3;
+            silent &= std::all_of(left, left + 512, [](float value) { return value == 0.0f; })
+                && std::all_of(right, right + 512, [](float value) { return value == 0.0f; });
+            silent &= changes.values.count(kParamInputPeak) && changes.values.count(kParamOutputPeak)
+                && changes.values.at(kParamInputPeak).value == 0.0 && changes.values.at(kParamOutputPeak).value == 0.0;
+        }
+        check(silent, "missing input clears prefilled outputs, sets silence flags and publishes silent peaks in wet and bypass modes");
+        data.numInputs = 1; data.inputs = &inputBus; std::fill_n(input, 512, 0.75f);
+        bool reprimes = true; const int latency = (int)processor.getLatencySamples();
+        for (int block = 0; block < 35; ++block) {
+            reprimes &= processor.process(data) == kResultOk;
+            for (int sample = 0; sample < 512; ++sample) {
+                const float expected = block * 512 + sample < latency ? 0.0f : 0.75f;
+                reprimes &= left[sample] == expected && right[sample] == expected;
+            }
+        }
+        check(reprimes, "input reconnection reprimes wet and bypass latency without replaying pre-disconnect samples");
+        data.numInputs = data.numOutputs = 0; data.inputs = data.outputs = nullptr;
+        check(processor.process(data) == kResultOk, "missing output remains a safe non-audio host flush");
+        processor.setActive(false); processor.terminate();
+    }
+}
+int main() { stateAndParameters(); audioProcessing(); stereoDownmix(); telemetryAndTransport(); disconnectedInput(); return failures ? 1 : 0; }

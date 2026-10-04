@@ -1,3 +1,14 @@
+# 2026-10-04 — Advanced simulation and complete reference FX path
+
+- Implement the Tier1–4 local audio/transport paths and expose53 advanced controls in four GUI pages and the CLI. Preserve legacy route automation while adding Opus via modern route IDs; append a checked, versioned state extension.
+- Add independent Gilbert–Elliott loss, shaped/correlated jitter, BER, reorder/late/duplicate scheduling, real RTP/AMR/EVS payloads, RED recovery and SR/RR/XR reports. Display actual input/output peaks and measured network counters rather than configured values masquerading as telemetry.
+- Add spectral comfort noise/legacy comparison, DTMF, real reference VAD2, DTX/pure-silence comparison, stable decoded-output echo, fading/rate adaptation, handover, clock drift and real narrowband tandem coding.
+- Add variable-duration Opus with actual mode readout, verified version-pinned force-mode CTL and real FEC decoding; implement genuine EVS AMR-WB IO, auto-bandwidth and state-preserving rate changes with native-profile restoration.
+- Replace the incomplete FX build with complete official TS26.442 v16.4 source-path integration. Remove16 dead link-only/floating fallback helpers. Keep official source outside Git; compare generated input against official encoder/decoder outputs.
+- Correct fixed queue latency accounting, state/framing transitions, DTX packet alignment, high-rate delay-ring sizing, AMR-WB reference utility overreads and absent-input host processing. Preserve deterministic reset and block-partition behavior.
+- Add protocol/codec/GUI/whole-DSP regression coverage, malformed packet checks, AddressSanitizer/UBSan runs and official VST validator coverage. Native DAW visual/audition testing is still separate.
+- Keep every requested item visible in [FEATURE_MATRIX.md](FEATURE_MATRIX.md), including corrected EP1–EP6 provenance and the remaining external-data/RF-conformance/official-vector requirements. Engineering models are not presented as radio certification.
+
 # 2026-10-04 — Editor and supported-path reliability
 
 - Add a native VSTGUI editor with a route overview, relevant codec controls, keyboard controls, tooltips and host-provided zoom. Keep parameter IDs stable and use the SDK's automation binding.

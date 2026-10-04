@@ -1,5 +1,12 @@
 # EVS FX 固定小数点ビルド進捗メモ
 
+> **2026-10-04 update:** This file records the historical incomplete link-helper
+> experiment. It is not the current FX implementation. The build now requires
+> a complete external official TS 26.442 v16.4.0 source tree; all helpers and
+> float ACELP fallbacks below have been retired and removed. See [current integration and test
+> instructions](docs/EVS_FIXED_POINT.md). Official-vector certification remains
+> separate from synthetic wrapper/reference regression.
+
 > 作成日: 2026-06-17  
 > 目的: `TELEPHONY_USE_EVS_FX=ON` で `TelephonyRunner` がリンクできるようにする。`external/3gpp-evs` は読み取り専用（編集禁止）とし、親リポジトリ側のヘルパー `*_fx.c` と `cmake/3gpp-evs.cmake` の改修で未解決シンボルを埋めていく。
 

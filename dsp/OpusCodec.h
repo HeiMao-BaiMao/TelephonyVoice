@@ -1,112 +1,76 @@
 #pragma once
-
 #include "dsp/ICodec.h"
 #include "dsp/WaveformConcealer.h"
-#include <vector>
 
 namespace TelephonyDSP {
+constexpr int kOpusBandwidthNarrowband = 1101;
+constexpr int kOpusBandwidthMediumband = 1102;
+constexpr int kOpusBandwidthWideband = 1103;
+constexpr int kOpusBandwidthSuperwideband = 1104;
+constexpr int kOpusBandwidthFullband = 1105;
+enum class OpusMode { Unknown = -1, Auto = 0, Silk = 1, Hybrid = 2, Celt = 3 };
 
-    // Opus bandwidth constants (mirrors opus_defines.h OPUS_BANDWIDTH_*).
-    // Duplicated locally so the header doesn't have to pull in <opus.h>;
-    // the values are part of the stable Opus public ABI.
-    constexpr int kOpusBandwidthNarrowband   = 1101; // 4 kHz
-    constexpr int kOpusBandwidthMediumband   = 1102; // 6 kHz
-    constexpr int kOpusBandwidthWideband     = 1103; // 8 kHz
-    constexpr int kOpusBandwidthSuperwideband= 1104; // 12 kHz
-    constexpr int kOpusBandwidthFullband     = 1105; // 20 kHz (default)
-
-    class OpusCodec : public ICodec {
-    public:
-        OpusCodec(int sampleRate, int bitrateBps, int complexity,
-                  int maxBw = kOpusBandwidthFullband);
-        ~OpusCodec() override;
-        void reset() override;
-        int getSampleRate() const override { return sampleRate; }
-        int getFrameSize() const override { return sampleRate / 50; }
-        void processFrame(const int16_t* in, int16_t* out, bool packetLost) override;
-        void configureNetwork(float packetLossRate, float networkDegradation) override;
-
-        // Update the target encoder bitrate at runtime. `bps` is clamped to
-        // the supported telephony bitrate range (6000..510000) before being stored and pushed into
-        // the live encoder. Safe to call before the encoder exists; the
-        // value is then applied the next time the encoder is (re)created
-        // (see ctor and applyNetworkCtls()).
-        void setBitrate(int bps);
-
-        int getBitrate() const { return bitrateBps; }
-
-        // Set the maximum audio bandwidth the encoder is allowed to use.
-        // Mirrors OPUS_SET_MAX_BANDWIDTH. Defaults to FB (1105) which
-        // preserves the previous implicit behavior. Safe to call before
-        // the encoder exists (the value is cached and applied once
-        // recreateCodec-style creation completes).
-        void setMaxBandwidth(int bw);
-        int  getMaxBandwidth() const { return maxBandwidth; }
-
-    private:
-        int sampleRate;
-        int bitrateBps;
-        int frameSize;     // samples per 20 ms frame at sampleRate
-        int complexity;
-        int maxBandwidth;  // current OPUS_BANDWIDTH_* value (e.g. 1105 = FB)
-        void* encoder;     // OpusEncoder* (kept void* to avoid pulling opus.h into the header)
-        void* decoder;     // OpusDecoder*
-        std::vector<unsigned char> bitstream;
-        WaveformConcealer fallbackPLC;
-
-        // --- Packetized VoIP simulation state ---
-        //
-        // We never have more than this many buffered packets. Larger values
-        // waste memory; smaller values can starve Opus's PLC / FEC path.
-        static constexpr int kMaxQueueSize = 16;
-
-        // One transport packet: bitstream bytes plus sequence number and
-        // arrival frame (the playback-frame index at which it should become
-        // available to the decoder).
-        struct VoipPacket {
-            uint32_t seq;            // monotonically increasing per encoded frame
-            int      arrivalFrame;   // playback frame index at which it arrives
-            std::vector<unsigned char> data;
-        };
-
-        // Per-packet entry in the simulated network queue.
-        std::vector<VoipPacket> queue;
-
-        // Sequence number assigned to the next encoded packet.
-        uint32_t nextSeq;
-        // Playback frame counter; the codec emits one decoded frame per
-        // call, so this advances by exactly 1 each processFrame().
-        int      playbackFrame;
-
-        // Current clamped network parameters (mirrors what
-        // ChannelProcessor::configure pushed in).
-        float cfgPacketLossRate;
-        float cfgNetworkDegradation;
-
-        // RF channel-aware feedback state (13.2 kbps / >= 16 kHz only).
-        bool rfActive;                     // true if RF is viable at ctor time
-        int  lastAppliedFecOffset;          // throttling: last value pushed to encoder
-        int  lastAppliedFecHi;             // throttling: last HI/LO pushed
-
-        // Deterministic LCG state used to derive per-packet arrival jitter.
-        uint32_t jitterLcg;
-
-        // Initial Playback-target lag: this many decoded frames must be
-        // queued before we start playing back. Includes a degradation-
-        // dependent extra so higher degradation => more buffering.
-        int basePlaybackDelay() const;
-        // Map the network parameters to Opus's PACKET_LOSS_PERC value.
-        int derivedPacketLossPercent() const;
-        // Apply encoder CTLs based on the current cfgPacketLossRate /
-        // cfgNetworkDegradation. Safe to call multiple times.
-        void applyNetworkCtls();
-        // Derive the arrival frame for a packet with `seq` using the LCG
-        // state. The state is advanced as a side effect so each call is
-        // deterministic given the seed.
-        int arrivalFrameFor(uint32_t seq);
-        // Drop any packet whose sequence is older than
-        // (nextSeq - kMaxQueueSize); used to keep the queue bounded.
-        void trimQueue();
+class OpusCodec : public ICodec {
+public:
+    OpusCodec(int sampleRate, int bitrateBps, int complexity, int maxBw = kOpusBandwidthFullband);
+    ~OpusCodec() override;
+    void reset() override;
+    int getSampleRate() const override { return sampleRate; }
+    int getFrameSize() const override { return frameSize; }
+    void processFrame(const int16_t* in, int16_t* out, bool packetLost) override;
+    void configureNetwork(float packetLossRate, float networkDegradation) override;
+    void configureDtx(bool enabled, bool pureSilence) override;
+    void setBitrate(int bps);
+    int getBitrate() const { return bitrateBps; }
+    void setMaxBandwidth(int bw);
+    int getMaxBandwidth() const { return maxBandwidth; }
+    // Public expert-duration CTL. Changes framing, so caller must resize/reprime
+    // its PCM buffers; encoder/decoder history is otherwise retained.
+    bool setExpertFrameDuration(float milliseconds);
+    float getExpertFrameDuration() const { return frameDurationMs; }
+    OpusMode getActualMode() const { return actualMode; }
+    // Version-pinned bundled private CTL (not stable public Opus API).
+    // Actual ToC readout remains authoritative during codec transitions.
+    bool setForceMode(OpusMode mode);
+    OpusMode getForcedMode() const { return forcedMode; }
+    static bool supportsForceMode();
+    void setFecEnabled(bool enable);
+    void setFecRecoveryEnabled(bool enable) { fecRecoveryEnabled = enable; }
+    void setFecOnly(bool enable) { fecOnly = enable; }
+    // -1 restores loss estimate derived from configureNetwork.
+    void setFecPacketLossPercent(int percent);
+    void setPlaybackDelayFrames(int frames);
+    uint64_t getFecRecoveredFrames() const { return fecRecoveredFrames; }
+    uint64_t getFecAttempts() const { return fecAttempts; }
+    bool isInternalTransportWarming() const { return internalTransportWarming; }
+    int getInternalDelayFrames() const { return basePlaybackDelay(); }
+private:
+    int sampleRate, bitrateBps, frameSize, complexity, maxBandwidth;
+    float frameDurationMs = 20.0f;
+    void* encoder = nullptr;
+    void* decoder = nullptr;
+    std::vector<unsigned char> bitstream;
+    WaveformConcealer fallbackPLC;
+    struct VoipPacket {
+        uint32_t seq;
+        int arrivalFrame;
+        bool dtx;
+        std::vector<unsigned char> data;
     };
-
+    std::vector<VoipPacket> queue;
+    uint32_t nextSeq = 0;
+    int playbackFrame = 0;
+    float cfgPacketLossRate = 0, cfgNetworkDegradation = 0;
+    uint32_t jitterLcg = 0x9E3779B9u;
+    bool fecEnabled = true, fecRecoveryEnabled = true, fecOnly = false;
+    bool internalTransportWarming = true;
+    int fecPacketLossPercent = -1, playbackDelayFrames = -1;
+    OpusMode actualMode = OpusMode::Unknown, forcedMode = OpusMode::Auto;
+    uint64_t fecRecoveredFrames = 0, fecAttempts = 0;
+    int basePlaybackDelay() const;
+    int derivedPacketLossPercent() const;
+    void applyNetworkCtls();
+    void corruptOpusPacket(int bytes);
+    bool internalExchange(int bytes, bool lost, bool dtx);
+};
 } // namespace TelephonyDSP

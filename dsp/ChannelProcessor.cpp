@@ -13,6 +13,7 @@
 #include <cstring>
 
 namespace TelephonyDSP {
+    using A = AdvancedControl;
 
     ChannelProcessor::ChannelProcessor(double hostSR)
         : hostSampleRate(hostSR), currentMode(EraMode::Bypass),
@@ -28,19 +29,198 @@ namespace TelephonyDSP {
         size_t bigSize = 131072;
         ringCodecIn.resize(bigSize);
         ringCodecOut.resize(bigSize);
-        outputBuffer.resize(bigSize);
+        outputBuffer.resize(std::max(bigSize,(size_t)std::ceil(hostSampleRate)+8192));
         prepareInternalBuffers(4096);
         setMode(EraMode::Bypass); // Initialize logic
+    }
+
+    void ChannelProcessor::setAdvancedSettings(const AdvancedSettings& s) {
+        if(advanced==s) return;
+        const bool framingChanged=currentMode!=EraMode::Bypass && (
+            (currentMode==EraMode::OPUS_VOIP && advanced.get(A::OpusFrameDuration)!=s.get(A::OpusFrameDuration))
+            || advanced.enabled(A::NetworkEnabled)!=s.enabled(A::NetworkEnabled)
+            || ((advanced.enabled(A::NetworkEnabled) || s.enabled(A::NetworkEnabled)) && advanced.get(A::PlaybackDelayMs)!=s.get(A::PlaybackDelayMs))
+            || advanced.get(A::ClockDriftPpm)!=s.get(A::ClockDriftPpm)
+            || advanced.enabled(A::HostClock)!=s.enabled(A::HostClock));
+        const auto old=advanced;
+        advanced=s;
+        auto changed=[&](std::initializer_list<A> controls) { for(auto c:controls) if(old.get(c)!=advanced.get(c)) return true; return false; };
+        const int rate=codec?codec->getSampleRate():(currentMode==EraMode::EVS_LIKE?32000:8000);
+        transport.configure(advanced,paramPacketLossRate);
+        if(changed({A::DtmfDigit,A::DtmfLevel,A::DtmfOnMs,A::DtmfGapMs})) {
+            dtmf.configure(rate); const int digit=(int)advanced.get(A::DtmfDigit);
+            dtmf.setSequence(digit<0?"":std::string(1,"0123456789*#ABCD"[digit]),advanced.get(A::DtmfOnMs),advanced.get(A::DtmfGapMs),20*std::log10(std::max(1e-6,advanced.get(A::DtmfLevel))),true);
+        }
+        if(changed({A::ClockDriftPpm})) drift.configure(rate,advanced.get(A::ClockDriftPpm));
+        if(changed({A::EchoEnabled,A::EchoDelayMs,A::EchoGain,A::EchoCutoffHz})) echo.configure(rate,advanced.get(A::EchoDelayMs),20*std::log10(std::max(1e-6,advanced.get(A::EchoGain))),advanced.get(A::EchoCutoffHz));
+        if(changed({A::FadingEnabled,A::FadingDopplerHz,A::CarrierToInterferenceDb})) fading.configure(rate,advanced.get(A::FadingDopplerHz),advanced.get(A::CarrierToInterferenceDb));
+        if(changed({A::HandoverIntervalMs,A::HandoverGapMs})) handover.configure(rate,advanced.get(A::HandoverGapMs),advanced.get(A::HandoverIntervalMs)/1000);
+        if(changed({A::VadMode})) { vad2.configure(rate); vadHangover=0; }
+        if(changed({A::PsdNoise})) comfortNoise.configure(rate);
+        if(old.enabled(A::AdaptiveBitrate) && old.enabled(A::FadingEnabled) && !(advanced.enabled(A::AdaptiveBitrate) && advanced.enabled(A::FadingEnabled))) {
+            if(auto* nb=dynamic_cast<AMRNBCodec*>(codec.get())) nb->setMode(amrNbMode);
+            if(auto* wb=dynamic_cast<AMRWBCodec*>(codec.get())) wb->setMode(amrWbMode);
+            if(auto* evs=dynamic_cast<EVSCodec*>(codec.get())) { if(!advanced.enabled(A::EvsAmrWbIo)) evs->reconfigure(evsBitrateBps,evsMaxBandwidth); }
+#if TELEPHONY_USE_EVS_JBM
+            if(auto* jbm=dynamic_cast<EVSCodecJbm*>(codec.get())) jbm->reconfigure(evsBitrateBps,evsMaxBandwidth);
+#endif
+        }
+        simulatedPathPLC.setSpectralNoise(advanced.enabled(A::PsdNoise));
+        applyAdvancedCodec();
+        if(changed({A::NetworkEnabled,A::BandwidthNarrowing,A::FilterCascade})) updateFilters();
+        if(framingChanged) reset();
+    }
+    double ChannelProcessor::advancedDelayMs() const {
+#if TELEPHONY_USE_EVS_JBM
+        // The reference JBM's adaptive playout/time scaling is an intentional
+        // time-varying wet effect, not a fixed host processing delay.
+        if(currentMode==EraMode::EVS_JBM) return 0;
+#endif
+        double delay=0;
+        if(advanced.enabled(A::NetworkEnabled) && currentMode!=EraMode::Bypass) {
+            const double frameMs=codec?1000.0*codec->getFrameSize()/codec->getSampleRate():20;
+            delay=std::ceil(advanced.get(A::PlaybackDelayMs)/frameMs)*frameMs;
+        }
+        if(advanced.get(A::ClockDriftPpm)!=0 && currentMode!=EraMode::Bypass) delay+=2;
+        return delay;
+    }
+    ProcessingTelemetry ChannelProcessor::getTelemetry() const {
+        auto t=transport.telemetry();
+        if(auto* opus=dynamic_cast<OpusCodec*>(codec.get())) t.opusMode=(int)opus->getActualMode();
+        return t;
+    }
+    void ChannelProcessor::configureAdvancedAudio() {
+        const int rate=codec?codec->getSampleRate():(currentMode==EraMode::EVS_LIKE?32000:8000);
+        comfortNoise.configure(rate);
+        simulatedPathPLC.setSpectralNoise(advanced.enabled(A::PsdNoise));
+        dtmf.configure(rate);
+        const int digit=(int)advanced.get(A::DtmfDigit);
+        dtmf.setSequence(digit<0?"":std::string(1,"0123456789*#ABCD"[digit]),advanced.get(A::DtmfOnMs),advanced.get(A::DtmfGapMs),20*std::log10(std::max(1e-6,advanced.get(A::DtmfLevel))),true);
+        drift.configure(rate,advanced.get(A::ClockDriftPpm));
+        driftPrimeRemaining=advanced.get(A::ClockDriftPpm)!=0
+#if TELEPHONY_USE_EVS_JBM
+            && currentMode!=EraMode::EVS_JBM
+#endif
+            ?drift.latencySamples():0;
+        echo.configure(rate,advanced.get(A::EchoDelayMs),20*std::log10(std::max(1e-6,advanced.get(A::EchoGain))),advanced.get(A::EchoCutoffHz));
+        fading.configure(rate,advanced.get(A::FadingDopplerHz),advanced.get(A::CarrierToInterferenceDb));
+        handover.configure(rate,advanced.get(A::HandoverGapMs),advanced.get(A::HandoverIntervalMs)/1000);
+        vad2.configure(rate); vadHangover=0;
+        feedbackFrame.assign(codec?codec->getFrameSize():640,0);
+        tandemLow1.reset(); tandemLow1.setLowpass(3400,rate); tandemLow2=tandemLow1; tandemCodec.reset();
+    }
+    void ChannelProcessor::applyAdvancedCodec() {
+        if(!codec) return;
+        codec->setTransport(advanced.enabled(A::NetworkEnabled)?&transport:nullptr);
+        codec->configureBitErrors((float)advanced.get(A::BitErrorRate));
+        codec->setSpectralConcealment(advanced.enabled(A::PsdNoise));
+        const bool native=currentMode==EraMode::EVS_NATIVE || currentMode==EraMode::AMR_NB_3G || currentMode==EraMode::AMR_WB_VOLTE
+#if TELEPHONY_USE_EVS_JBM
+            || currentMode==EraMode::EVS_JBM
+#endif
+            ;
+        codec->configureDtx(native || advanced.enabled(A::DtxEnabled),advanced.enabled(A::PureSilence));
+        if(auto* opus=dynamic_cast<OpusCodec*>(codec.get())) {
+            static constexpr float durations[]={2.5f,5,10,20,40,60};
+            opus->setForceMode(OpusMode::Auto);
+            opus->setExpertFrameDuration(durations[(int)advanced.get(A::OpusFrameDuration)]);
+            opus->setFecEnabled(advanced.enabled(A::OpusFecEnabled));
+            opus->setFecOnly(advanced.enabled(A::OpusFecOnly));
+            opus->setForceMode(static_cast<OpusMode>((int)advanced.get(A::OpusForceMode)));
+            opus->setFecPacketLossPercent(advanced.enabled(A::NetworkEnabled)?(int)advanced.get(A::OpusFecPercent):-1);
+        }
+        if(auto* evs=dynamic_cast<EVSCodec*>(codec.get())) {
+            evs->setAutoBandwidth(advanced.enabled(A::EvsAutoBandwidth));
+            static constexpr int ioRates[]={6600,8850,12650,14250,15850,18250,19850,23050,23850};
+            evs->setAmrWbIo(advanced.enabled(A::EvsAmrWbIo),ioRates[(int)advanced.get(A::EvsIoMode)]);
+        }
+#if TELEPHONY_USE_EVS_JBM
+        if(auto* jbm=dynamic_cast<EVSCodecJbm*>(codec.get())) {
+            jbm->setAutoBandwidth(advanced.enabled(A::EvsAutoBandwidth));
+            jbm->setClockDriftPpm(advanced.get(A::ClockDriftPpm));
+            jbm->setSafetyMarginMs(advanced.enabled(A::NetworkEnabled)?(int)std::lround(advanced.get(A::PlaybackDelayMs)):60);
+        }
+#endif
+        const int frame=codec->getFrameSize();
+        codecFrameF.resize(frame); codecFrameSIn.resize(frame); codecFrameSOut.resize(frame);
+        if(feedbackFrame.size()!=(size_t)frame) feedbackFrame.assign(frame,0);
+    }
+    bool ChannelProcessor::voiceDecision(const int16_t* data,int count,int rate) {
+        if(advanced.get(A::VadMode)==1 && vad2.available()) return vad2.processPCM16(data,count).speech;
+        double energy=0; for(int i=0;i<count;++i) energy+=double(data[i])*data[i];
+        const bool primary=energy/std::max(1,count)>180.0*180.0;
+        if(primary) vadHangover=(int)std::ceil(.15*rate/count);
+        else if(vadHangover) --vadHangover;
+        return primary || vadHangover>0;
+    }
+    void ChannelProcessor::prepareAdvancedFrame(int frame,int rate) {
+        if(feedbackFrame.size()!=(size_t)frame) feedbackFrame.assign(frame,0);
+        for(int i=0;i<frame;++i) {
+            float value=codecFrameF[i];
+            if(advanced.get(A::DtmfDigit)>=0) value+=dtmf.next();
+            if(advanced.enabled(A::EchoEnabled)) { value=echo.inject(value); echo.capture(feedbackFrame[i]/32768.f); }
+            if(advanced.enabled(A::FadingEnabled)) value=fading.process(value);
+            codecFrameSIn[i]=clampToInt16(value*32767.f);
+        }
+        lastFrameSpeech=advanced.enabled(A::DtxEnabled)?voiceDecision(codecFrameSIn.data(),frame,rate):true;
+        if(codec) codec->setVoiceActivity(lastFrameSpeech);
+        if(advanced.enabled(A::AdaptiveBitrate) && advanced.enabled(A::FadingEnabled)) {
+            const double fraction=fading.state().suggestedModeFraction;
+            if(auto* nb=dynamic_cast<AMRNBCodec*>(codec.get())) nb->setMode((int)std::lround(fraction*7));
+            if(auto* wb=dynamic_cast<AMRWBCodec*>(codec.get())) wb->setMode((int)std::lround(fraction*8));
+            static constexpr int rates[]={7200,8000,9600,13200,16400,24400,32000,48000,64000,96000,128000};
+            int choice=rates[(int)std::lround(fraction*10)];
+            choice=std::min(choice,evsBitrateBps);
+            if(auto* evs=dynamic_cast<EVSCodec*>(codec.get())) { if(!advanced.enabled(A::EvsAmrWbIo)) evs->setBitrate(choice); }
+#if TELEPHONY_USE_EVS_JBM
+            if(auto* jbm=dynamic_cast<EVSCodecJbm*>(codec.get())) jbm->reconfigure(choice,evsMaxBandwidth);
+#endif
+        }
+    }
+    void ChannelProcessor::finishAdvancedFrame(int frame,int rate,bool lost) {
+        const bool simulated=currentMode==EraMode::PSTN_G711 || currentMode==EraMode::GSM_FR || currentMode==EraMode::EVS_LIKE;
+        const bool silence=codec?codec->isDtxActive():lastOutputDtx;
+        if(simulated && advanced.enabled(A::PsdNoise)) {
+            if(lost || silence) comfortNoise.generatePCM16(codecFrameSOut.data(),frame);
+            else comfortNoise.observePCM16(codecFrameSOut.data(),frame);
+        }
+        if(silence && advanced.enabled(A::PureSilence)) std::fill(codecFrameSOut.begin(),codecFrameSOut.end(),0);
+        if(advanced.enabled(A::TandemNarrowband) && rate%8000==0 && frame*8000/rate<=480) {
+            const int factor=rate/8000;
+            const int nbCount=frame/factor;
+            for(int i=0;i<nbCount;++i) {
+                float sum=0;
+                for(int j=0;j<factor;++j) sum+=tandemLow2.process(tandemLow1.process(codecFrameSOut[i*factor+j]/32768.f));
+                tandemInput[i]=clampToInt16(sum/factor*32767.f);
+            }
+            tandemCodec.processSamples(tandemInput.data(),tandemOutput.data(),nbCount);
+            for(int i=0;i<frame;++i) codecFrameSOut[i]=tandemOutput[i/factor];
+        }
+        feedbackFrame.assign(codecFrameSOut.begin(),codecFrameSOut.end());
+        for(int i=0;i<frame;++i) {
+            float value=codecFrameSOut[i]/32768.f;
+            if(advanced.get(A::ClockDriftPpm)!=0
+#if TELEPHONY_USE_EVS_JBM
+                && currentMode!=EraMode::EVS_JBM
+#endif
+            ) value=drift.process(value);
+            if(advanced.get(A::HandoverIntervalMs)>0) value=handover.process(value);
+            if(modeTransientRemaining>0) { value+=(float)advanced.get(A::ModeTransient)*modeTransientPrevious*(modeTransientRemaining/32.f); --modeTransientRemaining; }
+            codecFrameF[i]=value;
+        }
+        modeTransientPrevious=codecFrameF.empty()?0:codecFrameF.back();
     }
 
     ChannelProcessor::~ChannelProcessor() {}
 
     void ChannelProcessor::setSampleRate(double sr) {
-        if (hostSampleRate != sr) { 
-            hostSampleRate = sr; 
-            recreateResamplers(); 
+        if (hostSampleRate != sr) {
+            hostSampleRate = sr;
+            outputBuffer.resize(std::max<size_t>(131072,(size_t)std::ceil(sr)+8192));
+            recreateResamplers();
+            configureAdvancedAudio();
             updateFilters();
-            reset(); 
+            reset();
         }
     }
 
@@ -72,6 +252,18 @@ namespace TelephonyDSP {
 #else
         const bool rebuildForEvs = (currentMode == EraMode::EVS_NATIVE);
 #endif
+        if(changed && rebuildForEvs && codec && codec->getSampleRate()==sampleRateHz) {
+            if(auto* native=dynamic_cast<EVSCodec*>(codec.get())) {
+                if(native->reconfigure(bitrateBps,maxBw,advanced.enabled(A::EvsAmrWbIo))) {
+                    updateFilters(); modeTransientRemaining=32; return;
+                }
+            }
+#if TELEPHONY_USE_EVS_JBM
+            if(auto* jbm=dynamic_cast<EVSCodecJbm*>(codec.get())) {
+                if(jbm->reconfigure(bitrateBps,maxBw)) { updateFilters(); modeTransientRemaining=32; return; }
+            }
+#endif
+        }
         if (changed && rebuildForEvs) {
             recreateResamplers();
             recreateCodec();
@@ -136,14 +328,9 @@ namespace TelephonyDSP {
         const int clamped = mode < 0 ? 0 : (mode > 7 ? 7 : mode);
         if (amrNbMode == clamped) return;
         amrNbMode = clamped;
-        // Always rebuild the active AMR_NB_3G codec so the freshly
-        // constructed AMRNBCodec picks up the new mode. The change is
-        // stashed for non-AMR_NB_3G modes and applied the next time
-        // recreateCodec() builds an AMRNBCodec.
-        if (currentMode == EraMode::AMR_NB_3G) {
-            recreateCodec();
-            ringCodecIn.reset(); ringCodecOut.reset();
-        }
+        if(auto* nb=dynamic_cast<AMRNBCodec*>(codec.get())) nb->setMode(clamped);
+        modeTransientRemaining=32;
+
     }
 
     void ChannelProcessor::setG711Law(int law) {
@@ -160,26 +347,9 @@ namespace TelephonyDSP {
         const int clamped = mode < 0 ? 0 : (mode > 8 ? 8 : mode);
         if (amrWbMode == clamped) return;
         amrWbMode = clamped;
-        // If the active codec is an AMR-WB codec, push the new mode
-        // through in place (its setMode() also resets encoder state);
-        // otherwise the change is remembered in amrWbMode and picked up
-        // the next time recreateCodec() builds an AMRWBCodec.
-        if (codec) {
-            AMRWBCodec* amrWb = dynamic_cast<AMRWBCodec*>(codec.get());
-            if (amrWb) {
-                amrWb->setMode(amrWbMode);
-            }
-        }
-        if (currentMode == EraMode::AMR_WB_VOLTE) {
-            // Rebuild so the freshly-created AMRWBCodec is constructed
-            // with the new amrWbMode and resampler/buffer state is
-            // consistent. AMRWBCodec::setMode() already resets the
-            // encoder state for the in-place path above, so we only
-            // need the full recreateCodec() for the case where no live
-            // codec was attached.
-            recreateCodec();
-            ringCodecIn.reset(); ringCodecOut.reset();
-        }
+        if(auto* wb=dynamic_cast<AMRWBCodec*>(codec.get())) wb->setMode(clamped);
+        modeTransientRemaining=32;
+
     }
 
     void ChannelProcessor::setOpusBitrate(int bps) {
@@ -215,12 +385,13 @@ namespace TelephonyDSP {
         if (networkChanged) {
             updateFilters();
         }
+        transport.configure(advanced,clampedLoss);
         // Push the clamped values into the codec if one is currently
         // attached. Codecs that don't model a network (the default ICodec
         // base) treat this as a no-op; OpusCodec uses it to drive its
         // encoder CTLs and internal jitter-buffer state.
         if (codec) {
-            codec->configureNetwork(clampedLoss, clampedDegradation);
+            codec->configureNetwork(advanced.enabled(A::NetworkEnabled)?0.f:clampedLoss, advanced.enabled(A::NetworkEnabled)?0.f:clampedDegradation);
         }
     }
 
@@ -232,6 +403,17 @@ void ChannelProcessor::reset() {
         packetLossSeed = 0x12345678u;
         artifactSeed = 12345u;
         simulatedPathPLC.reset(codec ? codec->getFrameSize() : 640);
+        transport.reset(); comfortNoise.reset(); dtmf.reset(); drift.reset(); echo.reset(); fading.reset(); handover.reset(); vad2.reset();
+        driftPrimeRemaining=advanced.get(A::ClockDriftPpm)!=0
+#if TELEPHONY_USE_EVS_JBM
+            && currentMode!=EraMode::EVS_JBM
+#endif
+            ?drift.latencySamples():0;
+        std::fill(feedbackFrame.begin(),feedbackFrame.end(),0); vadHangover=0; lastOutputDtx=false;
+        tandemLow1.reset();
+        tandemLow1.setLowpass(3400,codec?codec->getSampleRate():(currentMode==EraMode::EVS_LIKE?32000:8000));
+        tandemLow2=tandemLow1; tandemCodec.reset();
+        modeTransientRemaining=0; modeTransientPrevious=0;
         if (resamplerDown) resamplerDown->clear();
         if (resamplerUp) resamplerUp->clear();
         if (codec) codec->reset();
@@ -265,7 +447,7 @@ void ChannelProcessor::reset() {
         size_t avail = outputBuffer.getReadAvailable();
         size_t count = (std::min)((size_t)numSamples, avail);
         outputBuffer.read(out, count);
-        
+
         applyArtifacts(out, count);
         return count;
     }
@@ -323,13 +505,14 @@ void ChannelProcessor::reset() {
                 return;
             }
 
-            const float d = std::clamp(paramNetworkDegradation, 0.0f, 1.0f);
+            const float d = advanced.enabled(A::NetworkEnabled)?(float)advanced.get(A::BandwidthNarrowing):std::clamp(paramNetworkDegradation, 0.0f, 1.0f);
             highpassHz = highpassHz + d * ((std::max)(highpassHz, 260.0f) - highpassHz);
             lowpassHz = lowpassHz - d * (lowpassHz - degradedFloorHz);
             lowpassHz = std::clamp(lowpassHz, highpassHz + 300.0f, sampleRate * 0.45f);
 
-            hpFilter1.setHighpass(highpassHz, sampleRate);
-            lpFilter1.setLowpass(lowpassHz, sampleRate);
+            const int ramp=(int)std::lround(sampleRate*.005*(1-advanced.get(A::ModeTransient)));
+            hpFilter1.setHighpass(highpassHz, sampleRate,ramp);
+            lpFilter1.setLowpass(lowpassHz, sampleRate,ramp);
         };
 
         switch (currentMode) {
@@ -363,7 +546,7 @@ void ChannelProcessor::reset() {
                 applyBand();
                 break;
             case EraMode::EVS_NATIVE:
-                if (paramNetworkDegradation <= 0.001f) {
+                if ((advanced.enabled(A::NetworkEnabled)?advanced.get(A::BandwidthNarrowing):paramNetworkDegradation) <= 0.001f) {
                     // The real EVS already shapes its own bandwidth; skip the
                     // extra cascade unless the radio/path simulation asks for it.
                     hpFilter1.reset();
@@ -388,7 +571,7 @@ void ChannelProcessor::reset() {
                 // EVS_JBM runs the real EVS encoder + JBM at the
                 // configured sample rate, so its filter profile
                 // matches EVS_NATIVE.
-                if (paramNetworkDegradation <= 0.001f) {
+                if ((advanced.enabled(A::NetworkEnabled)?advanced.get(A::BandwidthNarrowing):paramNetworkDegradation) <= 0.001f) {
                     hpFilter1.reset();
                     lpFilter1.reset();
                 } else {
@@ -409,7 +592,7 @@ void ChannelProcessor::reset() {
 #endif
 #if TELEPHONY_EXPERIMENTAL_NETWORK
             case EraMode::OPUS_VOIP:
-                if (paramNetworkDegradation <= 0.001f) {
+                if ((advanced.enabled(A::NetworkEnabled)?advanced.get(A::BandwidthNarrowing):paramNetworkDegradation) <= 0.001f) {
                     // Opus already shapes its own bandwidth (up to 20 kHz FB);
                     // skip the extra cascade unless the path simulation asks.
                     hpFilter1.reset();
@@ -439,6 +622,7 @@ void ChannelProcessor::reset() {
     }
 
     bool ChannelProcessor::shouldDropPacket() {
+        if(advanced.enabled(A::NetworkEnabled)) return false;
         const float degradation = std::clamp(paramNetworkDegradation, 0.0f, 1.0f);
         const float derivedLoss = degradation * degradation * 0.08f;
         const float lossRate = std::clamp(paramPacketLossRate + derivedLoss, 0.0f, 0.95f);
@@ -473,6 +657,7 @@ void ChannelProcessor::recreateCodec() {
                 simulatedPathPLC.reset(32000 / 50);
                 // EVS_LIKE is a filter-only path. Do not attach the Opus
                 // speech gate here: quiet valid input must not become PLC.
+                configureAdvancedAudio();
                 return;
             case EraMode::EVS_NATIVE:
                 codec = std::make_unique<EVSCodec>(evsSampleRate, evsBitrateBps, evsMaxBandwidth,
@@ -484,7 +669,7 @@ void ChannelProcessor::recreateCodec() {
                 // in one ICodec. See the class header comment in
                 // TelephonyDSP.h for the full design.
                 codec = std::make_unique<EVSCodecJbm>(evsSampleRate, evsBitrateBps, evsMaxBandwidth,
-                                                     evsDtxSidInterval);
+                                                     evsDtxSidInterval, evsScVbrEnabled);
                 break;
 #endif
 #if TELEPHONY_EXPERIMENTAL_NETWORK
@@ -515,6 +700,8 @@ void ChannelProcessor::recreateCodec() {
             speexAux->configure(sr, fs);
 #endif
         }
+        configureAdvancedAudio();
+        applyAdvancedCodec();
     }
 
     void ChannelProcessor::prepareInternalBuffers(int maxBlockSize) {
@@ -552,9 +739,9 @@ void ChannelProcessor::recreateCodec() {
                  for (int i = 0; i < downCount; ++i) {
                      float x = (float)dOutRaw[i];
                      x = hpFilter1.process(x);
-                     x = hpFilter2.process(x);
+                     if(!advanced.enabled(A::NetworkEnabled) || advanced.enabled(A::FilterCascade)) x = hpFilter2.process(x);
                      x = lpFilter1.process(x);
-                     x = lpFilter2.process(x);
+                     if(!advanced.enabled(A::NetworkEnabled) || advanced.enabled(A::FilterCascade)) x = lpFilter2.process(x);
                      tempProcessBuf[i] = x;
                  }
                  ringCodecIn.write(tempProcessBuf.data(), downCount);
@@ -562,64 +749,48 @@ void ChannelProcessor::recreateCodec() {
              }
          }
 
-         // ---- Stage 2: codec/EVS_LIKE processing ----
-         // The SpeexDSPAux energy VAD now drives DTX for OPUS_VOIP and
-         // EVS_LIKE: when it classifies the current frame as silence, the
-         // effective `packetLost` flag is forced true so the codec path
-         // emits comfort noise (Opus's own CNG via DTX, the simulated
-         // path PLC for EVS_LIKE) instead of transmitting the silent
-         // frame. EVS_NATIVE / EVS_JBM have their own 3GPP VAD and are
-         // intentionally left alone; AMR / G.711 / GSM are not in the
-         // experimental network scope and are not touched here either.
-         if (currentMode == EraMode::EVS_LIKE) {
-             const int frameSize = 32000 / 50;
-             while (ringCodecIn.getReadAvailable() >= (size_t)frameSize) {
-                 ringCodecIn.read(codecFrameF.data(), frameSize);
-                 for (int i = 0; i < frameSize; ++i) {
-                     codecFrameSIn[i] = clampToInt16(codecFrameF[i] * 32767.0f);
-                 }
-
-                 // Run SpeexDSPAux (denoise + cached energy-VAD) on the
-                 // freshly-quantized int16 frame so lastFrameIsSpeech()
-                 // reflects *this* frame, not a previous one.
-                 if (speexAux) speexAux->runPreprocess(codecFrameSIn.data());
-                 const bool energyVadSilence =
-                     speexAux && !speexAux->lastFrameIsSpeech();
-
-                 if (shouldDropPacket() || energyVadSilence) {
-                     simulatedPathPLC.conceal(codecFrameSOut.data(), frameSize);
+         // Each input codec frame advances encoder and transport exactly once.
+         // Initial transport/drift prefill is omitted here and included in the
+         // host latency reserve instead, never double-counted as audio silence.
+         if(currentMode==EraMode::EVS_LIKE || codec) {
+             const int frame=codec?codec->getFrameSize():640;
+             const int rate=codec?codec->getSampleRate():32000;
+             while(ringCodecIn.getReadAvailable()>=(size_t)frame) {
+                 ringCodecIn.read(codecFrameF.data(),frame);
+                 prepareAdvancedFrame(frame,rate);
+                 bool lost=shouldDropPacket();
+                 if(codec) {
+                     codec->processFrame(codecFrameSIn.data(),codecFrameSOut.data(),lost);
+                     if(advanced.enabled(A::NetworkEnabled)) lost=!transport.lastPacketReceived();
                  } else {
-                     std::memcpy(codecFrameSOut.data(), codecFrameSIn.data(), frameSize * sizeof(int16_t));
-                     simulatedPathPLC.storeGoodFrame(codecFrameSOut.data(), frameSize);
-                 }
-
-                 for (int i = 0; i < frameSize; ++i) {
-                     codecFrameF[i] = codecFrameSOut[i] / 32768.0f;
-                 }
-                 ringCodecOut.write(codecFrameF.data(), frameSize);
-             }
-         } else if (codec) {
-             int frameSize = codec->getFrameSize();
-             while (ringCodecIn.getReadAvailable() >= (size_t)frameSize) {
-                 ringCodecIn.read(codecFrameF.data(), frameSize);
-                 for(int i=0; i<frameSize; ++i) codecFrameSIn[i] = clampToInt16(codecFrameF[i] * 32767.0f);
-
-                 bool packetLost = shouldDropPacket();
-                 // Energy-VAD-driven DTX is only wired into the
-                 // experimental OPUS_VOIP mode here; other codecs in the
-                 // generic branch (AMR, G.711, GSM) keep their existing
-                 // packet-loss-only behavior. EVS_NATIVE / EVS_JBM never
-                 // reach this branch (they have their own dispatch).
-                 if (currentMode == EraMode::OPUS_VOIP && speexAux) {
-                     speexAux->runPreprocess(codecFrameSIn.data());
-                     if (!speexAux->lastFrameIsSpeech()) {
-                         packetLost = true; // force Opus DTX/CNG
+                     if(advanced.enabled(A::NetworkEnabled)) {
+                         std::vector<uint8_t> bytes(frame*2);
+                         for(int i=0;i<frame;++i) { const uint16_t v=(uint16_t)codecFrameSIn[i]; bytes[2*i]=(uint8_t)(v>>8); bytes[2*i+1]=(uint8_t)v; }
+                         CodecPlayout played;
+                         lost=!transport.exchange({CodecPacketFormat::LinearPcm16,rate,frame,advanced.enabled(A::DtxEnabled) && !lastFrameSpeech,false},bytes.data(),bytes.size(),false,played);
+                         if(!lost && played.payload.size()==bytes.size()) {
+                             for(int i=0;i<frame;++i) codecFrameSOut[i]=(int16_t)((uint16_t(played.payload[2*i])<<8)|played.payload[2*i+1]);
+                             lastOutputDtx=played.dtx;
+                         } else lost=true;
+                     } else {
+                         std::copy(codecFrameSIn.begin(),codecFrameSIn.end(),codecFrameSOut.begin());
+                         lastOutputDtx=advanced.enabled(A::DtxEnabled) && !lastFrameSpeech;
                      }
+                     if(lost || lastOutputDtx) simulatedPathPLC.conceal(codecFrameSOut.data(),frame);
+                     else simulatedPathPLC.storeGoodFrame(codecFrameSOut.data(),frame);
                  }
-
-                 codec->processFrame(codecFrameSIn.data(), codecFrameSOut.data(), packetLost);
-                 for(int i=0; i<frameSize; ++i) codecFrameF[i] = codecFrameSOut[i] / 32768.0f;
-                 ringCodecOut.write(codecFrameF.data(), frameSize);
+                 finishAdvancedFrame(frame,rate,lost);
+                 if(advanced.enabled(A::NetworkEnabled) && transport.warmingUp()
+#if TELEPHONY_USE_EVS_JBM
+                     && currentMode!=EraMode::EVS_JBM
+#endif
+                 ) continue;
+                 if(!advanced.enabled(A::NetworkEnabled)) {
+                     if(auto* opus=dynamic_cast<OpusCodec*>(codec.get())) if(opus->isInternalTransportWarming()) continue;
+                 }
+                 const size_t skip=std::min(driftPrimeRemaining,(size_t)frame);
+                 driftPrimeRemaining-=skip;
+                 ringCodecOut.write(codecFrameF.data()+skip,frame-skip);
              }
          }
 
@@ -653,7 +824,7 @@ void ChannelProcessor::recreateCodec() {
              }
          }
     }
-    
+
     void ChannelProcessor::applyArtifacts(float* buffer, int numSamples) {
         if (!paramArtifactsEnabled || paramArtifactAmount <= 0.001f) return;
         auto randf = [&]() {

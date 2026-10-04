@@ -1,6 +1,10 @@
 #pragma once
 
 #include "dsp/Types.h"
+#include "dsp/AdvancedControls.h"
+#include "dsp/AudioSimulation.h"
+#include "dsp/ChannelTransport.h"
+#include "dsp/G711Codec.h"
 #include "dsp/Biquad.h"
 #include "dsp/RingBuffer.h"
 #include "dsp/ICodec.h"
@@ -19,6 +23,10 @@ namespace TelephonyDSP {
         ChannelProcessor(double hostSR);
         ~ChannelProcessor();
 
+        void setAdvancedSettings(const AdvancedSettings&);
+        ProcessingTelemetry getTelemetry() const;
+        void setTransportTime(double seconds,bool playing) { transport.setTime(seconds,playing); }
+        double advancedDelayMs() const;
         void setSampleRate(double sr);
         void setMode(EraMode mode);
         void setEVSConfig(int sampleRateHz, int bitrateBps, EVS_Bandwidth maxBw);
@@ -80,6 +88,28 @@ namespace TelephonyDSP {
         float getLastVadProb() const;
 
     private:
+        AdvancedSettings advanced;
+        ChannelTransport transport;
+        PsdComfortNoise comfortNoise;
+        DtmfGenerator dtmf;
+        ClockDriftResampler drift;
+        HybridEcho echo;
+        RayleighFading fading;
+        HandoverGate handover;
+        Vad2Detector vad2;
+        G711Codec tandemCodec{8000};
+        Biquad tandemLow1, tandemLow2;
+        std::vector<int16_t> feedbackFrame;
+        std::array<int16_t,480> tandemInput{},tandemOutput{};
+        bool lastFrameSpeech=true, lastOutputDtx=false;
+        int vadHangover=0, modeTransientRemaining=0;
+        float modeTransientPrevious=0;
+        size_t driftPrimeRemaining=0;
+        void configureAdvancedAudio();
+        void applyAdvancedCodec();
+        void prepareAdvancedFrame(int frameSize,int sampleRate);
+        bool voiceDecision(const int16_t* data,int count,int sampleRate);
+        void finishAdvancedFrame(int frameSize,int sampleRate,bool lost);
         double hostSampleRate;
         EraMode currentMode;
         bool paramArtifactsEnabled;

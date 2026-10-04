@@ -7,6 +7,7 @@ UI はコーデック規格名ではなく「`in -> 交換局 -> out`」「固�
 
 - 作業履歴の詳細: [docs/CHANGELOG.md](docs/CHANGELOG.md)
 - 実装ロードマップ (Tier 0〜4): [docs/ROADMAP.md](docs/ROADMAP.md)
+- 全機能の受入チェックと未検証事項: [docs/FEATURE_MATRIX.md](docs/FEATURE_MATRIX.md)
 
 ## 専用エディタとサポート範囲
 
@@ -14,7 +15,9 @@ VST3 ホストでプラグインを開くと、`in → 交換局 → out` の経
 ミックス／出力、コーデック詳細をまとめた専用エディタを表示します。
 ホストのオートメーションおよび保存状態と連動し、現在の経路で使わない
 コーデック設定は無効表示になります。配布ビルドでは利用できない
-コーデック設定を表示しません。Opus は引き続き CLI 専用です。
+コーデック設定を表示しません。個人ビルドでは Opus も in / out の経路から選べます。
+基本画面と Network / Speech・codecs / Channel effects / Packet format の4詳細ページを
+用意し、実際の入出力ピーク (dBFS)、パケット消失率、ジッタ、Opusモードを表示します。
 
 注意: 通常ビルド (JBM 無効) の経路リストと音声処理の値変換のずれを修正しました。
 パラメータ ID と保存済みの経路整数は維持しますが、旧版で記録した経路の
@@ -22,8 +25,10 @@ VST3 ホストでプラグインを開くと、`in → 交換局 → out` の経
 既存プロジェクトでは in / out の選択とオートメーションを確認してください。
 
 これは DAW 内の音声エフェクトです。電話発信、録音、外部ネットワーク通信は
-行いません。ロードマップの Tier 1〜4 は将来の研究・拡張項目を含み、
-すべてを実装済みとするものではありません。固定小数点 EVS は引き続き実験中です。
+行いません。Tier 1〜4 のローカル音声・パケット処理は追加実装しました。
+規格の正式エラーパターン、無線RF規格一致、公式FXベクタ試験、実DAWの画面・試聴は
+未検証です。具体的な範囲と残条件は受入チェック表に記載しています。
+固定小数点 EVS は公式完全ソースのパスを指定してビルドでき、旧stub実装は使用しません。
 
 ## クイックスタート
 
@@ -62,6 +67,27 @@ CLI は 16-bit 整数 PCM WAV (8〜192 kHz、1〜32 ch) を入力すると、各
 
 ## ルートとモード
 
+## 詳細シミュレーション
+
+詳細ネットワーク設定は `Independent network` / `--network-enabled 1` で有効化します。
+53個の追加制御はCLIでも同じキー・範囲で使えます (`--help`)。新機能は原則 opt-in、
+PSD雑音は既定で有効です。パケット書式にはRTP、AMR OA/BE、EVS Compact/Header-Full、REDを使用します。
+たとえば、独立ジッタ＋実パケット形式＋冗長復元のローカル変換:
+
+```sh
+TelephonyRunner input.wav --mode g711 --network-enabled 1 --jitter-ms 15 --jitter-distribution 1 --playback-delay-ms 40 --packet-format 1 --redundancy 1
+```
+
+DTMFは `--dtmf-digit 0..15` (0123456789*#ABCD)、無効は -1。
+EVS IOは `--mode evs_native --evs-amr-wb-io 1 --evs-io-mode 0..8`。
+Opus長は `--opus-frame-duration 0..5` (2.5/5/10/20/40/60ms)。
+強制モードは `--opus-force-mode 0..3` (Auto/SILK/Hybrid/CELT)で、
+同梱バージョンの非公開CTLを使用します。SILK/Hybridは10ms以上、HybridはSWB/FBかつ16kbps以上が必要です。
+受信FECの有無はToCの架空フラグで判断せず、実デコーダのFEC経路を使用します。
+
+音響モデルと制約は [AUDIO_MODELS](docs/AUDIO_MODELS.md)、
+パケット形式と計測は [TRANSPORT_MODELS](docs/TRANSPORT_MODELS.md) を参照してください。
+
 VST の経路は独立に劣化する 2 本のレグとしてモデル化されています:
 
 ```text
@@ -98,7 +124,11 @@ SC-VBR として処理します。8 kHz または NB の上限は 24.4 kbps で�
 
 バイパスはレイテンシ補正付きです(プラグインがホストへ報告するレイテンシと同じ
 遅延をドライ信号にも与えるので、バイパス切替で音の位置がずれません)。
-音声経路のバッファは 150 ms とし、ホストへ同じ遅延を報告します。
+基本バッファは150msです。詳細パケットの各レグのプレイアウト待機と一般コーデックの
+クロック差バッファを追加した固定処理遅延をホストへ報告し、ドライ／バイパスも補正します。
+Opus内部の固定待機も補正します。JBM経路は別で、参照受信機が決める適応的な待機／伸縮は
+時間変化するウェット音の効果として残ります。JBMのプレイアウト設定は安全余裕で、
+参照実装の初期最小待機(約60ms)や適応量まで固定値とみなして補正しません。
 16-bit 音声向けのリサンプラ設定 (96 dB 阻止帯域、10% 遷移帯域、最小位相) を使い、
 経路切替時はドライ／ウェットを一緒に初期化します。CLI で追加の遅延シミュレーションを
 無効化しても、コーデック経路の処理に必要なバッファは維持します。
@@ -110,7 +140,7 @@ SC-VBR として処理します。8 kHz または NB の上限は 24.4 kbps で�
 | -------------------------- | ------- | ---------------------------------------------------------------------- |
 | `TELEPHONY_BUILD_PLUGIN` | ON | VST3 と GUI をビルド。OFF は SDK を利用する headless 回帰テストと CLI のみ。 |
 | `TELEPHONY_VALIDATE_PLUGIN` | ON | VST3 ビルド後に Steinberg SDK validator でプラグインを検査。 |
-| `TELEPHONY_USE_EVS_FX`     | OFF     | 実験的な固定小数点 EVS (TS 26.442)。FX ライブラリと `TelephonyDSP` まではビルドできるが、`TelephonyRunner` の最終リンクが未解決シンボルでブロック中(詳細は [docs/CHANGELOG.md](docs/CHANGELOG.md))。 |
+| `TELEPHONY_USE_EVS_FX` | OFF | 公式 TS26.442 v16.4 固定小数点EVS。`TELEPHONY_EVS_FX_SOURCE_DIR` に完全な公式 c-code フォルダが必要。コード自体は再配布しません。[手順・検証](docs/EVS_FIXED_POINT.md) |
 | `TELEPHONY_USE_EVS_JBM`    | OFF     | 3GPP `EvsRXlib` を包む実験的な EVS Stage-1 JBM/VoIP 受信アダプタ (`evs_api_rx`) と `EVSJbmSmoke` をビルド。`TELEPHONY_DISTRIBUTION_BUILD`・`TELEPHONY_USE_EVS_FX` とは併用不可。 |
 | `TELEPHONY_DISTRIBUTION_BUILD` | OFF | AMR/AMR-WB/EVS 参照実装を除外し、配布可能なモードのみを公開。 |
 | `TELEPHONY_EXPERIMENTAL_NETWORK` | ON (配布ビルドでは強制 OFF) | SpeexDSP + Opus をビルドし `OPUS_VOIP` モードを公開 (BSD ライセンス)。 |
@@ -175,7 +205,7 @@ ctest --test-dir out/build/headless --output-on-failure
 │   └── vo-amrwbenc.cmake
 ├── evs_api.h              # 3GPP EVS ラッパーの公開 C API
 ├── evs_api.c              # 浮動小数点版(完全インメモリ、ファイルI/Oなし)
-├── evs_api_fx.c           # 固定小数点版(実験的 / リンクブロック中)
+├── evs_api_fx.c           # 公式完全ソース向け固定小数点C API
 ├── evs_api_rx.h / .c      # EVS JBM/VoIP 受信アダプタ (TELEPHONY_USE_EVS_JBM)
 ├── dsp/                   # 経路対応 SignalProcessor、コーデック別クラス、
 │                          # PLC、リサンプラ/フィルタチェーン(クラス毎に27ファイル)

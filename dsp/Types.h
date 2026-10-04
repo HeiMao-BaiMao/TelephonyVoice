@@ -33,8 +33,9 @@ enum class EraMode {
         Mobile5G,
         Mobile5GNative,
 #if TELEPHONY_USE_EVS_JBM
-        Mobile5GJbm
+        Mobile5GJbm,
 #endif
+        Opus = 100
     };
 
     enum class DegradationSegment {
@@ -59,7 +60,12 @@ inline EraMode distributionSafeMode(EraMode m) {
     }
 }
 #else
-inline EraMode distributionSafeMode(EraMode m) { return m; }
+inline EraMode distributionSafeMode(EraMode m) {
+#if !TELEPHONY_EXPERIMENTAL_NETWORK
+    if(m==EraMode::OPUS_VOIP) return EraMode::EVS_LIKE;
+#endif
+    return m;
+}
 #endif
 
 inline int clampToInt16(float v) {

@@ -6,6 +6,10 @@ file(GLOB VO_AMRWBENC_SOURCES
     "${VO_AMRWBENC_ROOT}/amrwbenc/src/*.c"
 )
 
+# Keep the pinned submodule untouched. Its optimized Copy prefetches beyond
+# the caller's vector (ASan catches isf_init in E_IF_init); use bounded loops.
+list(REMOVE_ITEM VO_AMRWBENC_SOURCES "${VO_AMRWBENC_ROOT}/amrwbenc/src/util.c")
+list(APPEND VO_AMRWBENC_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/helpers/amrwb_util_safe.c")
 add_library(vo-amrwbenc STATIC ${VO_AMRWBENC_SOURCES})
 
 target_include_directories(vo-amrwbenc PUBLIC

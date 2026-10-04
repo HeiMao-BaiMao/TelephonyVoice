@@ -1,5 +1,7 @@
 #include <cstring>
 #include "dsp/EvsCodecJbm.h"
+#include "dsp/EvsCodec.h"
+#include <array>
 #include <cmath>
 
 namespace TelephonyDSP {
@@ -31,51 +33,14 @@ namespace TelephonyDSP {
         , cfgPacketLossRate(0.0f)
         , cfgNetworkDegradation(0.0f)
     {
-        fallbackPLC.reset(getFrameSize());
-
-        // Normalize the requested SID interval to the set evs_enc_create_ex
-        // accepts (0 or 3..100). Any other value is clamped to 0 to keep
-        // the legacy behaviour and to avoid a configuration rejection.
-        dtxSidInterval = (dtxSidInterval == 0) ? 0
-                       : ((dtxSidInterval >= 3 && dtxSidInterval <= 100) ? dtxSidInterval : 0);
-
-        // Reserve queue capacity so the FIFO never reallocates during
-        // steady-state operation. Bounded by kMaxQueueSize.
+        this->dtxSidInterval = dtxSidInterval >= 3 && dtxSidInterval <= 100 ? dtxSidInterval : 0;
+        fixedBitrateBps = bitrateBps == 5900 ? 13200 : bitrateBps; fixedMaxBw = maxBw;
         jbmQueue.reserve(kMaxQueueSize);
-
-        // Match EVSCodec's DTX options. The JBM does not see DTX/SID
-        // frames specially (they are still valid AUs in the JBM's MSB-
-        // first compact format), so the encoder's DTX/CNG output is
-        // pushed through unchanged. SC-VBR (Source-Controlled VBR) is
-        // opt-in via the ctor flag and is also re-applied in reset()
-        // below.
-        EVS_EncOptions opts;
-        evs_enc_options_init(&opts);
-        opts.dtx_enable       = 1;
-        opts.dtx_sid_interval = dtxSidInterval;  // 0 = variable SID (see evs_api.h)
-        opts.rf_enable        = 0;  // RF enabled later via evs_enc_set_rf
-        opts.sc_vbr_enable    = scVbrEnabled ? 1 : 0;
-        rfActive = (bitrateBps == EVS_BR_13200 && sampleRate >= 16000);
-        lastAppliedFecOffset = -1;
-        lastAppliedFecHi     = -1;
-        enc = evs_enc_create_ex(sampleRate, bitrateBps, maxBw, &opts);
-        if (!enc) {
-            // Fall back to the legacy entry point on configuration
-            // rejection so the codec still encodes.
-            enc = evs_enc_create(sampleRate, bitrateBps, maxBw);
-        }
-
-        // Stage-1 JBM/VoIP receive adapter. jbm_safety_margin_ms=0 is
-        // clamped to the reference default (60 ms) inside the adapter.
-        rx = evs_rx_jbm_create(sampleRate, bitrateBps, 0);
-
-        // Encoder bitstream scratch (G.192 short-stream), sized to the
-        // worst-case AU at the configured sample rate.
         bitstream.resize(evs_max_bitstream_bytes(sampleRate));
-        // Compact MSB-first AU scratch: 320 bytes covers the 2560-bit
-        // worst case (MAX_BITS_PER_FRAME). The helper's own
-        // EVS_RX_G192_MAX_AU_BYTES is 320, so we match that exactly.
         compactAu.assign(320, 0);
+        pendingEncoderPcm.reserve((size_t)getFrameSize() * 2 + 4);
+        encodedBatch.reserve(2); arrivedBatch.reserve(kMaxQueueSize);
+        reset();
     }
 
     EVSCodecJbm::~EVSCodecJbm() {
@@ -84,6 +49,11 @@ namespace TelephonyDSP {
     }
 
     void EVSCodecJbm::reset() {
+        resetImpairments(); activeBw = pendingBw = maxBw; bandwidthHold = 0;
+        receiverClockMs = lastSourcePlayoutMs = 0; havePlayoutClock = false;
+        sourceSampleAccumulator = 0; previousSourceSample = 0; havePreviousSourceSample = false;
+        generatedSourceSamples = encodedFrameCount = 0;
+        pendingEncoderPcm.clear(); encodedBatch.clear(); arrivedBatch.clear();
         fallbackPLC.reset(getFrameSize());
         frameIndex = 0;
         rtpSeq     = 0;
@@ -101,26 +71,26 @@ namespace TelephonyDSP {
         if (enc) { evs_enc_destroy(enc); enc = nullptr; }
         EVS_EncOptions opts;
         evs_enc_options_init(&opts);
-        opts.dtx_enable       = 1;
+        opts.dtx_enable       = dtxEnabled ? 1 : 0;
         opts.dtx_sid_interval = dtxSidInterval;
         opts.rf_enable        = (bitrateBps == EVS_BR_13200 && sampleRate >= 16000) ? 1 : 0;
         opts.rf_fec_offset   = 0;     // use FEC_OFFSET default (3)
         opts.rf_fec_hi       = 1;
         opts.sc_vbr_enable    = scVbrEnabled ? 1 : 0;
-        const bool rfOk = (opts.rf_enable == 1);
-        rfActive             = rfOk;
-        lastAppliedFecOffset = -1;    // force first apply
-        lastAppliedFecHi     = -1;
-        enc = evs_enc_create_ex(sampleRate, bitrateBps, maxBw, &opts);
-        if (!enc) {
-            enc = evs_enc_create(sampleRate, bitrateBps, maxBw);
+        int rate = bitrateBps; auto bandwidth = maxBw;
+        if (evs_enc_normalize_config(sampleRate, &rate, &bandwidth, &opts) == EVS_OK) {
+            bitrateBps = rate; maxBw = activeBw = pendingBw = bandwidth;
+            scVbrEnabled = opts.sc_vbr_enable != 0;
+            enc = evs_enc_create_ex(sampleRate, rate, bandwidth, &opts);
         }
+        rfActive = opts.rf_enable != 0;
+        lastAppliedFecOffset = lastAppliedFecHi = -1;
 
         // Tear down + recreate the JBM. EVS_RX_Close destroys the
         // embedded Decoder_State contents; the adapter frees its
         // own Decoder_State allocation, so this is a full reset.
         if (rx) { evs_rx_jbm_destroy(rx); rx = nullptr; }
-        rx = evs_rx_jbm_create(sampleRate, bitrateBps, 0);
+        rx = evs_rx_jbm_create_ex(sampleRate, bitrateBps, safetyMarginMs);
     }
 
     void EVSCodecJbm::configureNetwork(float packetLossRate, float networkDegradation) {
@@ -144,12 +114,7 @@ namespace TelephonyDSP {
             return;
         }
         dtxSidInterval = normalized;
-        // The encoder was created with the previous dtx_sid_interval; the
-        // only way to push a new value is to tear it down and recreate it
-        // through reset(), which re-reads dtxSidInterval. reset() also
-        // rebuilds the JBM, which is fine because dtx_sid_interval does
-        // not feed any JBM state.
-        reset();
+        applyConfiguration(bitrateBps, activeBw, false);
     }
 
     int EVSCodecJbm::jbmArrivalOffsetMs() {
@@ -214,6 +179,7 @@ namespace TelephonyDSP {
         // ignored: the JBM will conceal any slot that didn't make it
         // in, which is exactly the behaviour we want for late / lost
         // packets.
+        std::stable_sort(jbmQueue.begin(), jbmQueue.end(), [](const JbmPacket& a, const JbmPacket& b) { return a.recvMs < b.recvMs; });
         size_t i = 0;
         for (; i < jbmQueue.size(); ++i) {
             if (jbmQueue[i].recvMs > sysMs) {
@@ -246,52 +212,82 @@ namespace TelephonyDSP {
     void EVSCodecJbm::processFrame(const int16_t* in, int16_t* out, bool packetLost) {
         const int fs = getFrameSize();
 
-        // Deterministic 20 ms timeline, advanced exactly once per
-        // input frame (not per successful encode) so the JBM sees a
-        // gap-free RTP timestamp stream even when a packet is dropped.
-        const uint32_t t_ms = frameIndex * 20u;
-        const uint16_t seq  = (uint16_t)rtpSeq;
+        // Receiver deadlines run at one 20 ms sound-card slot per call.
+        // A separate source resampling clock creates 0/1/2 encoded packets,
+        // so clock mismatch changes queue occupancy and reaches the real APA.
+        const uint32_t t_ms = frameIndex++ * 20u;
+        const double sourceRatio = 1.0 / (1.0 + clockDriftPpm * 1e-6);
+        estimateBandwidth(in);
+        for (int i = 0; i < fs; ++i) {
+            const int16_t current = dtxEnabled && hasVoiceActivity && !voiceActive ? 0 : in[i];
+            if (!havePreviousSourceSample) { previousSourceSample = current; havePreviousSourceSample = true; }
+            sourceSampleAccumulator += sourceRatio;
+            while (sourceSampleAccumulator >= 1.0) {
+                const double fraction = std::clamp(1.0 - (sourceSampleAccumulator - 1.0) / sourceRatio, 0.0, 1.0);
+                const double value = previousSourceSample + fraction * (current - (double)previousSourceSample);
+                pendingEncoderPcm.push_back((int16_t)std::clamp(std::lround(value), -32768l, 32767l));
+                ++generatedSourceSamples; sourceSampleAccumulator -= 1.0;
+            }
+            previousSourceSample = current;
+        }
+        encodedBatch.clear();
+        size_t consumed = 0;
+        while (pendingEncoderPcm.size() - consumed >= (size_t)fs) {
+            int used = 0, bits = 0;
+            const bool encoded = enc && evs_enc_process(enc, pendingEncoderPcm.data() + consumed, fs,
+                bitstream.data(), (int)bitstream.size(), &used) == EVS_OK;
+            if (enc) evs_enc_get_last_frame_info(enc, &bits, nullptr, nullptr);
+            if (encoded) corruptG192(bitstream.data(), (size_t)used);
+            CodecEncodedPacket packet;
+            packet.info = {CodecPacketFormat::EVSG192, sampleRate, fs, bits == 0 || bits == 48};
+            packet.sequence = encodedFrameCount++;
+            packet.sourceTimestampMs = (double)packet.sequence * 20.0;
+            packet.lost = packetLost || !encoded;
+            if (encoded) packet.payload.assign(bitstream.begin(), bitstream.begin() + used);
+            encodedBatch.push_back(std::move(packet));
+            ++rtpSeq; consumed += (size_t)fs;
+        }
+        if (consumed) pendingEncoderPcm.erase(pendingEncoderPcm.begin(), pendingEncoderPcm.begin() + (std::ptrdiff_t)consumed);
 
-        // Always advance the timeline + sequence number, even on
-        // packet loss: the JBM/decoder needs to know which slot was
-        // missed in order to conceal it deterministically.
-        frameIndex++;
-        rtpSeq++;
-
-        // ----- Drain queue (deliver past-due arrivals first) -----
-        // Pull every queued packet whose recvMs is <= the current
-        // system time so the JBM gets any late arrivals before we
-        // push the next fresh AU on top.
-        jbmDrain(t_ms);
-
-        // ----- Encode side -----
-        // Only encode and enqueue a new AU when the caller's network
-        // model did not drop this frame. If we have no encoder handle
-        // (e.g. both _ex and legacy create failed) we fall through to
-        // the "no feed" path and let the JBM conceal.
-        int nb_bits = 0;
-        bool have_au = false;
-        if (!packetLost && enc && rx) {
-            int used = 0;
-            if (evs_enc_process(enc, in, fs, bitstream.data(),
-                                (int)bitstream.size(), &used) == EVS_OK) {
-                nb_bits = evs_rx_jbm_g192_to_compact_au(
-                    bitstream.data(), used,
+        if (packetTransport && packetTransport->supportsBatchIngress()) {
+            packetTransport->exchangeBatch(encodedBatch, t_ms, arrivedBatch);
+            for (const auto& received : arrivedBatch) {
+                const int bits = evs_rx_jbm_g192_to_compact_au(received.payload.data(), (int)received.payload.size(),
                     compactAu.data(), (int)compactAu.size());
-                if (nb_bits > 0) {
-                    have_au = true;
+                if (rx && bits > 0 && received.hasTiming)
+                    evs_rx_jbm_feed_frame(rx, compactAu.data(), bits, (uint16_t)received.sequence,
+                        (uint32_t)std::max(0.0, std::round(received.sourceTimestampMs)),
+                        (uint32_t)std::max(0.0, std::round(received.arrivalTimeMs)));
+            }
+        } else {
+            // Direct/capture transports retain their synchronous compatibility
+            // path. Without an external transport the encoded queue is clocked
+            // solely by receiver time, independent of source RTP timestamps.
+            jbmDrain(t_ms);
+            for (const auto& packet : encodedBatch) {
+                const bool received = exchangePacket(CodecPacketFormat::EVSG192, packet.payload.data(),
+                    packet.payload.size(), packet.lost, packet.info.dtx);
+                if (!received) continue;
+                const int bits = evs_rx_jbm_g192_to_compact_au(playout.payload.data(), (int)playout.payload.size(),
+                    compactAu.data(), (int)compactAu.size());
+                if (bits <= 0 || !rx) continue;
+                if (packetTransport) {
+                    const uint16_t originalSeq = playout.hasTiming ? (uint16_t)playout.sequence : (uint16_t)packet.sequence;
+                    const uint32_t sourceTs = playout.hasTiming ? (uint32_t)std::max(0.0, std::round(playout.sourceTimestampMs)) : (uint32_t)packet.sourceTimestampMs;
+                    const uint32_t arrival = playout.hasTiming ? (uint32_t)std::max(0.0, std::round(playout.arrivalTimeMs)) : t_ms;
+                    evs_rx_jbm_feed_frame(rx, compactAu.data(), bits, originalSeq, sourceTs, arrival);
+                } else {
+                    JbmPacket queued; queued.auBits = bits; queued.seq = (uint16_t)packet.sequence;
+                    queued.rtpTsMs = (uint32_t)packet.sourceTimestampMs;
+                    queued.recvMs = t_ms + (uint32_t)jbmArrivalOffsetMs();
+                    queued.au.assign(compactAu.begin(), compactAu.begin() + (bits + 7) / 8);
+                    jbmQueue.push_back(std::move(queued)); jbmTrim();
                 }
             }
         }
-
-        // ----- JBM feed via the deterministic arrival queue -----
-        if (have_au) {
-            // Enqueue this AU with a deterministic recvMs offset.
-            // We do NOT feed the JBM directly any more: jbmDrain() at
-            // the top of the next processFrame() call will pick this
-            // packet up the moment its recvMs is in the past.
-            jbmEnqueue(compactAu.data(), nb_bits, seq, t_ms);
-        }
+        receiverClockMs = (double)frameIndex * 20.0;
+        lastSourcePlayoutMs = generatedSourceSamples * 1000.0 / sampleRate;
+        const uint32_t receiverMs = t_ms;
 
         // ----- JBM pull (always one 20 ms output frame) -----
         // We always pull, even on packet loss, so the contract
@@ -310,9 +306,10 @@ namespace TelephonyDSP {
         if (rx) {
             int n = 0;
             if (evs_rx_jbm_get_samples(rx, pcmBuf, fs,
-                                       (unsigned int)t_ms, &n) == EVS_OK
+                                       (unsigned int)receiverMs, &n) == EVS_OK
                 && n == fs) {
                 std::memcpy(out, pcmBuf, fs * sizeof(int16_t));
+                applyDtxOutput(out, evs_rx_jbm_in_dtx(rx) != 0);
                 fallbackPLC.storeGoodFrame(out, fs);
                 // After a successful pull, read the JBM's latest
                 // channel-aware FEC estimate and push it into the
@@ -345,6 +342,61 @@ namespace TelephonyDSP {
             fallbackPLC.storeGoodFrame(out, fs);
         }
     }
+    void EVSCodecJbm::setSafetyMarginMs(int milliseconds) {
+        const int normalized = std::clamp(milliseconds, 0, 1000);
+        if (normalized == safetyMarginMs) return;
+        safetyMarginMs = normalized; reset();
+    }
+    bool EVSCodecJbm::isWarmingUp() const { return !evs_rx_jbm_has_started(rx); }
+    void EVSCodecJbm::setClockDriftPpm(double ppm) {
+        clockDriftPpm = std::isfinite(ppm) ? std::clamp(ppm, -50.0, 50.0) : 0.0;
+    }
+    bool EVSCodecJbm::applyConfiguration(int bitrate, EVS_Bandwidth bw, bool storeCeiling) {
+        const int requestedBitrate = bitrate; const auto requestedBw = bw;
+        EVS_EncOptions opts; evs_enc_options_init(&opts);
+        opts.dtx_enable = dtxEnabled; opts.dtx_sid_interval = dtxSidInterval;
+        opts.sc_vbr_enable = scVbrEnabled;
+        opts.rf_enable = bitrate == 13200 && sampleRate >= 16000 && bw != EVS_NB;
+        if (evs_enc_normalize_config(sampleRate, &bitrate, &bw, &opts) != EVS_OK || !enc ||
+            evs_enc_reconfigure(enc, bitrate, bw, &opts) != EVS_OK) return false;
+        if (storeCeiling && opts.sc_vbr_enable && requestedBitrate != 5900) {
+            auto fixedOpts = opts; fixedOpts.sc_vbr_enable = 0;
+            int fixedRate = requestedBitrate; auto fixedBw = requestedBw;
+            if (evs_enc_normalize_config(sampleRate, &fixedRate, &fixedBw, &fixedOpts) == EVS_OK) {
+                fixedBitrateBps = fixedRate; fixedMaxBw = fixedBw;
+            }
+        }
+        bitrateBps = bitrate; activeBw = bw; if (storeCeiling) maxBw = bw;
+        if (storeCeiling && !scVbrEnabled) { fixedBitrateBps = bitrate; fixedMaxBw = bw; }
+        rfActive = opts.rf_enable != 0; lastAppliedFecOffset = lastAppliedFecHi = -1;
+        return true;
+    }
+    bool EVSCodecJbm::reconfigure(int bitrate, EVS_Bandwidth bw) { return applyConfiguration(bitrate, bw, true); }
+    void EVSCodecJbm::configureDtx(bool enabled, bool pureSilence) {
+        const bool changed = enabled != dtxEnabled;
+        ICodec::configureDtx(enabled, pureSilence);
+        if (changed) applyConfiguration(bitrateBps, activeBw, false);
+    }
+    void EVSCodecJbm::setScVbrEnabled(bool enabled) {
+        if (enabled == scVbrEnabled) return;
+        const bool before = scVbrEnabled;
+        if (enabled) { fixedBitrateBps = bitrateBps; fixedMaxBw = maxBw; }
+        scVbrEnabled = enabled;
+        if (!reconfigure(enabled ? 5900 : fixedBitrateBps, enabled ? maxBw : fixedMaxBw)) scVbrEnabled = before;
+    }
+    void EVSCodecJbm::setAutoBandwidth(bool enabled) {
+        if (enabled == autoBandwidth) return;
+        autoBandwidth = enabled; bandwidthHold = 0;
+        if (!enabled) applyConfiguration(bitrateBps, maxBw, false);
+    }
+    void EVSCodecJbm::estimateBandwidth(const int16_t* input) {
+        if (!autoBandwidth) return;
+        auto candidate = estimateEvsInputBandwidth(input, getFrameSize(), sampleRate, maxBw, activeBw);
+        if (candidate == EVS_NB && bitrateBps > 24400) candidate = EVS_WB;
+        if (candidate != pendingBw) { pendingBw = candidate; bandwidthHold = 1; } else ++bandwidthHold;
+        if (pendingBw != activeBw && bandwidthHold >= (pendingBw > activeBw ? 2 : 8))
+            applyConfiguration(bitrateBps, pendingBw, false);
+    }
 #else // TELEPHONY_DISTRIBUTION_BUILD
     // Distribution-build stub: keeps the symbol table clean while the
     // experimental mode is hidden by distributionSafeMode. The stub
@@ -365,6 +417,11 @@ namespace TelephonyDSP {
     }
     EVSCodecJbm::~EVSCodecJbm() {}
     void EVSCodecJbm::reset() {
+        resetImpairments(); activeBw = pendingBw = maxBw; bandwidthHold = 0;
+        receiverClockMs = lastSourcePlayoutMs = 0; havePlayoutClock = false;
+        sourceSampleAccumulator = 0; previousSourceSample = 0; havePreviousSourceSample = false;
+        generatedSourceSamples = encodedFrameCount = 0;
+        pendingEncoderPcm.clear(); encodedBatch.clear(); arrivedBatch.clear();
         fallbackPLC.reset(getFrameSize());
         frameIndex = 0;
         rtpSeq = 0;
@@ -414,6 +471,15 @@ namespace TelephonyDSP {
             jbmQueue.erase(jbmQueue.begin(), jbmQueue.begin() + (std::ptrdiff_t)excess);
         }
     }
+    void EVSCodecJbm::setSafetyMarginMs(int milliseconds) { safetyMarginMs = std::clamp(milliseconds, 0, 1000); }
+    bool EVSCodecJbm::isWarmingUp() const { return false; }
+    void EVSCodecJbm::setClockDriftPpm(double ppm) { clockDriftPpm = std::isfinite(ppm) ? std::clamp(ppm, -50.0, 50.0) : 0.0; }
+    bool EVSCodecJbm::applyConfiguration(int, EVS_Bandwidth, bool) { return false; }
+    bool EVSCodecJbm::reconfigure(int, EVS_Bandwidth) { return false; }
+    void EVSCodecJbm::configureDtx(bool enabled, bool pureSilence) { ICodec::configureDtx(enabled, pureSilence); }
+    void EVSCodecJbm::setScVbrEnabled(bool enabled) { scVbrEnabled = enabled; }
+    void EVSCodecJbm::setAutoBandwidth(bool enabled) { autoBandwidth = enabled; }
+    void EVSCodecJbm::estimateBandwidth(const int16_t*) {}
 #endif // !TELEPHONY_DISTRIBUTION_BUILD
 #endif // TELEPHONY_USE_EVS_JBM
 

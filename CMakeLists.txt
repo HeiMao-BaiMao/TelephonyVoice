@@ -99,60 +99,7 @@ else()
     set(EVS_API_LIBS evs-lib-enc evs-lib-dec)
 endif()
 
-# ---------------------------------------------------------------------------
-# Source-specific forced-include for evs_api_fx.c (parent-only FX build)
-#
-# cmake/3gpp-evs.cmake generates an FX typedef shim that maps Word16/Word32
-# to the fixed-point types, pre-defines the float lib_com/cnst.h guard
-# (CNST_H), pre-defines the float lib_com/typedef.h guards (TYPEDEF_H /
-# _TYPEDEF_H), and overrides the broken lib_com/control.h FOR/WHILE/DO/IF/
-# ELSE/SWITCH/CONTINUE/BREAK/GOTO macros.  This shim is force-included into
-# every translation unit of evs-lib-{com,enc,dec}-fx, but the parent-repo
-# C wrapper evs_api_fx.c lives in TelephonyDSP - not in those targets -
-# so it does not currently see the shim.
-#
-# Apply the shim to evs_api_fx.c ONLY, never to the rest of TelephonyDSP:
-#   - The C++ sources use the all-caps identifiers `FOR`, `WHILE`, etc. in
-#     legitimate ways (none today, but new C++ code might), and remapping
-#     `Mpy_32_16` -> `evs_fx_Mpy_32_16_2arg` globally would poison anything
-#     that touches basic_math/oper_32b.h transitively.
-#   - `Word16` / `Word32` / `UWord16` / `UWord32` are FX-only types that
-#     must not leak into C++ TUs that include only the float headers.
-#
-# set_source_files_properties applied to the absolute path used in
-# EVS_API_SRC above is the canonical CMake mechanism for this; it must
-# happen before add_library(TelephonyDSP ...) so the generator picks up
-# the per-file COMPILE_OPTIONS when it writes the build.ninja rule.
-#
-# EVS_FX_TYPEDEF_SHIM and EVS_FX_INCLUDE_DIRS are both defined inside the
-# `if(TELEPHONY_USE_EVS_FX)` block of cmake/3gpp-evs.cmake (which has
-# already been included by this point via the `include(cmake/3gpp-evs.cmake)`
-# call in the External Libraries section above), so they are visible here.
-# Include directories are already propagated transitively from
-# evs-lib-{com,enc,dec}-fx (PUBLIC link with PUBLIC include_directories),
-# so we do NOT need to add EVS_FX_INCLUDE_DIRS to the source here - we
-# only need to attach the force-include option.  We attach it explicitly
-# anyway, as a safety net, so the source compiles even if a future
-# refactor flips the FX libs to PRIVATE include directories.
-# ---------------------------------------------------------------------------
-if(TELEPHONY_USE_EVS_FX)
-    if(MSVC)
-        # MSVC uses /FI<path> (no space).  The path is absolute because
-        # EVS_FX_TYPEDEF_SHIM is set to
-        # "${CMAKE_CURRENT_BINARY_DIR}/evs_fx_shim/evs_fx_typedef_shim.h".
-        set_source_files_properties("${EVS_API_SRC}" PROPERTIES
-            INCLUDE_DIRECTORIES "${EVS_FX_INCLUDE_DIRS}"
-            COMPILE_OPTIONS    "/FI${EVS_FX_TYPEDEF_SHIM}"
-        )
-    else()
-        # GCC/Clang use -include <path> (with space).  CMake's
-        # COMPILE_OPTIONS is a list, so split the option from its value.
-        set_source_files_properties("${EVS_API_SRC}" PROPERTIES
-            INCLUDE_DIRECTORIES "${EVS_FX_INCLUDE_DIRS}"
-            COMPILE_OPTIONS    "-include;${EVS_FX_TYPEDEF_SHIM}"
-        )
-    endif()
-endif()
+set_source_files_properties(dsp/OpusCodec.cpp PROPERTIES INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/external/opus/celt")
 
 add_library(TelephonyDSP STATIC
     dsp/RingBuffer.cpp
@@ -165,6 +112,12 @@ add_library(TelephonyDSP STATIC
     dsp/EvsCodecJbm.cpp
     dsp/OpusCodec.cpp
     dsp/SpeexDSPAux.cpp
+    dsp/AdvancedControls.h
+    dsp/AudioSimulation.cpp
+    dsp/NetworkProfile.cpp
+    dsp/Transport.cpp
+    dsp/TransportEvs.cpp
+    dsp/ChannelTransport.cpp
     dsp/ChannelProcessor.cpp
     dsp/SignalProcessor.cpp
     ${EVS_API_SRC}
@@ -292,6 +245,14 @@ if(MSVC)
     endforeach()
 endif()
 
+if(NOT TELEPHONY_DISTRIBUTION_BUILD)
+    target_sources(opencore-amrnb PRIVATE
+        dsp/AudioSimulationVad2.cpp
+        dsp/AudioSimulationVad2Core.cpp
+        dsp/AudioSimulationVad2Fft.cpp)
+    target_compile_definitions(TelephonyDSP PRIVATE TELEPHONY_HAVE_VAD2=1)
+endif()
+
 # ---------------------------------------------------------------------------
 # TelephonyRunner (Sample EXE)
 # ---------------------------------------------------------------------------
@@ -313,11 +274,10 @@ endif()
 # configuration through SignalProcessor and, on non-distribution builds,
 # round-trips the raw EVS C API including the DTX SID/NO_DATA path.
 #
-# Skipped under TELEPHONY_USE_EVS_FX because that variant is still
-# link-blocked (see README) - any executable linking TelephonyDSP would
-# fail to link there.
+# The same application regressions run for the complete official FX source
+# path. Optional reference tools add byte-for-byte synthetic differential tests.
 # ---------------------------------------------------------------------------
-if(NOT TELEPHONY_USE_EVS_FX)
+if(BUILD_TESTING OR NOT DEFINED BUILD_TESTING)
     enable_testing()
 
     add_executable(TelephonyDspSmoke tests/TelephonyDspSmoke.cpp)
@@ -328,6 +288,50 @@ if(NOT TELEPHONY_USE_EVS_FX)
     endif()
 
     add_test(NAME dsp_smoke COMMAND TelephonyDspSmoke)
+
+    add_executable(TelephonyAdvancedEdgeCases tests/AdvancedEdgeCases.cpp)
+    target_link_libraries(TelephonyAdvancedEdgeCases PRIVATE TelephonyDSP)
+    add_test(NAME advanced_edge_cases COMMAND TelephonyAdvancedEdgeCases)
+    set_tests_properties(advanced_edge_cases PROPERTIES TIMEOUT 180)
+
+    add_executable(TelephonyAdvancedIntegration tests/AdvancedIntegration.cpp)
+    target_link_libraries(TelephonyAdvancedIntegration PRIVATE TelephonyDSP)
+    add_test(NAME advanced_integration COMMAND TelephonyAdvancedIntegration)
+    set_tests_properties(advanced_integration PROPERTIES TIMEOUT 180)
+
+    add_executable(TelephonyCodecControls tests/TelephonyCodecControls.cpp)
+    target_link_libraries(TelephonyCodecControls PRIVATE TelephonyDSP)
+    add_test(NAME codec_controls COMMAND TelephonyCodecControls)
+    set_tests_properties(codec_controls PROPERTIES TIMEOUT 120)
+
+    add_executable(TelephonyTransportTests tests/TransportTests.cpp)
+    target_link_libraries(TelephonyTransportTests PRIVATE TelephonyDSP)
+    add_test(NAME transport_protocols COMMAND TelephonyTransportTests)
+    add_executable(TelephonyTransportEvsTests tests/TransportEvsTests.cpp)
+    target_link_libraries(TelephonyTransportEvsTests PRIVATE TelephonyDSP)
+    add_test(NAME transport_evs COMMAND TelephonyTransportEvsTests)
+    add_executable(TelephonyTransportIntegrationTests tests/TransportIntegrationTests.cpp)
+    target_link_libraries(TelephonyTransportIntegrationTests PRIVATE TelephonyDSP)
+    add_test(NAME transport_integration COMMAND TelephonyTransportIntegrationTests)
+    set_tests_properties(transport_protocols transport_evs transport_integration PROPERTIES TIMEOUT 120)
+    add_executable(TelephonyTransportBatchTests tests/TransportBatchTests.cpp)
+    target_link_libraries(TelephonyTransportBatchTests PRIVATE TelephonyDSP)
+    add_test(NAME transport_batch_ingress COMMAND TelephonyTransportBatchTests)
+    set_tests_properties(transport_batch_ingress PROPERTIES TIMEOUT 120)
+    if(NOT TELEPHONY_DISTRIBUTION_BUILD)
+        add_executable(TelephonyTransportAmrCodecTests tests/TransportAmrCodecTests.cpp)
+        target_link_libraries(TelephonyTransportAmrCodecTests PRIVATE TelephonyDSP)
+        add_test(NAME transport_amr_codecs COMMAND TelephonyTransportAmrCodecTests)
+        set_tests_properties(transport_amr_codecs PROPERTIES TIMEOUT 120)
+    endif()
+
+    add_executable(TelephonyAudioSimulationTests tests/AudioSimulationTests.cpp)
+    target_link_libraries(TelephonyAudioSimulationTests PRIVATE TelephonyDSP)
+    if(NOT TELEPHONY_DISTRIBUTION_BUILD)
+        target_compile_definitions(TelephonyAudioSimulationTests PRIVATE TELEPHONY_HAVE_VAD2=1)
+    endif()
+    add_test(NAME audio_simulation COMMAND TelephonyAudioSimulationTests)
+    set_tests_properties(audio_simulation PROPERTIES TIMEOUT 120)
 
     add_executable(TelephonyDspRegression tests/TelephonyDspRegression.cpp)
     target_link_libraries(TelephonyDspRegression PRIVATE TelephonyDSP)
@@ -364,7 +368,24 @@ if(NOT TELEPHONY_USE_EVS_FX)
             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/ValidateEditor.py)
     endif()
 
+    if(TELEPHONY_USE_EVS_FX AND TELEPHONY_BUILD_EVS_FX_REFERENCE_TOOLS AND Python3_Interpreter_FOUND)
+        add_test(NAME evs_fx_api_regressions COMMAND TelephonyEvsFxApiRegression)
+        add_test(NAME evs_fx_differential COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/EvsFxDifferential.py
+            --encoder $<TARGET_FILE:TelephonyEvsFxReferenceEncoder>
+            --decoder $<TARGET_FILE:TelephonyEvsFxReferenceDecoder>
+            --adapter $<TARGET_FILE:TelephonyEvsFxReferenceAdapter>)
+        set_tests_properties(evs_fx_differential PROPERTIES TIMEOUT 600)
+    endif()
     if(TELEPHONY_USE_EVS_JBM)
+        add_executable(TelephonyJbmClockDrift tests/JbmClockDrift.cpp)
+        target_link_libraries(TelephonyJbmClockDrift PRIVATE TelephonyDSP)
+        if(UNIX AND NOT APPLE)
+            target_link_options(TelephonyJbmClockDrift PRIVATE -Wl,--wrap=apa_set_scale -Wl,--wrap=apa_exec)
+            target_compile_definitions(TelephonyJbmClockDrift PRIVATE TELEPHONY_TEST_APA_WRAP=1)
+        endif()
+        add_test(NAME jbm_clock_drift COMMAND TelephonyJbmClockDrift)
+        set_tests_properties(jbm_clock_drift PROPERTIES TIMEOUT 600)
         add_test(NAME evs_jbm_smoke COMMAND EVSJbmSmoke)
         set_tests_properties(evs_jbm_smoke PROPERTIES TIMEOUT 120)
     endif()

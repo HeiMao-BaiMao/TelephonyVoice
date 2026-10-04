@@ -1,6 +1,8 @@
 #include "TelephonyVoice.h"
 #include "pluginterfaces/vst/vsttypes.h"
 #include "pluginterfaces/vst/ivstparameterchanges.h"
+#include "pluginterfaces/vst/ivstprocesscontext.h"
+#include "pluginterfaces/base/ustring.h"
 #include "base/source/fstreamer.h"
 #include <algorithm>
 #include <cmath>
@@ -34,6 +36,43 @@ constexpr int32 kMaxExposedEndpoint = 5;
 constexpr int32 kDefaultOutputEndpoint = 5;
 #endif
 constexpr int32 kMaxDegradationSegment = 3;
+constexpr int32 kOpusEndpoint = 100;
+#if defined(TELEPHONY_DISTRIBUTION_BUILD) || !TELEPHONY_EXPERIMENTAL_NETWORK
+constexpr int32 kModernMaxEndpoint = kMaxExposedEndpoint; // Opus is excluded from this build.
+#else
+constexpr int32 kModernMaxEndpoint = kMaxExposedEndpoint + 1;
+#endif
+constexpr uint32 kStateExtensionMagic = 0x58415654; // TVAX, little endian
+constexpr uint32 kStateExtensionVersion = 1;
+constexpr double kLatencyNormalization = 384000.0;
+static int32 validEndpoint(int32 endpoint) {
+    if (endpoint == kOpusEndpoint) {
+#if !defined(TELEPHONY_DISTRIBUTION_BUILD) && TELEPHONY_EXPERIMENTAL_NETWORK
+        return endpoint;
+#elif defined(TELEPHONY_DISTRIBUTION_BUILD)
+        return 2;
+#else
+        return 4;
+#endif
+    }
+    return std::clamp(endpoint, 0, kMaxExposedEndpoint);
+}
+static int32 legacyEndpoint(int32 endpoint) {
+#ifdef TELEPHONY_DISTRIBUTION_BUILD
+    return endpoint == kOpusEndpoint ? 2 : validEndpoint(endpoint);
+#else
+    return endpoint == kOpusEndpoint ? 4 : validEndpoint(endpoint);
+#endif
+}
+static int32 modernEndpointIndex(int32 endpoint) {
+    return endpoint == kOpusEndpoint ? kModernMaxEndpoint : validEndpoint(endpoint);
+}
+static int32 endpointFromModernIndex(int32 index) {
+#if !defined(TELEPHONY_DISTRIBUTION_BUILD) && TELEPHONY_EXPERIMENTAL_NETWORK
+    if (index == kModernMaxEndpoint) return kOpusEndpoint;
+#endif
+    return validEndpoint(index);
+}
 
 constexpr int32 kNumEvsSampleRates = 4;
 constexpr int32 kDefaultEvsSampleRateIndex = 2; // 32 kHz (SWB)
@@ -117,6 +156,53 @@ static double normalizedFromTable(int32 value, const int32* table, int32 count, 
     return (double)idx / (double)(count - 1);
 }
 
+// Human-readable choices share the descriptor's normalized/physical mapping.
+static const char* advancedChoiceLabel(size_t index, int choice) {
+    static const char* binary[] = {"Off", "On"};
+    static const char* jitter[] = {"Uniform", "Gamma", "Weibull", "Pareto"};
+    static const char* vad[] = {"VAD1 / energy", "3GPP VAD2"};
+    static const char* digits[] = {"Off", "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "*", "#", "A", "B", "C", "D"};
+    static const char* durations[] = {"2.5 ms", "5 ms", "10 ms", "20 ms", "40 ms", "60 ms"};
+    static const char* payloads[] = {"Auto", "Compact", "Header-full"};
+    static const char* modes[] = {"Auto", "SILK", "Hybrid", "CELT"};
+    static const char* ioRates[] = {"6.60 kbps", "8.85 kbps", "12.65 kbps", "14.25 kbps", "15.85 kbps", "18.25 kbps", "19.85 kbps", "23.05 kbps", "23.85 kbps"};
+    const char** labels = nullptr; int count = 0;
+    if (index == 4) { labels = jitter; count = 4; }
+    else if (index == 20) { labels = vad; count = 2; }
+    else if (index == 21) { labels = digits; count = 17; }
+    else if (index == 26) { labels = durations; count = 6; }
+    else if (index == 47) { labels = payloads; count = 3; }
+    else if (index == 50) { labels = modes; count = 4; }
+    else if (index == 52) { labels = ioRates; count = 9; }
+    else if (TelephonyDSP::advancedDescriptors[index].steps == 1) { labels = binary; count = 2; }
+    return labels && choice >= 0 && choice < count ? labels[choice] : nullptr;
+}
+class AdvancedParameter final : public RangeParameter {
+public:
+    AdvancedParameter(const TChar* title, size_t index, const TChar* units)
+        : RangeParameter(title, kParamAdvancedBase + (ParamID)index, units,
+            TelephonyDSP::advancedDescriptors[index].minimum, TelephonyDSP::advancedDescriptors[index].maximum,
+            TelephonyDSP::advancedDescriptors[index].initial, TelephonyDSP::advancedDescriptors[index].steps,
+            ParameterInfo::kCanAutomate | (TelephonyDSP::advancedDescriptors[index].steps > 0
+                && TelephonyDSP::advancedDescriptors[index].steps <= 16 ? ParameterInfo::kIsList : 0)), index(index) {}
+    void toString(ParamValue normalized, String128 text) const override {
+        const auto& descriptor = TelephonyDSP::advancedDescriptors[index];
+        if (const char* label = advancedChoiceLabel(index, (int)std::lround(normalized * descriptor.steps)))
+            UString(text, 128).fromAscii(label);
+        else RangeParameter::toString(normalized, text);
+    }
+    bool fromString(const TChar* text, ParamValue& normalized) const override {
+        char ascii[128]{}; UString(const_cast<TChar*>(text), 128).toAscii(ascii, 128);
+        const auto& descriptor = TelephonyDSP::advancedDescriptors[index];
+        for (int choice = 0; choice <= descriptor.steps; ++choice)
+            if (const char* label = advancedChoiceLabel(index, choice))
+                if (std::strcmp(ascii, label) == 0) { normalized = double(choice) / descriptor.steps; return true; }
+        return RangeParameter::fromString(text, normalized);
+    }
+private:
+    size_t index;
+};
+
 // The byte layout is deliberately append-only. Historical presets may end at
 // any complete trailing field; partial fields are corrupt, not older presets.
 struct SavedState {
@@ -132,6 +218,7 @@ struct SavedState {
     int32 amrNbMode = kDefaultAmrNbModeIndex, sidInterval = 0;
     int32 amrWbMode = kDefaultAmrWbModeIndex, g711Law = 0, scVbr = 0;
     int32 opusBitrate = kOpusBitrateValues[kDefaultOpusBitrateIndex];
+    TelephonyDSP::AdvancedSettings advanced;
 };
 
 static int32 tableValueOrDefault(int32 value, const int32* table, int32 count, int32 defaultIndex)
@@ -168,11 +255,36 @@ static bool readSavedState(IBStream* state, SavedState& value)
         || !trailing(value.amrWbMode) || !trailing(value.g711Law)
         || !trailing(value.scVbr) || !trailing(value.opusBitrate)) return false;
 
+    if (!ended) {
+        uint32 magic = 0;
+        const auto bytes = stream.readRaw(&magic, sizeof(magic));
+        if (bytes != 0) {
+            // Read header using the same endian-aware streamer as numeric fields.
+            if (bytes != sizeof(magic)) return false;
+#if BYTEORDER == kBigEndian
+            magic = ((magic & 0xffu) << 24) | ((magic & 0xff00u) << 8)
+                  | ((magic & 0xff0000u) >> 8) | ((magic >> 24) & 0xffu);
+#endif
+            uint32 version = 0, count = 0;
+            if (magic != kStateExtensionMagic || !stream.readInt32u(version)
+                || version != kStateExtensionVersion || !stream.readInt32u(count)
+                || count > value.advanced.normalized.size()
+                || !stream.readInt32(value.eraMode) || !stream.readInt32(value.outputEndpoint)) return false;
+            for (uint32 index = 0; index < count; ++index) {
+                auto& normalized = value.advanced.normalized[index];
+                if (!stream.readDouble(normalized) || !std::isfinite(normalized)
+                    || normalized < 0.0 || normalized > 1.0) return false;
+            }
+            uint8 extra;
+            if (stream.readRaw(&extra, 1) != 0) return false;
+        }
+    }
+
     if (!std::isfinite(value.dry) || !std::isfinite(value.gain)
         || !std::isfinite(value.amount) || !std::isfinite(value.packetLoss)
         || !std::isfinite(value.degradation)) return false;
-    value.eraMode = std::clamp(value.eraMode, 0, kMaxExposedEndpoint);
-    value.outputEndpoint = std::clamp(value.outputEndpoint, 0, kMaxExposedEndpoint);
+    value.eraMode = validEndpoint(value.eraMode);
+    value.outputEndpoint = validEndpoint(value.outputEndpoint);
     value.segment = std::clamp(value.segment, 0, kMaxDegradationSegment);
     value.dry = std::clamp(value.dry, 0.0f, 1.0f);
     value.gain = std::clamp(value.gain, -60.0f, 24.0f);
@@ -195,6 +307,9 @@ static bool readSavedState(IBStream* state, SavedState& value)
 
 TelephonyDSP::RouteEndpoint endpointFromParameter(int32 endpoint)
 {
+#if !defined(TELEPHONY_DISTRIBUTION_BUILD) && TELEPHONY_EXPERIMENTAL_NETWORK
+    if (endpoint == kOpusEndpoint) return TelephonyDSP::RouteEndpoint::Opus;
+#endif
     endpoint = std::clamp(endpoint, 0, kMaxExposedEndpoint);
 #ifdef TELEPHONY_DISTRIBUTION_BUILD
     switch (endpoint) {
@@ -263,6 +378,7 @@ TelephonyVoiceProcessor::TelephonyVoiceProcessor()
     , bypassDelayPos(0)
 {
     setControllerClass(TelephonyVoiceController::uid);
+    processContextRequirements.needTransportState().needProjectTimeMusic().needTempo();
 }
 
 TelephonyVoiceProcessor::~TelephonyVoiceProcessor() {}
@@ -314,7 +430,9 @@ tresult PLUGIN_API TelephonyVoiceProcessor::setActive(TBool state)
         // so bypassed audio stays time-aligned with processed audio.
         bypassDelayLen = (int)dsp.getLatencySamples();
         bypassDelayPos = 0;
-        bypassDelayBuf.assign(2, std::vector<float>((size_t)std::max(bypassDelayLen, 1), 0.0f));
+        bypassDelayBuf.assign(2, std::vector<float>((size_t)std::max((int)processSetup.sampleRate, bypassDelayLen), 0.0f));
+        reportedLatency = -1.0;
+        transportTimeKnown = false;
     }
     return AudioEffect::setActive(state);
 }
@@ -339,7 +457,17 @@ tresult PLUGIN_API TelephonyVoiceProcessor::process(ProcessData& data)
                     && std::isfinite(value)) {
                     value = std::clamp(value, 0.0, 1.0);
                     ParamID pid = queue->getParameterId();
+                    if (pid >= kParamAdvancedBase && pid < kParamAdvancedBase + currentAdvanced.normalized.size()) {
+                        currentAdvanced.normalized[pid - kParamAdvancedBase] = value;
+                        continue;
+                    }
                     switch (pid) {
+                        case kParamInputRoute:
+                            currentEraMode = endpointFromModernIndex((int32)std::lround(value * kModernMaxEndpoint));
+                            break;
+                        case kParamOutputRoute:
+                            currentOutputEndpoint = endpointFromModernIndex((int32)std::lround(value * kModernMaxEndpoint));
+                            break;
                         case kParamEraMode:
                             currentEraMode = std::clamp((int32)(value * kMaxExposedEndpoint + 0.5), 0, kMaxExposedEndpoint);
                             break;
@@ -408,20 +536,61 @@ tresult PLUGIN_API TelephonyVoiceProcessor::process(ProcessData& data)
         updateDSPParameters();
     }
 
-    // Hosts can flush parameters without supplying audio buses or samples.
-    if (data.numSamples == 0) return kResultOk;
-    if (data.numSamples < 0 || data.symbolicSampleSize != kSample32) return kResultFalse;
-    if (data.numInputs == 0 || data.numOutputs == 0) return kResultOk;
-    if (!data.inputs || !data.outputs) return kResultFalse;
+    // VST3 projectTimeSamples and sampleRate are always valid when a context
+    // exists. Music time is quarter notes, so fallback conversion uses 60/tempo.
+    if (data.processContext) {
+        const auto& context = *data.processContext;
+        double seconds = 0.0;
+        if (std::isfinite(context.sampleRate) && context.sampleRate > 0.0)
+            seconds = double(context.projectTimeSamples) / context.sampleRate;
+        else if ((context.state & ProcessContext::kProjectTimeMusicValid)
+            && (context.state & ProcessContext::kTempoValid)
+            && std::isfinite(context.projectTimeMusic) && std::isfinite(context.tempo) && context.tempo > 0.0)
+            seconds = context.projectTimeMusic * 60.0 / context.tempo;
+        else seconds = double(context.projectTimeSamples) / processSetup.sampleRate;
+        const bool playing = (context.state & ProcessContext::kPlaying) != 0;
+        if (currentAdvanced.enabled(TelephonyDSP::AdvancedControl::HostClock) && std::isfinite(seconds)) {
+            if (transportTimeKnown && (playing || transportWasPlaying)
+                && std::abs(seconds - expectedTransportTime) > 2.0 / processSetup.sampleRate) {
+                bypassDelayPos = 0;
+                for (auto& channel : bypassDelayBuf) std::fill(channel.begin(), channel.end(), 0.0f);
+            }
+            expectedTransportTime = seconds + std::max(0, data.numSamples) / processSetup.sampleRate;
+            transportTimeKnown = true;
+            transportWasPlaying = playing;
+        } else transportTimeKnown = false;
+        dsp.setTransportTime(seconds, playing);
+    } else transportTimeKnown = false;
 
-    const int32 numInCh = data.inputs[0].numChannels;
+    // Hosts can flush parameters without supplying audio buses or samples.
+    if (data.numSamples == 0) { publishTelemetry(data); return kResultOk; }
+    if (data.numSamples < 0 || data.symbolicSampleSize != kSample32) return kResultFalse;
+    if (data.numOutputs == 0) return kResultOk;
+    if (data.numOutputs < 0 || data.numInputs < 0 || !data.outputs) return kResultFalse;
+
     const int32 numOutCh = data.outputs[0].numChannels;
-    float** in = data.inputs[0].channelBuffers32;
     float** out = data.outputs[0].channelBuffers32;
-    if (!in || !out || numInCh < 1 || numInCh > 2 || numOutCh < 1 || numOutCh > 2)
-        return kResultFalse;
-    for (int ch = 0; ch < numInCh; ++ch) if (!in[ch]) return kResultFalse;
+    if (!out || numOutCh < 1 || numOutCh > 2) return kResultFalse;
     for (int ch = 0; ch < numOutCh; ++ch) if (!out[ch]) return kResultFalse;
+
+    if (data.numInputs == 0) {
+        // A disconnected input is not a parameter-only flush: the host still
+        // owns an audible output buffer. Clear it and discard both wet and dry
+        // history so reconnecting cannot replay audio from before disconnect.
+        for (int ch = 0; ch < numOutCh; ++ch) std::fill_n(out[ch], data.numSamples, 0.0f);
+        data.outputs[0].silenceFlags = (uint64(1) << numOutCh) - 1;
+        dsp.reset();
+        bypassDelayPos = 0;
+        for (auto& channel : bypassDelayBuf) std::fill(channel.begin(), channel.end(), 0.0f);
+        transportTimeKnown = false;
+        publishTelemetry(data, out, numOutCh);
+        return kResultOk;
+    }
+    if (!data.inputs) return kResultFalse;
+    const int32 numInCh = data.inputs[0].numChannels;
+    float** in = data.inputs[0].channelBuffers32;
+    if (!in || numInCh < 1 || numInCh > 2) return kResultFalse;
+    for (int ch = 0; ch < numInCh; ++ch) if (!in[ch]) return kResultFalse;
 
     // Silence flags describe input only: codec/delay tails can still be audible.
     data.outputs[0].silenceFlags = 0;
@@ -457,6 +626,7 @@ tresult PLUGIN_API TelephonyVoiceProcessor::process(ProcessData& data)
             }
             if (delayLen > 0 && ++bypassDelayPos == delayLen) bypassDelayPos = 0;
         }
+        publishTelemetry(data, out, numOutCh);
         return kResultOk;
     }
 
@@ -476,14 +646,15 @@ tresult PLUGIN_API TelephonyVoiceProcessor::process(ProcessData& data)
         bypassDelayPos = (int)((int64(bypassDelayPos) + data.numSamples) % delayLen);
     }
     dsp.process(source, numInCh, out, numOutCh, data.numSamples);
+    publishTelemetry(data, out, numOutCh);
 
     return kResultOk;
 }
 
 void TelephonyVoiceProcessor::updateDSPParameters()
 {
-    currentEraMode = std::clamp(currentEraMode, 0, kMaxExposedEndpoint);
-    currentOutputEndpoint = std::clamp(currentOutputEndpoint, 0, kMaxExposedEndpoint);
+    currentEraMode = validEndpoint(currentEraMode);
+    currentOutputEndpoint = validEndpoint(currentOutputEndpoint);
     currentDegradationSegment = std::clamp(currentDegradationSegment, 0, kMaxDegradationSegment);
     currentEvsMaxBw = std::clamp(currentEvsMaxBw, (int32)EVS_NB, (int32)EVS_FB);
     currentOpusBandwidth = std::clamp(currentOpusBandwidth, 1101, 1105);
@@ -506,6 +677,14 @@ void TelephonyVoiceProcessor::updateDSPParameters()
     dsp.setG711Law(currentG711Law);
     dsp.setEvsDtxSidInterval(currentEvsDtxSidInterval);
     dsp.setEvsScVbrEnabled(currentEvsScVbr != 0);
+    dsp.setAdvancedSettings(currentAdvanced);
+    const int latency = (int)dsp.getLatencySamples();
+    if (!bypassDelayBuf.empty() && latency != bypassDelayLen
+        && latency <= (int)bypassDelayBuf.front().size()) {
+        bypassDelayLen = latency;
+        bypassDelayPos = 0;
+        for (auto& channel : bypassDelayBuf) std::fill(channel.begin(), channel.end(), 0.0f);
+    }
 }
 
 tresult PLUGIN_API TelephonyVoiceProcessor::setState(IBStream* state)
@@ -530,6 +709,7 @@ tresult PLUGIN_API TelephonyVoiceProcessor::setState(IBStream* state)
     currentG711Law = value.g711Law;
     currentEvsScVbr = value.scVbr;
     currentOpusBitrate = value.opusBitrate;
+    currentAdvanced = value.advanced;
     updateDSPParameters();
     return kResultOk;
 }
@@ -538,13 +718,13 @@ tresult PLUGIN_API TelephonyVoiceProcessor::getState(IBStream* state)
 {
     if (!state) return kResultFalse;
     IBStreamer streamer(state, kLittleEndian);
-    if (!streamer.writeInt32(currentEraMode)) return kResultFalse;
+    if (!streamer.writeInt32(legacyEndpoint(currentEraMode))) return kResultFalse;
     if (!streamer.writeFloat(currentDryWet)) return kResultFalse;
     if (!streamer.writeFloat(currentOutGain)) return kResultFalse;
     if (!streamer.writeBool(currentArtifactsEnabled)) return kResultFalse;
     if (!streamer.writeFloat(currentArtifactAmount)) return kResultFalse;
     if (!streamer.writeBool(currentBypass)) return kResultFalse;
-    if (!streamer.writeInt32(currentOutputEndpoint)) return kResultFalse;
+    if (!streamer.writeInt32(legacyEndpoint(currentOutputEndpoint))) return kResultFalse;
     if (!streamer.writeInt32(currentDegradationSegment)) return kResultFalse;
     if (!streamer.writeFloat(currentPacketLossRate)) return kResultFalse;
     if (!streamer.writeFloat(currentNetworkDegradation)) return kResultFalse;
@@ -558,7 +738,43 @@ tresult PLUGIN_API TelephonyVoiceProcessor::getState(IBStream* state)
     if (!streamer.writeInt32(currentG711Law)) return kResultFalse;
     if (!streamer.writeInt32(currentEvsScVbr)) return kResultFalse;
     if (!streamer.writeInt32(currentOpusBitrate)) return kResultFalse;
+    if (!streamer.writeInt32u(kStateExtensionMagic) || !streamer.writeInt32u(kStateExtensionVersion)
+        || !streamer.writeInt32u((uint32)currentAdvanced.normalized.size())
+        || !streamer.writeInt32(currentEraMode) || !streamer.writeInt32(currentOutputEndpoint)) return kResultFalse;
+    for (double normalized : currentAdvanced.normalized)
+        if (!streamer.writeDouble(normalized)) return kResultFalse;
     return kResultOk;
+}
+
+void TelephonyVoiceProcessor::publishTelemetry(ProcessData& data, float** output, int channels)
+{
+    if (!data.outputParameterChanges) return;
+    const auto telemetry = dsp.getTelemetry();
+    const auto publish = [&](ParamID id, double value) {
+        int32 index = 0;
+        if (auto* queue = data.outputParameterChanges->addParameterData(id, index))
+            return queue->addPoint(std::max(0, data.numSamples - 1), std::isfinite(value) ? std::clamp(value, 0.0, 1.0) : 0.0, index) == kResultOk;
+        return false;
+    };
+    const auto peakNormalized = [](double peak) {
+        return (std::clamp(20.0 * std::log10(std::max(peak, 1e-12)), -96.0, 12.0) + 96.0) / 108.0;
+    };
+    double outputPeak = telemetry.outputPeak;
+    if (output) {
+        outputPeak = 0.0;
+        for (int channel = 0; channel < channels; ++channel)
+            for (int32 sample = 0; sample < data.numSamples; ++sample)
+                outputPeak = std::max(outputPeak, double(std::abs(output[channel][sample])));
+    }
+    publish(kParamInputPeak, peakNormalized(telemetry.inputPeak));
+    publish(kParamOutputPeak, peakNormalized(outputPeak));
+    publish(kParamMeasuredLoss, telemetry.measuredLoss);
+    publish(kParamMeasuredJitter, telemetry.jitterMs / 1000.0);
+    publish(kParamOpusActualMode, double(std::clamp(telemetry.opusMode, 0, 3)) / 3.0);
+    const double latency = double(dsp.getLatencySamples()) / kLatencyNormalization;
+    if (latency != reportedLatency) {
+        if (publish(kParamLatencySamples, latency)) reportedLatency = latency;
+    }
 }
 
 // --------------------------------------------------------------------------
@@ -588,15 +804,26 @@ tresult PLUGIN_API TelephonyVoiceController::initialize(FUnknown* context)
 #endif
     };
 
-    StringListParameter* inputParam = new StringListParameter(STR16("in"), kParamEraMode, nullptr, ParameterInfo::kCanAutomate | ParameterInfo::kIsList);
+    StringListParameter* inputParam = new StringListParameter(STR16("Input (legacy automation)"), kParamEraMode, nullptr, ParameterInfo::kCanAutomate | ParameterInfo::kIsList | ParameterInfo::kIsHidden);
     appendEndpointStrings(inputParam);
     inputParam->setNormalized(0.0);
     parameters.addParameter(inputParam);
 
-    StringListParameter* outputParam = new StringListParameter(STR16("out"), kParamOutputEndpoint, nullptr, ParameterInfo::kCanAutomate | ParameterInfo::kIsList);
+    StringListParameter* outputParam = new StringListParameter(STR16("Output (legacy automation)"), kParamOutputEndpoint, nullptr, ParameterInfo::kCanAutomate | ParameterInfo::kIsList | ParameterInfo::kIsHidden);
     appendEndpointStrings(outputParam);
     outputParam->setNormalized((double)kDefaultOutputEndpoint / (double)kMaxExposedEndpoint);
     parameters.addParameter(outputParam);
+
+    for (ParamID id : {ParamID(kParamInputRoute), ParamID(kParamOutputRoute)}) {
+        auto* route = new StringListParameter(id == kParamInputRoute ? STR16("Input Route") : STR16("Output Route"),
+            id, nullptr, ParameterInfo::kCanAutomate | ParameterInfo::kIsList);
+        appendEndpointStrings(route);
+#if !defined(TELEPHONY_DISTRIBUTION_BUILD) && TELEPHONY_EXPERIMENTAL_NETWORK
+        route->appendString(STR16("Opus VoIP"));
+#endif
+        route->setNormalized(id == kParamInputRoute ? 0.0 : double(kDefaultOutputEndpoint) / kModernMaxEndpoint);
+        parameters.addParameter(route);
+    }
 
     StringListParameter* evsSampleRateParam = new StringListParameter(STR16("EVS Sample Rate"), kParamEvsSampleRate, nullptr, ParameterInfo::kCanAutomate | ParameterInfo::kIsList);
     evsSampleRateParam->appendString(STR16("8 kHz (NB)"));
@@ -707,6 +934,27 @@ tresult PLUGIN_API TelephonyVoiceController::initialize(FUnknown* context)
     parameters.addParameter(new RangeParameter(STR16("EVS SC-VBR"), kParamEvsScVbr, STR16(""), 0.0, 1.0, 0.0, 1, ParameterInfo::kCanAutomate));
     parameters.addParameter(new RangeParameter(STR16("Bypass"), kParamMasterBypass, STR16(""), 0, 1, 0, 1, ParameterInfo::kCanAutomate | ParameterInfo::kIsBypass));
 
+    for (size_t index = 0; index < TelephonyDSP::advancedDescriptors.size(); ++index) {
+        const auto& descriptor = TelephonyDSP::advancedDescriptors[index];
+        String128 title{}, units{};
+        UString(title, 128).fromAscii(descriptor.title);
+        UString(units, 128).fromAscii(descriptor.units);
+        auto* parameter = new AdvancedParameter(title, index, units);
+        parameter->setPrecision(descriptor.steps ? 0 : (descriptor.maximum <= 1 ? 5 : 2));
+        parameters.addParameter(parameter);
+    }
+    parameters.addParameter(new RangeParameter(STR16("Input peak"), kParamInputPeak, STR16("dBFS"), -96, 12, -96, 0, ParameterInfo::kIsReadOnly));
+    parameters.addParameter(new RangeParameter(STR16("Output peak"), kParamOutputPeak, STR16("dBFS"), -96, 12, -96, 0, ParameterInfo::kIsReadOnly));
+    parameters.addParameter(new RangeParameter(STR16("Network measured packet loss"), kParamMeasuredLoss, STR16("%"), 0, 100, 0, 0, ParameterInfo::kIsReadOnly));
+    parameters.addParameter(new RangeParameter(STR16("Network measured packet jitter"), kParamMeasuredJitter, STR16("ms"), 0, 1000, 0, 0, ParameterInfo::kIsReadOnly));
+    auto* opusMode = new StringListParameter(STR16("Opus actual mode"), kParamOpusActualMode, nullptr, ParameterInfo::kIsReadOnly | ParameterInfo::kIsList);
+    for (const auto* mode : {STR16("Inactive"), STR16("SILK"), STR16("Hybrid"), STR16("CELT")}) opusMode->appendString(mode);
+    parameters.addParameter(opusMode);
+    parameters.addParameter(new RangeParameter(STR16("Latency samples"), kParamLatencySamples, STR16("samples"), 0, kLatencyNormalization, 0, 0, ParameterInfo::kIsReadOnly | ParameterInfo::kIsHidden));
+    auto* page = new StringListParameter(STR16("Editor page"), kParamEditorPage, nullptr, ParameterInfo::kIsHidden | ParameterInfo::kIsList);
+    for (const auto* name : {STR16("Basic route"), STR16("Network"), STR16("Speech / codecs"), STR16("Channel effects"), STR16("Packet format")}) page->appendString(name);
+    parameters.addParameter(page);
+
     // Hosts use metadata defaults for their reset/default preset actions.
     // StringListParameter::setNormalized changes only the live value.
     for (int32 i = 0; i < parameters.getParameterCount(); ++i) {
@@ -715,6 +963,27 @@ tresult PLUGIN_API TelephonyVoiceController::initialize(FUnknown* context)
     }
 
     return kResultOk;
+}
+
+tresult PLUGIN_API TelephonyVoiceController::setParamNormalized(ParamID tag, ParamValue value)
+{
+    if (!std::isfinite(value)) return kResultFalse;
+    value = std::clamp(value, 0.0, 1.0);
+    const auto previous = getParamNormalized(tag);
+    const auto result = EditController::setParamNormalized(tag, value);
+    if (result != kResultOk) return result;
+    if (tag == kParamEraMode || tag == kParamOutputEndpoint) {
+        const int32 endpoint = (int32)std::lround(value * kMaxExposedEndpoint);
+        EditController::setParamNormalized(tag == kParamEraMode ? kParamInputRoute : kParamOutputRoute,
+            double(endpoint) / kModernMaxEndpoint);
+    } else if (tag == kParamInputRoute || tag == kParamOutputRoute) {
+        const int32 endpoint = endpointFromModernIndex((int32)std::lround(value * kModernMaxEndpoint));
+        EditController::setParamNormalized(tag == kParamInputRoute ? kParamEraMode : kParamOutputEndpoint,
+            double(legacyEndpoint(endpoint)) / kMaxExposedEndpoint);
+    } else if (tag == kParamLatencySamples && value != previous && componentHandler) {
+        componentHandler->restartComponent(kLatencyChanged);
+    }
+    return result;
 }
 
 tresult PLUGIN_API TelephonyVoiceController::setComponentState(IBStream* state)
@@ -733,9 +1002,13 @@ tresult PLUGIN_API TelephonyVoiceController::setComponentState(IBStream* state)
     const auto evsScVbr = value.scVbr, opusBitrate = value.opusBitrate;
 
     setParamNormalized(kParamEraMode,
-        (double)std::clamp(eraMode, 0, kMaxExposedEndpoint) / (double)kMaxExposedEndpoint);
+        (double)legacyEndpoint(eraMode) / (double)kMaxExposedEndpoint);
     setParamNormalized(kParamOutputEndpoint,
-        (double)std::clamp(outputEndpoint, 0, kMaxExposedEndpoint) / (double)kMaxExposedEndpoint);
+        (double)legacyEndpoint(outputEndpoint) / (double)kMaxExposedEndpoint);
+    setParamNormalized(kParamInputRoute, double(modernEndpointIndex(eraMode)) / kModernMaxEndpoint);
+    setParamNormalized(kParamOutputRoute, double(modernEndpointIndex(outputEndpoint)) / kModernMaxEndpoint);
+    for (size_t index = 0; index < value.advanced.normalized.size(); ++index)
+        setParamNormalized(kParamAdvancedBase + (ParamID)index, value.advanced.normalized[index]);
     setParamNormalized(kParamDegradationSegment,
         (double)std::clamp(degradationSegment, 0, kMaxDegradationSegment) / (double)kMaxDegradationSegment);
     setParamNormalized(kParamDryWet, std::clamp(dry, 0.0f, 1.0f));

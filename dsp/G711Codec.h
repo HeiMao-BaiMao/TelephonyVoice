@@ -21,13 +21,16 @@ namespace TelephonyDSP {
         // Returns true if the codec is currently configured to use A-law.
         bool isAlaw() const { return useAlaw; }
         void reset() override;
+        void setSpectralConcealment(bool enabled) override { plc.setSpectralNoise(enabled); }
         int getSampleRate() const override { return sampleRate; }
         int getFrameSize() const override { return sampleRate / 50; }
         void processFrame(const int16_t* in, int16_t* out, bool packetLost) override;
+        void processSamples(const int16_t* in, int16_t* out, int count) const;
     private:
         int sampleRate;
         bool useAlaw;
         WaveformConcealer plc;
+        std::vector<uint8_t> encoded;
     };
 
 } // namespace TelephonyDSP

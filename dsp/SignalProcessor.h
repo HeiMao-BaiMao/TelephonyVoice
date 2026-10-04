@@ -1,6 +1,7 @@
 #pragma once
 
 #include "dsp/Types.h"
+#include "dsp/AdvancedControls.h"
 #include "dsp/ChannelProcessor.h"
 #include "dsp/RingBuffer.h"
 #include "evs_api.h"
@@ -14,6 +15,10 @@ namespace TelephonyDSP {
         SignalProcessor();
         ~SignalProcessor();
 
+        void setAdvancedSettings(const AdvancedSettings& settings);
+        const AdvancedSettings& getAdvancedSettings() const { return advanced; }
+        ProcessingTelemetry getTelemetry() const;
+        void setTransportTime(double seconds, bool playing);
         void setSampleRate(double sampleRate);
         void setMode(EraMode mode);
         void setRoute(RouteEndpoint input, RouteEndpoint output, DegradationSegment degradationSegment);
@@ -56,6 +61,10 @@ namespace TelephonyDSP {
         int getLatencySamples() const;
 
     private:
+        AdvancedSettings advanced;
+        double inputPeak = 0, outputPeak = 0;
+        double expectedHostTime=0;
+        bool hostTimeKnown=false, hostPlaying=false;
         double hostSampleRate;
         EraMode currentMode;
         bool routeModelEnabled;

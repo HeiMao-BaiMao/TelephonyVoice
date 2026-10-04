@@ -239,7 +239,7 @@ const char* getModeSuffix(TelephonyDSP::EraMode mode) {
 void processFile(const std::string& inputFile, TelephonyDSP::EraMode mode,
                  int evsSr, int evsBr, EVS_Bandwidth evsBw, int amrNbMode,
                  int amrWbMode, int dtxSidInterval, int g711Law, bool evsScVbr,
-                 int opusBw, int opusBr) {
+                 int opusBw, int opusBr, const TelephonyDSP::AdvancedSettings& advanced = {}) {
     const std::string outputFile = getOutputFilename(inputFile, getModeSuffix(mode));
     std::cout << "Processing " << getModeSuffix(mode) << " -> " << outputFile << "..." << std::endl;
     PcmWavReader wavIn(inputFile);
@@ -294,6 +294,7 @@ void processFile(const std::string& inputFile, TelephonyDSP::EraMode mode,
     // picks OPUS_VOIP. No-op for non-Opus modes.
     dsp.setOpusBitrate(opusBr);
     dsp.setParameters(1.0f, 0.0f, false, 0.0f);
+    dsp.setAdvancedSettings(advanced);
     dsp.setSimulateLatency(false); // Disable artificial 100ms latency for runner
 
     constexpr int blockSize = 1024;
@@ -328,6 +329,13 @@ void processFile(const std::string& inputFile, TelephonyDSP::EraMode mode,
         inputFrames += frames;
     }
 
+    // Test tones belong to input duration, not the artificial drain period.
+    // Changing only this generator control preserves codec/transport history.
+    if(advanced.get(TelephonyDSP::AdvancedControl::DtmfDigit)>=0) {
+        auto tailSettings=advanced;
+        tailSettings.setPlain((size_t)TelephonyDSP::AdvancedControl::DtmfDigit,-1);
+        dsp.setAdvancedSettings(tailSettings);
+    }
     // Drain codec/resampler state. Durations are measured in samples, not in
     // 1024-sample blocks (which previously meant 64 seconds at 8 kHz).
     // Keep a conservative one-second drain for codec/resampler startup and
@@ -487,6 +495,14 @@ static void printUsage(const char* prog) {
         << "Use -- before an input filename beginning with a hyphen.\n"
         << "Exit status: 0 for success/help, 1 for invalid arguments or processing failure.\n"
         << "Available modes:";
+    std::cout << "\nAdvanced simulation (numeric values; disabled by default):\n";
+    for(const auto& d:TelephonyDSP::advancedDescriptors)
+        std::cout << "  --" << d.key << " VALUE  " << d.title << " [" << d.minimum << ".." << d.maximum << ", default " << d.initial << "] " << d.units << "\n";
+    std::cout << "  Jitter: 0 uniform, 1 gamma, 2 Weibull, 3 Pareto.\n"
+                 "  Opus duration: 0=2.5, 1=5, 2=10, 3=20, 4=40, 5=60 ms.\n"
+                 "  DTMF: -1 off, 0..15 selects 0123456789*#ABCD.\n"
+                 "  VAD: 0 energy+hangover, 1 reference VAD2 core (non-distribution).\n"
+                 "  Available modes:";
     for (const auto mode : availableModes()) std::cout << " " << getModeSuffix(mode);
     std::cout << "\n";
 }
@@ -516,6 +532,7 @@ int main(int argc, char* argv[]) {
     bool modeFilterSet = false;
     TelephonyDSP::EraMode modeFilter = TelephonyDSP::EraMode::PSTN_G711;
     std::string inputFile;
+    TelephonyDSP::AdvancedSettings advanced;
 
     bool positionalOnly = false;
     bool inputProvided = false;
@@ -678,6 +695,24 @@ int main(int argc, char* argv[]) {
                 return 1;
             }
         }
+        else if (std::strncmp(a, "--", 2) == 0) {
+            bool matched = false;
+            for (size_t index=0; index<TelephonyDSP::advancedDescriptors.size(); ++index) {
+                const auto& descriptor=TelephonyDSP::advancedDescriptors[index];
+                if(std::string_view(a+2)!=descriptor.key) continue;
+                matched=true;
+                if(i+1>=argc) { std::cerr << "Error: " << a << " requires a value\n"; return 1; }
+                const char* valueText=argv[++i];
+                double value=0;
+                const auto parsed=std::from_chars(valueText,valueText+std::strlen(valueText),value);
+                if(parsed.ec!=std::errc{} || parsed.ptr!=valueText+std::strlen(valueText) || !advanced.setPlain(index,value)) {
+                    std::cerr << "Error: invalid " << a << " (allowed " << descriptor.minimum << ".." << descriptor.maximum << ")\n";
+                    return 1;
+                }
+                break;
+            }
+            if(!matched) { std::cerr << "Error: unknown flag: " << a << "\n"; return 1; }
+        }
         else if (a[0] == '-') {
             std::cerr << "Error: unknown flag: " << a << "\n";
             printUsage(argv[0]);
@@ -699,6 +734,39 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    using A=TelephonyDSP::AdvancedControl;
+#ifdef TELEPHONY_DISTRIBUTION_BUILD
+    if(advanced.get(A::VadMode)==1 || advanced.enabled(A::EvsAmrWbIo) || advanced.enabled(A::EvsAutoBandwidth)) {
+        std::cerr << "Error: reference VAD2 and EVS controls are unavailable in distribution builds\n"; return 1;
+    }
+#endif
+#if !TELEPHONY_EXPERIMENTAL_NETWORK
+    if(advanced.get(A::OpusForceMode)!=0 || advanced.enabled(A::OpusFecOnly)) {
+        std::cerr << "Error: Opus is unavailable in this build\n"; return 1;
+    }
+#endif
+    if(advanced.enabled(A::HostClock)) { std::cerr << "Error: host-clock requires a VST host; CLI renders use deterministic sample time\n"; return 1; }
+    if(advanced.enabled(A::EvsAmrWbIo) && (evsSr<16000 || evsScVbr)) {
+        std::cerr << "Error: EVS AMR-WB IO requires 16000/32000/48000 Hz and SC-VBR off\n"; return 1;
+    }
+#if TELEPHONY_USE_EVS_JBM
+    if(advanced.enabled(A::EvsAmrWbIo) && (!modeFilterSet || modeFilter==TelephonyDSP::EraMode::EVS_JBM)) {
+        std::cerr << "Error: EVS AMR-WB IO is not supported by JBM; select --mode evs_native\n"; return 1;
+    }
+#endif
+    const int forcedMode=(int)advanced.get(A::OpusForceMode);
+    if((forcedMode==1 || forcedMode==2) && advanced.get(A::OpusFrameDuration)<2) {
+        std::cerr << "Error: forced SILK/Hybrid requires at least 10 ms Opus frames\n"; return 1;
+    }
+    if(forcedMode==2 && (opusBw<1104 || opusBr<16000)) {
+        std::cerr << "Error: forced Hybrid requires SWB/FB and at least 16000 bps\n"; return 1;
+    }
+    if(advanced.enabled(A::OpusFecOnly) && (advanced.get(A::OpusFrameDuration)<2 || forcedMode==3 || !advanced.enabled(A::OpusFecEnabled) || advanced.get(A::OpusFecPercent)==0 || !advanced.enabled(A::NetworkEnabled))) {
+        std::cerr << "Error: FEC-only requires network-enabled, FEC enabled, expected loss >0, >=10ms and SILK/Hybrid-capable mode\n"; return 1;
+    }
+    if(advanced.enabled(A::Redundancy) && (!advanced.enabled(A::PacketFormat) || !advanced.enabled(A::NetworkEnabled))) {
+        std::cerr << "Error: RFC2198 requires --packet-format 1 --network-enabled 1\n"; return 1;
+    }
     const auto modes = availableModes();
 
     if (modeFilterSet && std::find(modes.begin(), modes.end(), modeFilter) == modes.end()) {
@@ -736,7 +804,7 @@ int main(int argc, char* argv[]) {
         for (auto mode : modes) {
             if (modeFilterSet && mode != modeFilter) continue;
             processFile(inputFile, mode, evsSr, evsBr, evsBw, amrNbMode, amrWbMode,
-                        dtxSidInterval, g711Law, evsScVbr, opusBw, opusBr);
+                        dtxSidInterval, g711Law, evsScVbr, opusBw, opusBr, advanced);
         }
     } catch (const std::exception& error) {
         std::cerr << "Error: " << error.what() << "\n";

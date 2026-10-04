@@ -25,10 +25,10 @@ namespace TelephonyDSP {
         int getFrameSize() const override { return 320; }
         void processFrame(const int16_t* in, int16_t* out, bool packetLost) override;
         void setDtxEnabled(bool enable);
+        void configureDtx(bool enabled, bool pureSilence) override { ICodec::configureDtx(enabled, pureSilence); setDtxEnabled(enabled); }
         bool isDtxEnabled() const { return dtxEnabled; }
         // Select AMR-WB mode (0..8). Out-of-range values are clamped
-        // silently. The encoder state is rebuilt via reset() so the
-        // change takes effect on the next processFrame() call.
+        // silently. The next frame uses the mode without resetting codec history.
         void setMode(int mode);
         int getMode() const { return amrMode; }
     private:

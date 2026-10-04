@@ -61,6 +61,15 @@ struct EVS_RxJbm {
     short*          pcm_buf;
 };
 
+int evs_rx_jbm_has_started(const EVS_RxJbm* rx) {
+    return rx && rx->dec_state && rx->dec_state->codec_mode != 0;
+}
+
+int evs_rx_jbm_in_dtx(const EVS_RxJbm* rx) {
+    if (!rx || !rx->dec_state) return 0;
+    return rx->dec_state->core_brate == SID_2k40 || rx->dec_state->core_brate == FRAME_NO_DATA;
+}
+
 // ---------------------------------------------------------------------------
 // Local helpers
 // ---------------------------------------------------------------------------
@@ -89,9 +98,12 @@ static int sample_rate_supported(int sr_hz) {
 EVS_RxJbm* evs_rx_jbm_create(int sample_rate_hz,
                              int bitrate_bps,
                              int jbm_safety_margin_ms) {
+    return evs_rx_jbm_create_ex(sample_rate_hz, bitrate_bps, jbm_safety_margin_ms <= 0 ? 60 : jbm_safety_margin_ms);
+}
+EVS_RxJbm* evs_rx_jbm_create_ex(int sample_rate_hz, int bitrate_bps, int jbm_safety_margin_ms) {
+    if (jbm_safety_margin_ms < 0 || jbm_safety_margin_ms > 1000) return NULL;
     if (!sample_rate_supported(sample_rate_hz)) return NULL;
     if (bitrate_bps < 5900 || bitrate_bps > 128000) return NULL;
-    if (jbm_safety_margin_ms <= 0) jbm_safety_margin_ms = 60;
 
     EVS_RxJbm* rx = (EVS_RxJbm*)calloc(1, sizeof(EVS_RxJbm));
     if (!rx) return NULL;
@@ -113,7 +125,7 @@ EVS_RxJbm* evs_rx_jbm_create(int sample_rate_hz,
     // non-JBM wrapper's defaults so the state stays consistent regardless
     // of which entry point the caller used elsewhere.
     rx->dec_state->output_Fs       = sample_rate_hz;
-    rx->dec_state->total_brate     = bitrate_bps;
+    rx->dec_state->total_brate     = bitrate_bps == 5900 ? ACELP_7k20 : bitrate_bps;
     rx->dec_state->Opt_AMR_WB      = 0;          // native EVS, not AMR-WB IO
     rx->dec_state->bitstreamformat = G192;
     rx->dec_state->bfi             = 0;

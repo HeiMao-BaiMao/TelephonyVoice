@@ -72,6 +72,11 @@ extern "C" {
 #include "evs_api.h"
 
 typedef struct EVS_RxJbm EVS_RxJbm;
+// Actual reference decoder SID/no-data state, after the latest PCM pull.
+int evs_rx_jbm_in_dtx(const EVS_RxJbm* rx);
+int evs_rx_jbm_has_started(const EVS_RxJbm* rx);
+// Explicit margin, including zero; legacy create(…,0) keeps its 60ms default.
+EVS_RxJbm* evs_rx_jbm_create_ex(int sample_rate_hz, int bitrate_bps, int safety_margin_ms);
 
 // ---------------------------------------------------------------------------
 // Create / destroy.
