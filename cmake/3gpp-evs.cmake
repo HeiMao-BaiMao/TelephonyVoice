@@ -262,6 +262,20 @@ set(EVS_WB_VAD_RENAME_DEFS
 # Floating-point EVS (TS 26.443 v12.7.0/v13.3.0) - default
 # ---------------------------------------------------------------------------
 evs_collect_float_sources(EVS_LIB_COM_SOURCES "${EVS_ROOT}/lib_com")
+
+# The vendored float tree also includes a BASOP ROM source that duplicates
+# ten tables in rom_com.c. Keep its unique window tables, but isolate the
+# duplicate definitions in a generated wrapper. The FX source stays untouched.
+set(EVS_FLOAT_BASOP_ROM "${CMAKE_CURRENT_BINARY_DIR}/evs_float_rom_basop.c")
+file(WRITE "${EVS_FLOAT_BASOP_ROM}" "/* Generated: isolate duplicate BASOP ROM names. */\n")
+foreach(_table ldCoeff exp2_tab_long exp2w_tab_long exp2x_tab_long
+        SqrtTable SqrtDiffTable ISqrtTable ISqrtDiffTable InvTable InvDiffTable)
+    file(APPEND "${EVS_FLOAT_BASOP_ROM}" "#define ${_table} telephony_basop_${_table}\n")
+endforeach()
+file(APPEND "${EVS_FLOAT_BASOP_ROM}" "#include \"${EVS_ROOT}/lib_com/rom_basop_util.c\"\n")
+list(REMOVE_ITEM EVS_LIB_COM_SOURCES "${EVS_ROOT}/lib_com/rom_basop_util.c")
+list(APPEND EVS_LIB_COM_SOURCES "${EVS_FLOAT_BASOP_ROM}")
+
 add_library(evs-lib-com STATIC ${EVS_LIB_COM_SOURCES})
 target_include_directories(evs-lib-com PUBLIC ${EVS_INCLUDE_DIRS})
 # Rename wb_vad / wb_vad_init to evs_wb_vad* (see header comment above)
@@ -271,10 +285,8 @@ if(MSVC)
     target_compile_options(evs-lib-com PRIVATE /wd4244 /wd4267 /wd4018 /wd4305)
     # EVS is heavy floating-point code; /O2 keeps it fast and matches upstream
     target_compile_options(evs-lib-com PRIVATE /O2)
-    # EVS's basop32.c/basop_util.c implement the same ITU-T G.191 basic
-    # arithmetic operations as opencore-amrnb. They are bit-equivalent; pick
-    # one at link time.
-    target_link_options(evs-lib-com INTERFACE /FORCE:MULTIPLE)
+    # Codec symbols are isolated in cmake/opencore-amr.cmake. Do not suppress
+    # duplicate-symbol errors: the apparent duplicates can have different ABIs.
 endif()
 
 evs_collect_float_sources(EVS_LIB_ENC_SOURCES "${EVS_ROOT}/lib_enc")

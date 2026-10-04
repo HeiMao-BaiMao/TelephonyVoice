@@ -3,6 +3,9 @@
 #include "pluginterfaces/vst/ivstparameterchanges.h"
 #include "base/source/fstreamer.h"
 #include <algorithm>
+#include <cmath>
+#include <cstring>
+#include <cstdint>
 
 // Define string macro for VST3 (UTF-16)
 #ifndef STR16
@@ -23,7 +26,11 @@ namespace Vst {
 constexpr int32 kMaxExposedEndpoint = 2;
 constexpr int32 kDefaultOutputEndpoint = 2;
 #else
+#if TELEPHONY_USE_EVS_JBM
 constexpr int32 kMaxExposedEndpoint = 6;
+#else
+constexpr int32 kMaxExposedEndpoint = 5;
+#endif
 constexpr int32 kDefaultOutputEndpoint = 5;
 #endif
 constexpr int32 kMaxDegradationSegment = 3;
@@ -108,6 +115,82 @@ static double normalizedFromTable(int32 value, const int32* table, int32 count, 
         if (table[i] == value) { idx = i; break; }
     }
     return (double)idx / (double)(count - 1);
+}
+
+// The byte layout is deliberately append-only. Historical presets may end at
+// any complete trailing field; partial fields are corrupt, not older presets.
+struct SavedState {
+    int32 eraMode = 0;
+    float dry = 0.5f, gain = 0.0f;
+    bool art = false;
+    float amount = 0.0f;
+    bool bypass = false;
+    int32 outputEndpoint = kDefaultOutputEndpoint, segment = 0;
+    float packetLoss = 0.0f, degradation = 0.0f;
+    int32 evsSampleRate = kDefaultEvsSampleRate, evsBitrate = kDefaultEvsBitrate;
+    int32 evsMaxBw = kDefaultEvsMaxBw, opusBandwidth = kDefaultOpusBandwidth;
+    int32 amrNbMode = kDefaultAmrNbModeIndex, sidInterval = 0;
+    int32 amrWbMode = kDefaultAmrWbModeIndex, g711Law = 0, scVbr = 0;
+    int32 opusBitrate = kOpusBitrateValues[kDefaultOpusBitrateIndex];
+};
+
+static int32 tableValueOrDefault(int32 value, const int32* table, int32 count, int32 defaultIndex)
+{
+    return std::find(table, table + count, value) != table + count ? value : table[defaultIndex];
+}
+
+static bool readSavedState(IBStream* state, SavedState& value)
+{
+    if (!state) return false;
+    IBStreamer stream(state, kLittleEndian);
+    if (!stream.readInt32(value.eraMode) || !stream.readFloat(value.dry)
+        || !stream.readFloat(value.gain) || !stream.readBool(value.art)
+        || !stream.readFloat(value.amount) || !stream.readBool(value.bypass)) return false;
+
+    bool ended = false;
+    auto trailing = [&](auto& field) {
+        if (ended) return true;
+        uint8_t bytes[4]{};
+        const auto count = stream.readRaw(bytes, sizeof(bytes));
+        if (count == 0) { ended = true; return true; }
+        if (count != sizeof(bytes)) return false;
+        const uint32_t bits = uint32_t(bytes[0]) | (uint32_t(bytes[1]) << 8)
+            | (uint32_t(bytes[2]) << 16) | (uint32_t(bytes[3]) << 24);
+        static_assert(sizeof(field) == sizeof(bits));
+        std::memcpy(&field, &bits, sizeof(field));
+        return true;
+    };
+    if (!trailing(value.outputEndpoint) || !trailing(value.segment)
+        || !trailing(value.packetLoss) || !trailing(value.degradation)
+        || !trailing(value.evsSampleRate) || !trailing(value.evsBitrate)
+        || !trailing(value.evsMaxBw) || !trailing(value.opusBandwidth)
+        || !trailing(value.amrNbMode) || !trailing(value.sidInterval)
+        || !trailing(value.amrWbMode) || !trailing(value.g711Law)
+        || !trailing(value.scVbr) || !trailing(value.opusBitrate)) return false;
+
+    if (!std::isfinite(value.dry) || !std::isfinite(value.gain)
+        || !std::isfinite(value.amount) || !std::isfinite(value.packetLoss)
+        || !std::isfinite(value.degradation)) return false;
+    value.eraMode = std::clamp(value.eraMode, 0, kMaxExposedEndpoint);
+    value.outputEndpoint = std::clamp(value.outputEndpoint, 0, kMaxExposedEndpoint);
+    value.segment = std::clamp(value.segment, 0, kMaxDegradationSegment);
+    value.dry = std::clamp(value.dry, 0.0f, 1.0f);
+    value.gain = std::clamp(value.gain, -60.0f, 24.0f);
+    value.amount = std::clamp(value.amount, 0.0f, 1.0f);
+    value.packetLoss = std::clamp(value.packetLoss, 0.0f, 0.30f);
+    value.degradation = std::clamp(value.degradation, 0.0f, 1.0f);
+    value.evsSampleRate = tableValueOrDefault(value.evsSampleRate, kEvsSampleRateValues, kNumEvsSampleRates, kDefaultEvsSampleRateIndex);
+    value.evsBitrate = tableValueOrDefault(value.evsBitrate, kEvsBitrateValues, kNumEvsBitrates, kDefaultEvsBitrateIndex);
+    value.evsMaxBw = std::clamp(value.evsMaxBw, (int32)EVS_NB, (int32)EVS_FB);
+    value.opusBandwidth = std::clamp(value.opusBandwidth, 1101, 1105);
+    value.amrNbMode = std::clamp(value.amrNbMode, 0, kNumAmrNbModes - 1);
+    value.amrWbMode = std::clamp(value.amrWbMode, 0, kNumAmrWbModes - 1);
+    value.sidInterval = std::clamp(value.sidInterval, 0, 100);
+    if (value.sidInterval < 3) value.sidInterval = 0;
+    value.g711Law = std::clamp(value.g711Law, 0, 1);
+    value.scVbr = std::clamp(value.scVbr, 0, 1);
+    value.opusBitrate = tableValueOrDefault(value.opusBitrate, kOpusBitrateValues, kNumOpusBitrates, kDefaultOpusBitrateIndex);
+    return true;
 }
 
 TelephonyDSP::RouteEndpoint endpointFromParameter(int32 endpoint)
@@ -199,7 +282,7 @@ tresult PLUGIN_API TelephonyVoiceProcessor::setBusArrangements(
     SpeakerArrangement* inputs, int32 numIns,
     SpeakerArrangement* outputs, int32 numOuts)
 {
-    if (numIns == 1 && numOuts == 1) {
+    if (inputs && outputs && numIns == 1 && numOuts == 1) {
         if ((inputs[0] == SpeakerArr::kMono || inputs[0] == SpeakerArr::kStereo) &&
             (outputs[0] == SpeakerArr::kMono || outputs[0] == SpeakerArr::kStereo)) 
         {
@@ -211,9 +294,15 @@ tresult PLUGIN_API TelephonyVoiceProcessor::setBusArrangements(
 
 tresult PLUGIN_API TelephonyVoiceProcessor::setupProcessing(ProcessSetup& newSetup)
 {
+    if (!std::isfinite(newSetup.sampleRate) || newSetup.sampleRate < 8000.0
+        || newSetup.sampleRate > 384000.0 || newSetup.maxSamplesPerBlock <= 0
+        || canProcessSampleSize(newSetup.symbolicSampleSize) != kResultTrue)
+        return kResultFalse;
+    const auto result = AudioEffect::setupProcessing(newSetup);
+    if (result != kResultOk) return result;
     dsp.setSampleRate(newSetup.sampleRate);
     dsp.setSimulateLatency(true); // VST uses latency
-    return AudioEffect::setupProcessing(newSetup);
+    return kResultOk;
 }
 
 tresult PLUGIN_API TelephonyVoiceProcessor::setActive(TBool state)
@@ -246,7 +335,9 @@ tresult PLUGIN_API TelephonyVoiceProcessor::process(ProcessData& data)
                 ParamValue value;
                 int32 sampleOffset;
                 int32 numPoints = queue->getPointCount();
-                if (queue->getPoint(numPoints - 1, sampleOffset, value) == kResultOk) {
+                if (numPoints > 0 && queue->getPoint(numPoints - 1, sampleOffset, value) == kResultOk
+                    && std::isfinite(value)) {
+                    value = std::clamp(value, 0.0, 1.0);
                     ParamID pid = queue->getParameterId();
                     switch (pid) {
                         case kParamEraMode:
@@ -317,60 +408,74 @@ tresult PLUGIN_API TelephonyVoiceProcessor::process(ProcessData& data)
         updateDSPParameters();
     }
 
+    // Hosts can flush parameters without supplying audio buses or samples.
+    if (data.numSamples == 0) return kResultOk;
+    if (data.numSamples < 0 || data.symbolicSampleSize != kSample32) return kResultFalse;
     if (data.numInputs == 0 || data.numOutputs == 0) return kResultOk;
-    if (data.symbolicSampleSize != kSample32) return kResultOk;
+    if (!data.inputs || !data.outputs) return kResultFalse;
 
-    int32 numInCh = data.inputs[0].numChannels;
-    int32 numOutCh = data.outputs[0].numChannels;
+    const int32 numInCh = data.inputs[0].numChannels;
+    const int32 numOutCh = data.outputs[0].numChannels;
     float** in = data.inputs[0].channelBuffers32;
     float** out = data.outputs[0].channelBuffers32;
-    if (!in || !out || numInCh <= 0 || numOutCh <= 0) return kResultOk;
+    if (!in || !out || numInCh < 1 || numInCh > 2 || numOutCh < 1 || numOutCh > 2)
+        return kResultFalse;
+    for (int ch = 0; ch < numInCh; ++ch) if (!in[ch]) return kResultFalse;
+    for (int ch = 0; ch < numOutCh; ++ch) if (!out[ch]) return kResultFalse;
+
+    // Silence flags describe input only: codec/delay tails can still be audible.
+    data.outputs[0].silenceFlags = 0;
+    std::vector<float> silence;
+    float* source[2] = { in[0], in[numInCh - 1] };
+    if (data.inputs[0].silenceFlags != 0) {
+        silence.assign(data.numSamples, 0.0f);
+        for (int ch = 0; ch < numInCh; ++ch)
+            if (data.inputs[0].silenceFlags & (uint64(1) << ch)) source[ch] = silence.data();
+    }
 
     const int delayLen = bypassDelayLen;
     const int maxDelayCh = (std::min)((int)numOutCh, (int)bypassDelayBuf.size());
-
     if (currentBypass) {
-        // Latency-compensated bypass: emit the input delayed by the same
-        // amount the host compensates for (getLatencySamples()), so
-        // toggling bypass does not shift the audio in time.
-        for (int ch = 0; ch < numOutCh; ch++) {
-            float* src = in[ch % numInCh];
-            float* dst = out[ch];
-            if (delayLen <= 0 || ch >= maxDelayCh) {
-                if (src != dst) memcpy(dst, src, data.numSamples * sizeof(float));
-            } else {
-                float* ring = bypassDelayBuf[ch].data();
-                int pos = bypassDelayPos;
-                for (int32 i = 0; i < data.numSamples; ++i) {
-                    const float x = src[i]; // read before dst write: src may alias dst
-                    dst[i] = ring[pos];
-                    ring[pos] = x;
-                    if (++pos == delayLen) pos = 0;
+        // Keep codec state and delay tails moving while bypassed. Otherwise
+        // re-enabling the effect can replay audio from before the bypass.
+        std::vector<std::vector<float>> wet(numOutCh, std::vector<float>(data.numSamples));
+        float* wetOut[2] = { wet[0].data(), wet[numOutCh - 1].data() };
+        dsp.process(source, numInCh, wetOut, numOutCh, data.numSamples);
+        for (int32 i = 0; i < data.numSamples; ++i) {
+            // Snapshot all inputs before any output write, including a mono
+            // input aliased to the first of two output channels.
+            const float inputSamples[2] = { source[0][i], source[numInCh - 1][i] };
+            for (int ch = 0; ch < numOutCh; ++ch) {
+                const float sample = numOutCh == 1 && numInCh == 2
+                    ? (inputSamples[0] + inputSamples[1]) * 0.5f : inputSamples[ch % numInCh];
+                const float x = std::isfinite(sample) ? sample : 0.0f;
+                if (delayLen <= 0 || ch >= maxDelayCh) out[ch][i] = x;
+                else {
+                    out[ch][i] = bypassDelayBuf[ch][bypassDelayPos];
+                    bypassDelayBuf[ch][bypassDelayPos] = x;
                 }
             }
+            if (delayLen > 0 && ++bypassDelayPos == delayLen) bypassDelayPos = 0;
         }
-        if (delayLen > 0) bypassDelayPos = (int)((bypassDelayPos + data.numSamples) % delayLen);
         return kResultOk;
     }
 
-    // Keep the bypass delay line fed while processing normally so a
-    // mid-playback bypass toggle plays correctly aligned dry audio
-    // instead of a stale/zeroed buffer.
+    // Feed dry delay before DSP writes potentially in-place output.
     if (delayLen > 0) {
-        for (int ch = 0; ch < maxDelayCh; ch++) {
-            const float* src = in[ch % numInCh];
+        for (int ch = 0; ch < maxDelayCh; ++ch) {
+            const float* src = source[ch % numInCh];
             float* ring = bypassDelayBuf[ch].data();
             int pos = bypassDelayPos;
             for (int32 i = 0; i < data.numSamples; ++i) {
-                ring[pos] = src[i];
+                const float sample = numOutCh == 1 && numInCh == 2
+                    ? (source[0][i] + source[1][i]) * 0.5f : src[i];
+                ring[pos] = std::isfinite(sample) ? sample : 0.0f;
                 if (++pos == delayLen) pos = 0;
             }
         }
-        bypassDelayPos = (int)((bypassDelayPos + data.numSamples) % delayLen);
+        bypassDelayPos = (int)((int64(bypassDelayPos) + data.numSamples) % delayLen);
     }
-
-    // Pass to DSP (Multi-channel)
-    dsp.process(in, numInCh, out, numOutCh, data.numSamples);
+    dsp.process(source, numInCh, out, numOutCh, data.numSamples);
 
     return kResultOk;
 }
@@ -387,7 +492,7 @@ void TelephonyVoiceProcessor::updateDSPParameters()
     currentG711Law = std::clamp(currentG711Law, 0, 1);
     currentEvsDtxSidInterval = std::clamp(currentEvsDtxSidInterval, 0, 100);
     currentEvsScVbr = std::clamp(currentEvsScVbr, 0, 1);
-    currentOpusBitrate = std::clamp(currentOpusBitrate, 6, 510000);
+    currentOpusBitrate = std::clamp(currentOpusBitrate, 6000, 510000);
     dsp.setRoute(endpointFromParameter(currentEraMode),
                  endpointFromParameter(currentOutputEndpoint),
                  degradationSegmentFromParameter(currentDegradationSegment));
@@ -405,68 +510,54 @@ void TelephonyVoiceProcessor::updateDSPParameters()
 
 tresult PLUGIN_API TelephonyVoiceProcessor::setState(IBStream* state)
 {
-    IBStreamer streamer(state, kLittleEndian);
-    int32 mode; float dry, gain, amt; bool art, byp;
-    if (!streamer.readInt32(mode)) return kResultFalse;
-    if (!streamer.readFloat(dry)) return kResultFalse;
-    if (!streamer.readFloat(gain)) return kResultFalse;
-    if (!streamer.readBool(art)) return kResultFalse;
-    if (!streamer.readFloat(amt)) return kResultFalse;
-    if (!streamer.readBool(byp)) return kResultFalse;
-    currentEraMode = std::clamp(mode, 0, kMaxExposedEndpoint);
-    currentDryWet = dry; currentOutGain = gain;
-    currentArtifactsEnabled = art; currentArtifactAmount = amt;
-    currentBypass = byp;
-    if (!streamer.readInt32(currentOutputEndpoint)) currentOutputEndpoint = kDefaultOutputEndpoint;
-    if (!streamer.readInt32(currentDegradationSegment)) currentDegradationSegment = 0;
-    if (!streamer.readFloat(currentPacketLossRate)) currentPacketLossRate = 0.0f;
-    if (!streamer.readFloat(currentNetworkDegradation)) currentNetworkDegradation = 0.0f;
-    if (!streamer.readInt32(currentEvsSampleRate)) currentEvsSampleRate = kDefaultEvsSampleRate;
-    if (!streamer.readInt32(currentEvsBitrate)) currentEvsBitrate = kDefaultEvsBitrate;
-    if (!streamer.readInt32(currentEvsMaxBw)) currentEvsMaxBw = kDefaultEvsMaxBw;
-    if (!streamer.readInt32(currentOpusBandwidth)) currentOpusBandwidth = kDefaultOpusBandwidth;
-    if (!streamer.readInt32(currentAmrNbMode)) currentAmrNbMode = kDefaultAmrNbModeIndex;
-    if (!streamer.readInt32(currentEvsDtxSidInterval)) currentEvsDtxSidInterval = 0;
-    if (!streamer.readInt32(currentAmrWbMode)) currentAmrWbMode = kDefaultAmrWbModeIndex;
-    if (!streamer.readInt32(currentG711Law)) currentG711Law = kDefaultG711LawIndex;
-    if (!streamer.readInt32(currentEvsScVbr)) currentEvsScVbr = 0;
-    if (!streamer.readInt32(currentOpusBitrate)) currentOpusBitrate = kOpusBitrateValues[kDefaultOpusBitrateIndex];
-    currentOutputEndpoint = std::clamp(currentOutputEndpoint, 0, kMaxExposedEndpoint);
-    currentDegradationSegment = std::clamp(currentDegradationSegment, 0, kMaxDegradationSegment);
-    currentPacketLossRate = std::clamp(currentPacketLossRate, 0.0f, 0.95f);
-    currentNetworkDegradation = std::clamp(currentNetworkDegradation, 0.0f, 1.0f);
-    currentEvsMaxBw = std::clamp(currentEvsMaxBw, (int32)EVS_NB, (int32)EVS_FB);
-    currentOpusBandwidth = std::clamp(currentOpusBandwidth, 1101, 1105);
-    currentAmrNbMode = std::clamp(currentAmrNbMode, 0, kNumAmrNbModes - 1);
-    currentEvsDtxSidInterval = std::clamp(currentEvsDtxSidInterval, 0, 100);
-    currentAmrWbMode = std::clamp(currentAmrWbMode, 0, kNumAmrWbModes - 1);
-    currentG711Law = std::clamp(currentG711Law, 0, 1);
-    currentEvsScVbr = std::clamp(currentEvsScVbr, 0, 1);
-    currentOpusBitrate = std::clamp(currentOpusBitrate, 6, 510000);
+    SavedState value;
+    if (!readSavedState(state, value)) return kResultFalse;
+    currentEraMode = value.eraMode;
+    currentDryWet = value.dry; currentOutGain = value.gain;
+    currentArtifactsEnabled = value.art; currentArtifactAmount = value.amount;
+    currentBypass = value.bypass;
+    currentOutputEndpoint = value.outputEndpoint;
+    currentDegradationSegment = value.segment;
+    currentPacketLossRate = value.packetLoss;
+    currentNetworkDegradation = value.degradation;
+    currentEvsSampleRate = value.evsSampleRate;
+    currentEvsBitrate = value.evsBitrate;
+    currentEvsMaxBw = value.evsMaxBw;
+    currentOpusBandwidth = value.opusBandwidth;
+    currentAmrNbMode = value.amrNbMode;
+    currentEvsDtxSidInterval = value.sidInterval;
+    currentAmrWbMode = value.amrWbMode;
+    currentG711Law = value.g711Law;
+    currentEvsScVbr = value.scVbr;
+    currentOpusBitrate = value.opusBitrate;
     updateDSPParameters();
     return kResultOk;
 }
 
 tresult PLUGIN_API TelephonyVoiceProcessor::getState(IBStream* state)
 {
+    if (!state) return kResultFalse;
     IBStreamer streamer(state, kLittleEndian);
-    streamer.writeInt32(currentEraMode); streamer.writeFloat(currentDryWet);
-    streamer.writeFloat(currentOutGain); streamer.writeBool(currentArtifactsEnabled);
-    streamer.writeFloat(currentArtifactAmount); streamer.writeBool(currentBypass);
-    streamer.writeInt32(currentOutputEndpoint);
-    streamer.writeInt32(currentDegradationSegment);
-    streamer.writeFloat(currentPacketLossRate);
-    streamer.writeFloat(currentNetworkDegradation);
-    streamer.writeInt32(currentEvsSampleRate);
-    streamer.writeInt32(currentEvsBitrate);
-    streamer.writeInt32(currentEvsMaxBw);
-    streamer.writeInt32(currentOpusBandwidth);
-    streamer.writeInt32(currentAmrNbMode);
-    streamer.writeInt32(currentEvsDtxSidInterval);
-    streamer.writeInt32(currentAmrWbMode);
-    streamer.writeInt32(currentG711Law);
-    streamer.writeInt32(currentEvsScVbr);
-    streamer.writeInt32(currentOpusBitrate);
+    if (!streamer.writeInt32(currentEraMode)) return kResultFalse;
+    if (!streamer.writeFloat(currentDryWet)) return kResultFalse;
+    if (!streamer.writeFloat(currentOutGain)) return kResultFalse;
+    if (!streamer.writeBool(currentArtifactsEnabled)) return kResultFalse;
+    if (!streamer.writeFloat(currentArtifactAmount)) return kResultFalse;
+    if (!streamer.writeBool(currentBypass)) return kResultFalse;
+    if (!streamer.writeInt32(currentOutputEndpoint)) return kResultFalse;
+    if (!streamer.writeInt32(currentDegradationSegment)) return kResultFalse;
+    if (!streamer.writeFloat(currentPacketLossRate)) return kResultFalse;
+    if (!streamer.writeFloat(currentNetworkDegradation)) return kResultFalse;
+    if (!streamer.writeInt32(currentEvsSampleRate)) return kResultFalse;
+    if (!streamer.writeInt32(currentEvsBitrate)) return kResultFalse;
+    if (!streamer.writeInt32(currentEvsMaxBw)) return kResultFalse;
+    if (!streamer.writeInt32(currentOpusBandwidth)) return kResultFalse;
+    if (!streamer.writeInt32(currentAmrNbMode)) return kResultFalse;
+    if (!streamer.writeInt32(currentEvsDtxSidInterval)) return kResultFalse;
+    if (!streamer.writeInt32(currentAmrWbMode)) return kResultFalse;
+    if (!streamer.writeInt32(currentG711Law)) return kResultFalse;
+    if (!streamer.writeInt32(currentEvsScVbr)) return kResultFalse;
+    if (!streamer.writeInt32(currentOpusBitrate)) return kResultFalse;
     return kResultOk;
 }
 
@@ -602,10 +693,10 @@ tresult PLUGIN_API TelephonyVoiceController::initialize(FUnknown* context)
     segmentParam->appendString(STR16("\u306a\u3057"));
     parameters.addParameter(segmentParam);
 
-    parameters.addParameter(new RangeParameter(STR16("Dry/Wet"), kParamDryWet, STR16("%"), 0.0, 1.0, 0.5, 0, ParameterInfo::kCanAutomate));
+    parameters.addParameter(new RangeParameter(STR16("Dry/Wet"), kParamDryWet, STR16("%"), 0.0, 100.0, 50.0, 0, ParameterInfo::kCanAutomate));
     parameters.addParameter(new RangeParameter(STR16("Output Gain"), kParamOutputGain, STR16("dB"), -60.0, 24.0, 0.0, 0, ParameterInfo::kCanAutomate));
     parameters.addParameter(new RangeParameter(STR16("Enable Artifacts"), kParamArtifactsEnabled, STR16(""), 0.0, 1.0, 0.0, 1, ParameterInfo::kCanAutomate));
-    parameters.addParameter(new RangeParameter(STR16("Artifact Amount"), kParamArtifactAmount, STR16("%"), 0.0, 1.0, 0.0, 0, ParameterInfo::kCanAutomate));
+    parameters.addParameter(new RangeParameter(STR16("Artifact Amount"), kParamArtifactAmount, STR16("%"), 0.0, 100.0, 0.0, 0, ParameterInfo::kCanAutomate));
     parameters.addParameter(new RangeParameter(STR16("\u30d1\u30b1\u30c3\u30c8\u30ed\u30b9"), kParamPacketLossRate, STR16("%"), 0.0, 30.0, 0.0, 0, ParameterInfo::kCanAutomate));
     parameters.addParameter(new RangeParameter(STR16("\u901a\u4fe1\u52a3\u5316"), kParamNetworkDegradation, STR16("%"), 0.0, 100.0, 0.0, 0, ParameterInfo::kCanAutomate));
     // EVS DTX SID update interval in 20 ms frames. 0 = variable (the
@@ -616,44 +707,30 @@ tresult PLUGIN_API TelephonyVoiceController::initialize(FUnknown* context)
     parameters.addParameter(new RangeParameter(STR16("EVS SC-VBR"), kParamEvsScVbr, STR16(""), 0.0, 1.0, 0.0, 1, ParameterInfo::kCanAutomate));
     parameters.addParameter(new RangeParameter(STR16("Bypass"), kParamMasterBypass, STR16(""), 0, 1, 0, 1, ParameterInfo::kCanAutomate | ParameterInfo::kIsBypass));
 
+    // Hosts use metadata defaults for their reset/default preset actions.
+    // StringListParameter::setNormalized changes only the live value.
+    for (int32 i = 0; i < parameters.getParameterCount(); ++i) {
+        auto* parameter = parameters.getParameterByIndex(i);
+        parameter->getInfo().defaultNormalizedValue = parameter->getNormalized();
+    }
+
     return kResultOk;
 }
 
 tresult PLUGIN_API TelephonyVoiceController::setComponentState(IBStream* state)
 {
-    // Mirror TelephonyVoiceProcessor::setState() so the UI reflects the
-    // values the processor just restored. The stream layout must stay in
-    // lockstep with getState()/setState(); trailing fields are optional
-    // for backward compatibility with older saved states.
-    if (!state) return kResultFalse;
-
-    IBStreamer streamer(state, kLittleEndian);
-    int32 eraMode; float dry, gain, amt; bool art, byp;
-    if (!streamer.readInt32(eraMode)) return kResultFalse;
-    if (!streamer.readFloat(dry)) return kResultFalse;
-    if (!streamer.readFloat(gain)) return kResultFalse;
-    if (!streamer.readBool(art)) return kResultFalse;
-    if (!streamer.readFloat(amt)) return kResultFalse;
-    if (!streamer.readBool(byp)) return kResultFalse;
-
-    int32 outputEndpoint, degradationSegment;
-    float packetLossRate, networkDegradation;
-    int32 evsSampleRate, evsBitrate, evsMaxBw, opusBandwidth, amrNbMode, evsDtxSidInterval;
-    int32 amrWbMode, g711Law, evsScVbr, opusBitrate;
-    if (!streamer.readInt32(outputEndpoint)) outputEndpoint = kDefaultOutputEndpoint;
-    if (!streamer.readInt32(degradationSegment)) degradationSegment = 0;
-    if (!streamer.readFloat(packetLossRate)) packetLossRate = 0.0f;
-    if (!streamer.readFloat(networkDegradation)) networkDegradation = 0.0f;
-    if (!streamer.readInt32(evsSampleRate)) evsSampleRate = kDefaultEvsSampleRate;
-    if (!streamer.readInt32(evsBitrate)) evsBitrate = kDefaultEvsBitrate;
-    if (!streamer.readInt32(evsMaxBw)) evsMaxBw = kDefaultEvsMaxBw;
-    if (!streamer.readInt32(opusBandwidth)) opusBandwidth = kDefaultOpusBandwidth;
-    if (!streamer.readInt32(amrNbMode)) amrNbMode = kDefaultAmrNbModeIndex;
-    if (!streamer.readInt32(evsDtxSidInterval)) evsDtxSidInterval = 0;
-    if (!streamer.readInt32(amrWbMode)) amrWbMode = kDefaultAmrWbModeIndex;
-    if (!streamer.readInt32(g711Law)) g711Law = kDefaultG711LawIndex;
-    if (!streamer.readInt32(evsScVbr)) evsScVbr = 0;
-    if (!streamer.readInt32(opusBitrate)) opusBitrate = kOpusBitrateValues[kDefaultOpusBitrateIndex];
+    SavedState value;
+    if (!readSavedState(state, value)) return kResultFalse;
+    const auto eraMode = value.eraMode, outputEndpoint = value.outputEndpoint;
+    const auto degradationSegment = value.segment;
+    const auto dry = value.dry, gain = value.gain, amt = value.amount;
+    const auto art = value.art, byp = value.bypass;
+    const auto packetLossRate = value.packetLoss, networkDegradation = value.degradation;
+    const auto evsSampleRate = value.evsSampleRate, evsBitrate = value.evsBitrate;
+    const auto evsMaxBw = value.evsMaxBw, opusBandwidth = value.opusBandwidth;
+    const auto amrNbMode = value.amrNbMode, evsDtxSidInterval = value.sidInterval;
+    const auto amrWbMode = value.amrWbMode, g711Law = value.g711Law;
+    const auto evsScVbr = value.scVbr, opusBitrate = value.opusBitrate;
 
     setParamNormalized(kParamEraMode,
         (double)std::clamp(eraMode, 0, kMaxExposedEndpoint) / (double)kMaxExposedEndpoint);

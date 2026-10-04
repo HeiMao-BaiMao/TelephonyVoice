@@ -1,5 +1,6 @@
 #define NOMINMAX
 #include "dsp/ChannelProcessor.h"
+#include "dsp/EvsConfig.h"
 #include "dsp/G711Codec.h"
 #include "dsp/GsmCodec.h"
 #include "dsp/AmrNbCodec.h"
@@ -17,12 +18,12 @@ namespace TelephonyDSP {
         : hostSampleRate(hostSR), currentMode(EraMode::Bypass),
           paramArtifactsEnabled(false), paramArtifactAmount(0.0f),
           paramPacketLossRate(0.0f), paramNetworkDegradation(0.0f),
-          packetLossSeed(0x12345678u), packetLossBurstFrames(0),
+          packetLossSeed(0x12345678u), artifactSeed(12345u), packetLossBurstFrames(0),
           evsSampleRate(32000), evsBitrateBps(EVS_BR_13200), evsMaxBandwidth(EVS_SWB),
-          evsDtxSidInterval(0),
-          downMaxInLen(0), upMaxInLen(0),
-          amrWbMode(2), // 12.65 kbps; matches AMRWBCodec's own default.
-          evsOpusBitrateBps(24000) // default Opus target bitrate (24 kbps).
+          evsDtxSidInterval(0), evsScVbrEnabled(false), evsG711Law(0),
+          opusBandwidth(1105), evsOpusBitrateBps(24000),
+          amrWbMode(2), amrNbMode(7),
+          downMaxInLen(0), upMaxInLen(0)
     {
         size_t bigSize = 131072;
         ringCodecIn.resize(bigSize);
@@ -50,11 +51,12 @@ namespace TelephonyDSP {
             recreateResamplers();
             updateFilters();
             recreateCodec();
-            ringCodecIn.reset(); ringCodecOut.reset();
+            reset();
         }
     }
 
     void ChannelProcessor::setEVSConfig(int sampleRateHz, int bitrateBps, EVS_Bandwidth maxBw) {
+        normalizeEvsConfig(sampleRateHz, bitrateBps, maxBw);
         bool changed = (evsSampleRate != sampleRateHz)
                     || (evsBitrateBps != bitrateBps)
                     || (evsMaxBandwidth != maxBw);
@@ -73,7 +75,8 @@ namespace TelephonyDSP {
         if (changed && rebuildForEvs) {
             recreateResamplers();
             recreateCodec();
-            ringCodecIn.reset(); ringCodecOut.reset();
+            updateFilters();
+            ringCodecIn.reset(); ringCodecOut.reset(); outputBuffer.reset();
         }
     }
 
@@ -144,21 +147,11 @@ namespace TelephonyDSP {
     }
 
     void ChannelProcessor::setG711Law(int law) {
-        evsG711Law = law;
-        // If the active codec is a G.711 codec, push the new law flag through
-        // in place; otherwise the change is remembered in evsG711Law and picked
-        // up the next time recreateCodec() builds a G.711 codec.
-        if (codec) {
-            G711Codec* g711 = dynamic_cast<G711Codec*>(codec.get());
-            if (g711) {
-                g711->setLaw(law > 0);
-            }
-        }
-        if (currentMode == EraMode::PSTN_G711) {
-            // Rebuild so the freshly-created G711Codec is constructed with the
-            // new evsG711Law flag and resampler/buffer state is consistent.
-            recreateCodec();
-        }
+        const int normalized = law > 0 ? 1 : 0;
+        if (evsG711Law == normalized) return;
+        evsG711Law = normalized;
+        if (auto* g711 = dynamic_cast<G711Codec*>(codec.get()))
+            g711->setLaw(normalized != 0);
     }
 
     void ChannelProcessor::setAmrWbMode(int mode) {
@@ -194,8 +187,8 @@ namespace TelephonyDSP {
         // yet (and therefore can't push the value into a live encoder)
         // still pick the caller's preference up on the next recreateCodec()
         // pass. Clamp here so the stashed value is always within Opus's
-        // legal OPUS_BITRATE_MIN..OPUS_BITRATE_MAX (6..510000) range.
-        const int clamped = bps < 6 ? 6 : (bps > 510000 ? 510000 : bps);
+        // supported bitrate (6000..510000) range.
+        const int clamped = bps < 6000 ? 6000 : (bps > 510000 ? 510000 : bps);
         evsOpusBitrateBps = clamped;
         // If a live OpusCodec is attached, push the new bitrate through
         // OpusCodec::setBitrate() so the change takes effect on the very
@@ -206,17 +199,9 @@ namespace TelephonyDSP {
                 oc->setBitrate(evsOpusBitrateBps);
             }
         }
-        if (currentMode == EraMode::OPUS_VOIP) {
-            // The current OpusCodec's bitstream buffer is sized in the
-            // ctor against the original sample rate and an assumed upper
-            // bitrate; for a small (e.g. 6 kbps) target the existing
-            // buffer is still comfortably oversized. We rebuild anyway
-            // so a future rate change can't strand a too-small buffer
-            // and so the encoder state is consistent with the new
-            // target bitrate.
-            recreateCodec();
-            ringCodecIn.reset(); ringCodecOut.reset();
-        }
+        // Updating Opus CTLs in place preserves packet queues and codec
+        // history. Rebuilding here also used to discard the requested bitrate.
+
     }
 
  void ChannelProcessor::configure(bool artifacts, float amount, float packetLossRate, float networkDegradation) {
@@ -244,7 +229,9 @@ void ChannelProcessor::reset() {
         hpFilter1.reset(); hpFilter2.reset();
         lpFilter1.reset(); lpFilter2.reset();
         packetLossBurstFrames = 0;
-        simulatedPathPLC.reset(640);
+        packetLossSeed = 0x12345678u;
+        artifactSeed = 12345u;
+        simulatedPathPLC.reset(codec ? codec->getFrameSize() : 640);
         if (resamplerDown) resamplerDown->clear();
         if (resamplerUp) resamplerUp->clear();
         if (codec) codec->reset();
@@ -264,6 +251,7 @@ void ChannelProcessor::reset() {
     }
 
     void ChannelProcessor::pushInput(const float* in, int numSamples) {
+        if (!in || numSamples <= 0) return;
         if (currentMode == EraMode::Bypass) {
             outputBuffer.write(in, numSamples);
         } else {
@@ -273,6 +261,7 @@ void ChannelProcessor::reset() {
     }
 
     size_t ChannelProcessor::pullOutput(float* out, int numSamples) {
+        if (!out || numSamples <= 0) return 0;
         size_t avail = outputBuffer.getReadAvailable();
         size_t count = (std::min)((size_t)numSamples, avail);
         outputBuffer.read(out, count);
@@ -310,10 +299,14 @@ void ChannelProcessor::reset() {
             // We keep it at 1024 to match the historical buffer size, but
             // processCodec now chunks its calls so callers are free to push
             // more than this per pushInput().
+            // Codec PCM is 16-bit. A 96 dB stopband is below its quantization
+            // floor; minimum phase and a 10% transition preserve the speech
+            // passband while keeping two-leg buffering inside the 150 ms budget.
+            // The 24-bit/2% default needed ~600 ms per G.711 round trip.
             downMaxInLen = 1024;
             upMaxInLen = 1024;
-            resamplerDown = std::make_unique<r8b::CDSPResampler24>(hostSampleRate, targetSR, downMaxInLen);
-            resamplerUp = std::make_unique<r8b::CDSPResampler24>(targetSR, hostSampleRate, upMaxInLen);
+            resamplerDown = std::make_unique<r8b::CDSPResampler>(hostSampleRate, targetSR, downMaxInLen, 10.0, 96.0, r8b::fprMinPhase);
+            resamplerUp = std::make_unique<r8b::CDSPResampler>(targetSR, hostSampleRate, upMaxInLen, 10.0, 96.0, r8b::fprMinPhase);
         }
     }
 
@@ -467,6 +460,7 @@ void ChannelProcessor::reset() {
 
 void ChannelProcessor::recreateCodec() {
         codec.reset();
+        speexAux.reset();
         switch (currentMode) {
             case EraMode::PSTN_G711: codec = std::make_unique<G711Codec>(8000, evsG711Law > 0); break;
             case EraMode::GSM_FR: codec = std::make_unique<GSMCodec>(); break;
@@ -477,6 +471,8 @@ void ChannelProcessor::recreateCodec() {
                 codecFrameSIn.resize(32000 / 50);
                 codecFrameSOut.resize(32000 / 50);
                 simulatedPathPLC.reset(32000 / 50);
+                // EVS_LIKE is a filter-only path. Do not attach the Opus
+                // speech gate here: quiet valid input must not become PLC.
                 return;
             case EraMode::EVS_NATIVE:
                 codec = std::make_unique<EVSCodec>(evsSampleRate, evsBitrateBps, evsMaxBandwidth,
@@ -497,7 +493,7 @@ void ChannelProcessor::recreateCodec() {
                 // The 4th argument carries the caller's OPUS_BANDWIDTH_*
                 // cap (default 1105 = FB) so a live setOpusBandwidth()
                 // change is honored on the very next codec rebuild.
-                codec = std::make_unique<OpusCodec>(48000, 24000, 6, opusBandwidth);
+                codec = std::make_unique<OpusCodec>(48000, evsOpusBitrateBps, 6, opusBandwidth);
                 break;
 #endif
             default: break;
@@ -660,10 +656,12 @@ void ChannelProcessor::recreateCodec() {
     
     void ChannelProcessor::applyArtifacts(float* buffer, int numSamples) {
         if (!paramArtifactsEnabled || paramArtifactAmount <= 0.001f) return;
-        static uint32_t seed = 12345;
-        auto randf = [&]() { seed = seed * 1664525 + 1013904223; return (float)(seed & 0xFFFF) / 32768.0f - 1.0f; };
+        auto randf = [&]() {
+            artifactSeed = artifactSeed * 1664525u + 1013904223u;
+            return (float)(artifactSeed & 0xFFFF) / 32768.0f - 1.0f;
+        };
         for (int i=0; i<numSamples; ++i) {
-            if (currentMode == EraMode::GSM_FR && (rand() % 1000) < (10 * paramArtifactAmount)) buffer[i] += randf() * 0.5f * paramArtifactAmount;
+            if (currentMode == EraMode::GSM_FR && ((randf() + 1.0f) * 500.0f) < (10 * paramArtifactAmount)) buffer[i] += randf() * 0.5f * paramArtifactAmount;
             // General noise
             buffer[i] += randf() * 0.01f * paramArtifactAmount;
         }

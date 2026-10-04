@@ -55,6 +55,13 @@ target_include_directories(opencore-amrnb PRIVATE
     "${AMRNB_ENC_DIR}/src"
 )
 
+# Keep opencore's arithmetic ABI separate from the EVS reference implementation.
+# Some identically named routines carry an extra overflow-pointer parameter.
+foreach(_symbol L_abs L_negate L_shr_r div_s mult_r negate norm_l norm_s
+        shr shr_r sub Pow2)
+    target_compile_definitions(opencore-amrnb PRIVATE "${_symbol}=telephony_amrnb_${_symbol}")
+endforeach()
+
 if(MSVC)
     target_compile_definitions(opencore-amrnb PRIVATE _CRT_SECURE_NO_WARNINGS)
     target_compile_options(opencore-amrnb PRIVATE /wd4244 /wd4267 /wd4305 /wd4018)
@@ -76,6 +83,19 @@ list(REMOVE_ITEM AMRWB_DEC_SOURCES
 add_library(opencore-amrwb STATIC
     "${OPENCORE_AMR_ROOT}/amrwb/wrapper.cpp"
     ${AMRWB_DEC_SOURCES}
+)
+
+# EVS exports float codebooks with these names; opencore uses int16 tables.
+# Never let /FORCE:MULTIPLE (or archive order) choose one for both codecs.
+target_compile_definitions(opencore-amrwb PRIVATE
+    dico1_isf=telephony_amrwb_dico1_isf
+    dico2_isf=telephony_amrwb_dico2_isf
+    dico21_isf_36b=telephony_amrwb_dico21_isf_36b
+    dico22_isf_36b=telephony_amrwb_dico22_isf_36b
+    dico23_isf_36b=telephony_amrwb_dico23_isf_36b
+    phase_dispersion=telephony_amrwb_phase_dispersion
+    t_qua_gain6b=telephony_amrwb_t_qua_gain6b
+    t_qua_gain7b=telephony_amrwb_t_qua_gain7b
 )
 
 target_include_directories(opencore-amrwb PUBLIC

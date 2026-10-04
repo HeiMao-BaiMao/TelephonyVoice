@@ -1,3 +1,4 @@
+#include <cstring>
 #include "dsp/AmrNbCodec.h"
 #ifndef TELEPHONY_DISTRIBUTION_BUILD
 #include <interf_enc.h>

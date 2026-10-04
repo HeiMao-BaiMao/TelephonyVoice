@@ -2,10 +2,13 @@ name: CI
 
 on:
   push:
-    branches: [master]
+    branches: [master, "codex/**"]
   pull_request:
     branches: [master]
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   build-and-test:
@@ -42,3 +45,27 @@ jobs:
 
       - name: Test
         run: ctest --test-dir out/build/${{ matrix.preset }} --output-on-failure
+
+  linux-regressions:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: normal
+            options: ""
+          - name: distribution
+            options: "-DTELEPHONY_DISTRIBUTION_BUILD=ON"
+          - name: evs-jbm
+            options: "-DTELEPHONY_USE_EVS_JBM=ON"
+    name: Linux headless (${{ matrix.name }})
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Configure
+        run: cmake -S . -B out/build/ci -G Ninja -DCMAKE_BUILD_TYPE=Release -DTELEPHONY_BUILD_PLUGIN=OFF ${{ matrix.options }}
+      - name: Build
+        run: cmake --build out/build/ci --parallel 2
+      - name: Test
+        run: ctest --test-dir out/build/ci --output-on-failure

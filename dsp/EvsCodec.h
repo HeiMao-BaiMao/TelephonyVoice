@@ -20,7 +20,7 @@ namespace TelephonyDSP {
         // persisted on the instance and applied the next time reset() (or
         // the ctor) builds the encoder, so callers do not need to time
         // the call against the audio thread.
-        void setScVbrEnabled(bool enable) { scVbrEnabled = enable; reset(); }
+        void setScVbrEnabled(bool enable) { if (scVbrEnabled != enable) { scVbrEnabled = enable; reset(); } }
         bool getScVbrEnabled() const { return scVbrEnabled; }
 
         // Update the DTX SID update interval. 0 = variable (codec default,

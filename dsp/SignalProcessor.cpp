@@ -1,5 +1,6 @@
 #define NOMINMAX
 #include "dsp/SignalProcessor.h"
+#include "dsp/EvsConfig.h"
 #include <cmath>
 #include <algorithm>
 #include <cstring>
@@ -102,6 +103,7 @@ namespace TelephonyDSP {
     }
 
     void SignalProcessor::setSampleRate(double sr) {
+        if (!std::isfinite(sr) || sr < 8000.0 || sr > 384000.0) return;
         hostSampleRate = sr;
         updateLatency();
         for (auto& ch : inputLegs) ch->setSampleRate(sr);
@@ -111,25 +113,41 @@ namespace TelephonyDSP {
 
     void SignalProcessor::setMode(EraMode mode) {
         mode = distributionSafeMode(mode);
+        if (!routeModelEnabled && currentMode == mode) return;
         routeModelEnabled = false;
         currentMode = mode;
+        updateLatency();
         applyRouteToChannels();
+        reset();
     }
 
     void SignalProcessor::setRoute(RouteEndpoint input, RouteEndpoint output, DegradationSegment segment) {
+        const bool pathChanged = !routeModelEnabled || inputEndpoint != input || outputEndpoint != output;
         routeModelEnabled = true;
         inputEndpoint = input;
         outputEndpoint = output;
         degradationSegment = segment;
+        updateLatency();
         applyRouteToChannels();
+        if (pathChanged) reset();
     }
 
     void SignalProcessor::setEVSConfig(int sampleRateHz, int bitrateBps, EVS_Bandwidth maxBw) {
+        normalizeEvsConfig(sampleRateHz, bitrateBps, maxBw);
+        const bool changed = evsSampleRate != sampleRateHz || evsBitrateBps != bitrateBps || evsMaxBandwidth != maxBw;
         evsSampleRate   = sampleRateHz;
         evsBitrateBps   = bitrateBps;
         evsMaxBandwidth = maxBw;
         for (auto& ch : inputLegs) ch->setEVSConfig(sampleRateHz, bitrateBps, maxBw);
         for (auto& ch : outputLegs) ch->setEVSConfig(sampleRateHz, bitrateBps, maxBw);
+        auto native = [](EraMode mode) {
+            return mode == EraMode::EVS_NATIVE
+#if TELEPHONY_USE_EVS_JBM
+                || mode == EraMode::EVS_JBM
+#endif
+                ;
+        };
+        if (changed && (routeModelEnabled ? (native(endpointToMode(inputEndpoint)) || native(endpointToMode(outputEndpoint))) : native(currentMode))) reset();
     }
 
     void SignalProcessor::setOpusBandwidth(int bw) {
@@ -156,9 +174,11 @@ namespace TelephonyDSP {
         // also clamps independently. Cache the clamped value so new
         // legs created later (via ensureChannels) pick it up.
         const int clamped = mode < 0 ? 0 : (mode > 7 ? 7 : mode);
+        if (amrNbMode == clamped) return;
         amrNbMode = clamped;
         for (auto& ch : inputLegs)  ch->setAmrNbMode(clamped);
         for (auto& ch : outputLegs) ch->setAmrNbMode(clamped);
+        if (routeModelEnabled ? (endpointToMode(inputEndpoint) == EraMode::AMR_NB_3G || endpointToMode(outputEndpoint) == EraMode::AMR_NB_3G) : currentMode == EraMode::AMR_NB_3G) reset();
     }
 
     void SignalProcessor::setAmrWbMode(int mode) {
@@ -167,9 +187,11 @@ namespace TelephonyDSP {
         // also clamps independently. Cache the clamped value so new
         // legs created later (via ensureChannels) pick it up.
         const int clamped = mode < 0 ? 0 : (mode > 8 ? 8 : mode);
+        if (amrWbMode == clamped) return;
         amrWbMode = clamped;
         for (auto& ch : inputLegs)  ch->setAmrWbMode(clamped);
         for (auto& ch : outputLegs) ch->setAmrWbMode(clamped);
+        if (routeModelEnabled ? (endpointToMode(inputEndpoint) == EraMode::AMR_WB_VOLTE || endpointToMode(outputEndpoint) == EraMode::AMR_WB_VOLTE) : currentMode == EraMode::AMR_WB_VOLTE) reset();
     }
 
     void SignalProcessor::setG711Law(int law) {
@@ -182,9 +204,9 @@ namespace TelephonyDSP {
 
     void SignalProcessor::setOpusBitrate(int bps) {
         // Clamp here so the cached value is always within Opus's
-        // OPUS_BITRATE_MIN..OPUS_BITRATE_MAX (6..510000) range, even
+        // supported bitrate (6000..510000) range, even
         // if a future caller bypasses the per-leg clamping.
-        const int clamped = bps < 6 ? 6 : (bps > 510000 ? 510000 : bps);
+        const int clamped = bps < 6000 ? 6000 : (bps > 510000 ? 510000 : bps);
         opusBitrate = clamped;
         for (auto& ch : inputLegs)  ch->setOpusBitrate(clamped);
         for (auto& ch : outputLegs) ch->setOpusBitrate(clamped);
@@ -198,18 +220,20 @@ namespace TelephonyDSP {
 
     void SignalProcessor::setParameters(float dryWet, float outGaindB, bool artifacts, float artifactAmount,
                                         float packetLossRate, float networkDegradation) {
-        paramDryWet = dryWet;
-        paramOutGain = std::pow(10.0f, outGaindB / 20.0f);
+        paramDryWet = std::isfinite(dryWet) ? std::clamp(dryWet, 0.0f, 1.0f) : 1.0f;
+        paramOutGain = std::pow(10.0f, (std::isfinite(outGaindB) ? std::clamp(outGaindB, -60.0f, 24.0f) : 0.0f) / 20.0f);
         paramArtifactsEnabled = artifacts;
-        paramArtifactAmount = artifactAmount;
-        paramPacketLossRate = std::clamp(packetLossRate, 0.0f, 0.95f);
-        paramNetworkDegradation = std::clamp(networkDegradation, 0.0f, 1.0f);
+        paramArtifactAmount = std::isfinite(artifactAmount) ? std::clamp(artifactAmount, 0.0f, 1.0f) : 0.0f;
+        paramPacketLossRate = (std::isfinite(packetLossRate) ? std::clamp(packetLossRate, 0.0f, 0.95f) : 0.0f);
+        paramNetworkDegradation = (std::isfinite(networkDegradation) ? std::clamp(networkDegradation, 0.0f, 1.0f) : 0.0f);
         applyRouteToChannels();
     }
 
     void SignalProcessor::setSimulateLatency(bool enable) {
+        if (simulateLatency == enable) return;
         simulateLatency = enable;
         updateLatency();
+        reset();
     }
 
     void SignalProcessor::reset() {
@@ -222,8 +246,12 @@ namespace TelephonyDSP {
     }
 
     void SignalProcessor::updateLatency() {
-        if (simulateLatency) targetLatencySamples = (int)std::round(0.1 * hostSampleRate);
-        else targetLatencySamples = 0;
+        // Framed/resampled codecs require a deterministic reserve even when
+        // callers disable the optional dry/bypass delay. Without it output
+        // starvation inserts a different number of zeros for each block size.
+        const bool needsCodecReserve = routeModelEnabled || currentMode != EraMode::Bypass;
+        targetLatencySamples = (simulateLatency || needsCodecReserve)
+            ? (int)std::round((LATENCY_MS / 1000.0) * hostSampleRate) : 0;
     }
 
     int SignalProcessor::getLatencySamples() const {
@@ -232,6 +260,7 @@ namespace TelephonyDSP {
 
     void SignalProcessor::ensureChannels(int count) {
         if (outputLegs.size() != (size_t)count) {
+            inTotalSamples = outTotalSamples = 0;
             inputLegs.clear();
             outputLegs.clear();
             dryBuffers.clear();
@@ -245,61 +274,69 @@ namespace TelephonyDSP {
     }
 
     void SignalProcessor::process(float** inputs, int numIns, float** outputs, int numOuts, int numSamples) {
+        if (numSamples <= 0 || !outputs || numOuts <= 0) return;
+        for (int ch = 0; ch < numOuts; ++ch) if (!outputs[ch]) return;
+        if (!inputs || numIns <= 0) {
+            for (int ch = 0; ch < numOuts; ++ch) std::fill_n(outputs[ch], numSamples, 0.0f);
+            return;
+        }
+        for (int ch = 0; ch < numIns; ++ch) if (!inputs[ch]) return;
         ensureChannels(numIns);
-        inTotalSamples += numSamples;
 
-        for (int i=0; i<numIns; ++i) {
-            dryBuffers[i]->write(inputs[i], numSamples);
-            if (routeModelEnabled) {
-                std::vector<float> exchange(numSamples, 0.0f);
-                inputLegs[i]->pushInput(inputs[i], numSamples);
-                inputLegs[i]->pullOutput(exchange.data(), numSamples);
-                outputLegs[i]->pushInput(exchange.data(), numSamples);
-            } else {
-                outputLegs[i]->pushInput(inputs[i], numSamples);
-            }
-        }
-
-        int64_t readable = (inTotalSamples - targetLatencySamples) - outTotalSamples;
-        int samplesToWrite = numSamples;
-        int outputOffset = 0;
-
-        if (readable < 0) {
-            int silence = (int)(std::min)((int64_t)samplesToWrite, -readable);
-            for (int ch=0; ch<numOuts; ++ch) {
-                std::memset(outputs[ch], 0, silence * sizeof(float));
-            }
-            samplesToWrite -= silence;
-            outputOffset += silence;
-            outTotalSamples += silence;
-        }
-
-        if (samplesToWrite > 0) {
-            std::vector<std::vector<float>> processedChannels(numIns, std::vector<float>(samplesToWrite));
-            
-            for (int i=0; i<numIns; ++i) {
-                std::vector<float> d(samplesToWrite);
-                if (dryBuffers[i]->getReadAvailable() >= (size_t)samplesToWrite) {
-                    dryBuffers[i]->read(d.data(), samplesToWrite);
+        // Bound staging and ring-buffer use even for unusually large offline
+        // blocks. Read every channel before writing any aliased output.
+        constexpr int kChunkSize = 4096;
+        for (int offset = 0; offset < numSamples; offset += kChunkSize) {
+            const int count = std::min(kChunkSize, numSamples - offset);
+            for (int ch = 0; ch < numIns; ++ch) {
+                std::vector<float> input(count);
+                for (int i = 0; i < count; ++i) {
+                    const float sample = inputs[ch][offset + i];
+                    input[i] = std::isfinite(sample) ? sample : 0.0f;
+                }
+                dryBuffers[ch]->write(input.data(), count);
+                if (routeModelEnabled) {
+                    inputLegs[ch]->pushInput(input.data(), count);
+                    const auto available = inputLegs[ch]->getAvailableOutput();
+                    std::vector<float> exchange(available);
+                    inputLegs[ch]->pullOutput(exchange.data(), (int)available);
+                    // Do not pad an incomplete codec frame with host-block
+                    // silence. The second leg consumes actual streaming data.
+                    outputLegs[ch]->pushInput(exchange.data(), (int)available);
                 } else {
-                    dryBuffers[i]->read(d.data(), dryBuffers[i]->getReadAvailable());
-                }
-
-                std::vector<float> w(samplesToWrite);
-                outputLegs[i]->pullOutput(w.data(), samplesToWrite);
-                
-                for (int s=0; s<samplesToWrite; ++s) {
-                    processedChannels[i][s] = (d[s] * (1.0f - paramDryWet) + w[s] * paramDryWet) * paramOutGain;
+                    outputLegs[ch]->pushInput(input.data(), count);
                 }
             }
+            inTotalSamples += count;
 
-            for (int ch=0; ch<numOuts; ++ch) {
-                int inCh = (ch < numIns) ? ch : 0;
-                float* dest = outputs[ch] + outputOffset;
-                std::memcpy(dest, processedChannels[inCh].data(), samplesToWrite * sizeof(float));
+            // Startup silence is measured on the output timeline exactly once.
+            // Subtracting output silence from "readable input" on every block
+            // previously left ordinary small blocks permanently silent.
+            const int silence = (int)std::min<int64_t>(count,
+                std::max<int64_t>(0, targetLatencySamples - outTotalSamples));
+            const int ready = count - silence;
+            std::vector<std::vector<float>> processed(numIns, std::vector<float>(count, 0.0f));
+            for (int ch = 0; ch < numIns; ++ch) {
+                std::vector<float> dry(ready, 0.0f), wet(ready, 0.0f);
+                if (ready > 0) {
+                    dryBuffers[ch]->read(dry.data(), ready);
+                    outputLegs[ch]->pullOutput(wet.data(), ready);
+                    for (int i = 0; i < ready; ++i)
+                        processed[ch][silence + i] =
+                            (dry[i] * (1.0f - paramDryWet) + wet[i] * paramDryWet) * paramOutGain;
+                }
             }
-            
-            outTotalSamples += samplesToWrite;
+            if (numOuts == 1 && numIns > 1) {
+                for (int i = 0; i < count; ++i) {
+                    float sum = 0.0f;
+                    for (int ch = 0; ch < numIns; ++ch) sum += processed[ch][i];
+                    outputs[0][offset + i] = sum / numIns;
+                }
+            } else {
+                for (int ch = 0; ch < numOuts; ++ch)
+                    std::memcpy(outputs[ch] + offset, processed[ch < numIns ? ch : 0].data(), count * sizeof(float));
+            }
+            outTotalSamples += count;
         }
     }
 

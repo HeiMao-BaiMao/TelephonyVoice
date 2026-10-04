@@ -1,0 +1,161 @@
+<?xml version='1.0' encoding='utf-8'?>
+<vstgui-ui-description version="1">
+  <colors>
+    <color name="Background" rgba="#11191fff" />
+    <color name="Panel" rgba="#1b2730ff" />
+    <color name="Panel Deep" rgba="#152129ff" />
+    <color name="Control" rgba="#263640ff" />
+    <color name="Border" rgba="#42535eff" />
+    <color name="Text" rgba="#eff5f6ff" />
+    <color name="Muted" rgba="#b2c1caff" />
+    <color name="Teal" rgba="#64d7c5ff" />
+    <color name="Amber" rgba="#efbd75ff" />
+    <color name="Dark Text" rgba="#142229ff" />
+    <color name="Focus" rgba="#a0efe1ff" />
+  </colors>
+  <fonts>
+    <font name="Brand" font-name="Segoe UI" alternative-font-names="Helvetica Neue,Arial,Noto Sans,DejaVu Sans" size="26" bold="true" />
+    <font name="Heading" font-name="Segoe UI" alternative-font-names="Helvetica Neue,Arial,Noto Sans,DejaVu Sans" size="16" bold="true" />
+    <font name="Body" font-name="Segoe UI" alternative-font-names="Helvetica Neue,Arial,Noto Sans,DejaVu Sans" size="13" bold="false" />
+    <font name="Label" font-name="Segoe UI" alternative-font-names="Helvetica Neue,Arial,Noto Sans,DejaVu Sans" size="11" bold="false" />
+    <font name="Small" font-name="Segoe UI" alternative-font-names="Helvetica Neue,Arial,Noto Sans,DejaVu Sans" size="10" bold="false" />
+    <font name="Endpoint" font-name="Segoe UI" alternative-font-names="Helvetica Neue,Arial,Noto Sans,DejaVu Sans" size="16" bold="true" />
+    <font name="Arrow" font-name="Segoe UI" alternative-font-names="Helvetica Neue,Arial,Noto Sans,DejaVu Sans" size="24" bold="false" />
+  </fonts>
+  <gradients>
+    <gradient name="Button">
+      <color-stop rgba="#263640ff" start="0" />
+      <color-stop rgba="#263640ff" start="1" />
+    </gradient>
+    <gradient name="Button Active">
+      <color-stop rgba="#64d7c5ff" start="0" />
+      <color-stop rgba="#64d7c5ff" start="1" />
+    </gradient>
+  </gradients>
+  <control-tags>
+    <control-tag name="Input" tag="100" />
+    <control-tag name="DryWet" tag="101" />
+    <control-tag name="Gain" tag="102" />
+    <control-tag name="Artifacts" tag="103" />
+    <control-tag name="ArtifactAmount" tag="104" />
+    <control-tag name="Bypass" tag="105" />
+    <control-tag name="PacketLoss" tag="106" />
+    <control-tag name="Degradation" tag="107" />
+    <control-tag name="Output" tag="108" />
+    <control-tag name="EvsRate" tag="109" />
+    <control-tag name="EvsBitrate" tag="110" />
+    <control-tag name="EvsBandwidth" tag="111" />
+    <control-tag name="Segment" tag="112" />
+    <control-tag name="AmrWb" tag="113" />
+    <control-tag name="AmrNb" tag="115" />
+    <control-tag name="G711Law" tag="116" />
+    <control-tag name="EvsSid" tag="117" />
+    <control-tag name="EvsScVbr" tag="118" />
+  </control-tags>
+  <template name="view" class="CViewContainer" origin="0, 0" size="940, 680" minSize="940, 680" maxSize="940, 680" background-color="Background" transparent="false" mouse-enabled="true">
+    <view class="CTextLabel" origin="24, 24" size="42, 42" title="" back-color="Teal" frame-color="Teal" style-round-rect="true" round-rect-radius="8" style-no-frame="false" transparent="false" mouse-enabled="false" wants-focus="false" />
+    <view class="CTextLabel" origin="25, 30" size="40, 30" title="TV" font="Heading" font-color="Dark Text" font-antialias="true" text-alignment="center" text-inset="0, 0" transparent="true" style-no-frame="true" mouse-enabled="false" wants-focus="false" />
+    <view class="CTextLabel" origin="80, 20" size="310, 36" title="TelephonyVoice" font="Brand" font-color="Text" font-antialias="true" text-alignment="left" text-inset="0, 0" transparent="true" style-no-frame="true" mouse-enabled="false" wants-focus="false" />
+    <view class="CTextLabel" origin="81, 56" size="400, 17" title="TELEPHONE PATH EMULATOR" font="Small" font-color="Muted" font-antialias="true" text-alignment="left" text-inset="0, 0" transparent="true" style-no-frame="true" mouse-enabled="false" wants-focus="false" />
+    <view class="CTextLabel" origin="504, 34" size="246, 24" title="IN → EXCHANGE → OUT" font="Label" font-color="Teal" font-antialias="true" text-alignment="right" text-inset="0, 0" transparent="true" style-no-frame="true" mouse-enabled="false" wants-focus="false" />
+    <view class="CTextButton" origin="776, 28" size="140, 36" control-tag="Bypass" title="BYPASS OFF" telephony-name="bypass" font="Body" text-color="Text" text-color-highlighted="Dark Text" gradient="Button" gradient-highlighted="Button Active" frame-color="Border" frame-color-highlighted="Teal" frame-width="1" round-radius="5" kick-style="false" text-alignment="center" mouse-enabled="true" wants-focus="true" tooltip="Host bypass: latency-compensated dry signal." />
+    <view class="CTextLabel" origin="24, 92" size="892, 178" title="" back-color="Panel" frame-color="Panel" style-round-rect="true" round-rect-radius="10" style-no-frame="false" transparent="false" mouse-enabled="false" wants-focus="false" />
+    <view class="CTextLabel" origin="44, 108" size="248, 20" title="01 / INPUT" font="Label" font-color="Teal" font-antialias="true" text-alignment="left" text-inset="0, 0" transparent="true" style-no-frame="true" mouse-enabled="false" wants-focus="false" />
+    <view class="CTextLabel" origin="350, 108" size="240, 20" title="02 / EXCHANGE" font="Label" font-color="Muted" font-antialias="true" text-alignment="center" text-inset="0, 0" transparent="true" style-no-frame="true" mouse-enabled="false" wants-focus="false" />
+    <view class="CTextLabel" origin="648, 108" size="248, 20" title="03 / OUTPUT" font="Label" font-color="Teal" font-antialias="true" text-alignment="left" text-inset="0, 0" transparent="true" style-no-frame="true" mouse-enabled="false" wants-focus="false" />
+    <view class="COptionMenu" origin="44, 141" size="248, 38" control-tag="Input" font="Endpoint" font-color="Text" back-color="Control" frame-color="Border" frame-width="1" style-round-rect="true" round-rect-radius="5" text-alignment="left" text-inset="10, 0" transparent="false" mouse-enabled="true" wants-focus="true" menu-check-style="true" tooltip="Input telephone endpoint. Host automation is supported." />
+    <view class="CTextLabel" origin="267, 143" size="18, 34" title="▼" font="Small" font-color="Muted" font-antialias="true" text-alignment="center" text-inset="0, 0" transparent="true" style-no-frame="true" mouse-enabled="false" wants-focus="false" />
+    <view class="COptionMenu" origin="648, 141" size="248, 38" control-tag="Output" font="Endpoint" font-color="Text" back-color="Control" frame-color="Border" frame-width="1" style-round-rect="true" round-rect-radius="5" text-alignment="left" text-inset="10, 0" transparent="false" mouse-enabled="true" wants-focus="true" menu-check-style="true" tooltip="Output telephone endpoint. The two legs may use different codecs." />
+    <view class="CTextLabel" origin="871, 143" size="18, 34" title="▼" font="Small" font-color="Muted" font-antialias="true" text-alignment="center" text-inset="0, 0" transparent="true" style-no-frame="true" mouse-enabled="false" wants-focus="false" />
+    <view class="CTextLabel" origin="307, 143" size="38, 34" title="→" font="Arrow" font-color="Amber" font-antialias="true" text-alignment="center" text-inset="0, 0" transparent="true" style-no-frame="true" mouse-enabled="false" wants-focus="false" />
+    <view class="CTextLabel" origin="595, 143" size="38, 34" title="→" font="Arrow" font-color="Amber" font-antialias="true" text-alignment="center" text-inset="0, 0" transparent="true" style-no-frame="true" mouse-enabled="false" wants-focus="false" />
+    <view class="CTextLabel" origin="350, 136" size="240, 49" title="" back-color="Panel Deep" frame-color="Panel Deep" style-round-rect="true" round-rect-radius="6" style-no-frame="false" transparent="false" mouse-enabled="false" wants-focus="false" />
+    <view class="CTextLabel" origin="358, 149" size="224, 24" title="交換局 / Exchange" font="Heading" font-color="Text" font-antialias="true" text-alignment="center" text-inset="0, 0" transparent="true" style-no-frame="true" mouse-enabled="false" wants-focus="false" />
+    <view class="CTextLabel" origin="44, 189" size="265, 20" title="G.711 / 8 kHz" font="Body" font-color="Muted" font-antialias="true" text-alignment="left" text-inset="0, 0" transparent="true" style-no-frame="true" mouse-enabled="false" wants-focus="false" telephony-name="input-codec" />
+    <view class="CTextLabel" origin="648, 189" size="248, 20" title="EVS / configurable bandwidth" font="Body" font-color="Muted" font-antialias="true" text-alignment="left" text-inset="0, 0" transparent="true" style-no-frame="true" mouse-enabled="false" wants-focus="false" telephony-name="output-codec" />
+    <view class="CTextLabel" origin="44, 222" size="252, 18" title="DEGRADATION TARGET" font="Small" font-color="Amber" font-antialias="true" text-alignment="left" text-inset="0, 0" transparent="true" style-no-frame="true" mouse-enabled="false" wants-focus="false" telephony-name="input-target" />
+    <view class="CTextLabel" origin="648, 222" size="248, 18" title="DEGRADATION TARGET" font="Small" font-color="Amber" font-antialias="true" text-alignment="left" text-inset="0, 0" transparent="true" style-no-frame="true" mouse-enabled="false" wants-focus="false" telephony-name="output-target" />
+    <view class="CTextLabel" origin="350, 194" size="240, 18" title="Degraded segment / 劣化区間" font="Small" font-color="Muted" font-antialias="true" text-alignment="center" text-inset="0, 0" transparent="true" style-no-frame="true" mouse-enabled="false" wants-focus="false" />
+    <view class="COptionMenu" origin="350, 218" size="240, 30" control-tag="Segment" font="Body" font-color="Text" back-color="Control" frame-color="Border" frame-width="1" style-round-rect="true" round-rect-radius="5" text-alignment="left" text-inset="10, 0" transparent="false" mouse-enabled="true" wants-focus="true" menu-check-style="true" tooltip="Choose which leg receives packet loss and communication degradation." />
+    <view class="CTextLabel" origin="565, 220" size="18, 26" title="▼" font="Small" font-color="Muted" font-antialias="true" text-alignment="center" text-inset="0, 0" transparent="true" style-no-frame="true" mouse-enabled="false" wants-focus="false" />
+    <view class="CTextLabel" origin="24, 286" size="436, 186" title="" back-color="Panel" frame-color="Panel" style-round-rect="true" round-rect-radius="10" style-no-frame="false" transparent="false" mouse-enabled="false" wants-focus="false" />
+    <view class="CTextLabel" origin="480, 286" size="436, 186" title="" back-color="Panel" frame-color="Panel" style-round-rect="true" round-rect-radius="10" style-no-frame="false" transparent="false" mouse-enabled="false" wants-focus="false" />
+    <view class="CTextLabel" origin="44, 298" size="270, 24" title="Network character" font="Heading" font-color="Text" font-antialias="true" text-alignment="left" text-inset="0, 0" transparent="true" style-no-frame="true" mouse-enabled="false" wants-focus="false" />
+    <view class="CTextLabel" origin="335, 300" size="105, 20" title="SIMULATED" font="Small" font-color="Amber" font-antialias="true" text-alignment="right" text-inset="0, 0" transparent="true" style-no-frame="true" mouse-enabled="false" wants-focus="false" />
+    <view class="CViewContainer" origin="44, 333" size="396, 110" transparent="true" telephony-group="network-controls" mouse-enabled="true">
+      <view class="CTextLabel" origin="0, 0" size="230, 19" title="Packet loss (%)" font="Label" font-color="Muted" font-antialias="true" text-alignment="left" text-inset="0, 0" transparent="true" style-no-frame="true" mouse-enabled="false" wants-focus="false" />
+      <view class="CSlider" custom-view-name="TelephonySlider" origin="0, 26" size="282, 20" control-tag="PacketLoss" min-value="0" max-value="1" orientation="horizontal" reverse-orientation="false" mode="free click" draw-back="true" draw-back-color="Control" draw-frame="true" draw-frame-color="Border" draw-value="true" draw-value-color="Amber" transparent="false" mouse-enabled="true" wants-focus="true" wheel-inc-value="0.01" zoom-factor="10" tooltip="Configured frame/packet loss probability, from 0 to 30 percent. Not a measured loss meter." />
+      <view class="CTextEdit" origin="300, 16" size="96, 34" control-tag="PacketLoss" font="Body" font-color="Text" back-color="Control" frame-color="Border" frame-width="1" style-round-rect="true" round-rect-radius="5" text-alignment="center" text-inset="5, 0" transparent="false" mouse-enabled="true" wants-focus="true" immediate-text-change="false" style-doubleclick="false" tooltip="Packet loss in percent, 0–30." />
+      <view class="CTextLabel" origin="0, 56" size="292, 19" title="Communication degradation (%)" font="Label" font-color="Muted" font-antialias="true" text-alignment="left" text-inset="0, 0" transparent="true" style-no-frame="true" mouse-enabled="false" wants-focus="false" />
+      <view class="CSlider" custom-view-name="TelephonySlider" origin="0, 82" size="282, 20" control-tag="Degradation" min-value="0" max-value="1" orientation="horizontal" reverse-orientation="false" mode="free click" draw-back="true" draw-back-color="Control" draw-frame="true" draw-frame-color="Border" draw-value="true" draw-value-color="Amber" transparent="false" mouse-enabled="true" wants-focus="true" wheel-inc-value="0.01" zoom-factor="10" tooltip="Couples bandwidth narrowing and burst loss; 0 to 100 percent." />
+      <view class="CTextEdit" origin="300, 72" size="96, 34" control-tag="Degradation" font="Body" font-color="Text" back-color="Control" frame-color="Border" frame-width="1" style-round-rect="true" round-rect-radius="5" text-alignment="center" text-inset="5, 0" transparent="false" mouse-enabled="true" wants-focus="true" immediate-text-change="false" style-doubleclick="false" tooltip="Communication degradation in percent, 0–100." />
+    </view>
+    <view class="CTextLabel" origin="44, 448" size="396, 17" title="Configured loss per selected leg. This is not a live meter." font="Small" font-color="Muted" font-antialias="true" text-alignment="left" text-inset="0, 0" transparent="true" style-no-frame="true" mouse-enabled="false" wants-focus="false" telephony-name="network-note" />
+    <view class="CTextLabel" origin="500, 298" size="240, 24" title="Mix &amp; output" font="Heading" font-color="Text" font-antialias="true" text-alignment="left" text-inset="0, 0" transparent="true" style-no-frame="true" mouse-enabled="false" wants-focus="false" />
+    <view class="CTextLabel" origin="720, 300" size="176, 20" title="LATENCY COMPENSATED" font="Small" font-color="Teal" font-antialias="true" text-alignment="right" text-inset="0, 0" transparent="true" style-no-frame="true" mouse-enabled="false" wants-focus="false" />
+    <view class="CTextLabel" origin="500, 333" size="244, 19" title="Wet mix (%)" font="Label" font-color="Muted" font-antialias="true" text-alignment="left" text-inset="0, 0" transparent="true" style-no-frame="true" mouse-enabled="false" wants-focus="false" />
+    <view class="CSlider" custom-view-name="TelephonySlider" origin="500, 359" size="282, 20" control-tag="DryWet" min-value="0" max-value="1" orientation="horizontal" reverse-orientation="false" mode="free click" draw-back="true" draw-back-color="Control" draw-frame="true" draw-frame-color="Border" draw-value="true" draw-value-color="Teal" transparent="false" mouse-enabled="true" wants-focus="true" wheel-inc-value="0.01" zoom-factor="10" tooltip="Wet mix. 0% is aligned dry, 100% is the telephone route." />
+    <view class="CTextEdit" origin="800, 349" size="96, 34" control-tag="DryWet" font="Body" font-color="Text" back-color="Control" frame-color="Border" frame-width="1" style-round-rect="true" round-rect-radius="5" text-alignment="center" text-inset="5, 0" transparent="false" mouse-enabled="true" wants-focus="true" immediate-text-change="false" style-doubleclick="false" tooltip="Wet mix in percent, 0–100." />
+    <view class="CTextLabel" origin="500, 389" size="250, 19" title="Output gain (dB)" font="Label" font-color="Muted" font-antialias="true" text-alignment="left" text-inset="0, 0" transparent="true" style-no-frame="true" mouse-enabled="false" wants-focus="false" />
+    <view class="CSlider" custom-view-name="TelephonySlider" origin="500, 415" size="282, 20" control-tag="Gain" min-value="0" max-value="1" orientation="horizontal" reverse-orientation="false" mode="free click" draw-back="true" draw-back-color="Control" draw-frame="true" draw-frame-color="Border" draw-value="true" draw-value-color="Teal" transparent="false" mouse-enabled="true" wants-focus="true" wheel-inc-value="0.01" zoom-factor="10" tooltip="Output gain, -60 to +24 dB. Hold Shift for fine adjustment." />
+    <view class="CTextEdit" origin="800, 405" size="96, 34" control-tag="Gain" font="Body" font-color="Text" back-color="Control" frame-color="Border" frame-width="1" style-round-rect="true" round-rect-radius="5" text-alignment="center" text-inset="5, 0" transparent="false" mouse-enabled="true" wants-focus="true" immediate-text-change="false" style-doubleclick="false" tooltip="Output gain in dB, -60 to +24." />
+    <view class="CTextLabel" origin="500, 448" size="396, 17" title="IN-PROCESS / two independent legs" font="Small" font-color="Muted" font-antialias="true" text-alignment="left" text-inset="0, 0" transparent="true" style-no-frame="true" mouse-enabled="false" wants-focus="false" telephony-name="route-status" />
+    <view class="CTextLabel" origin="24, 488" size="892, 156" title="" back-color="Panel" frame-color="Panel" style-round-rect="true" round-rect-radius="10" style-no-frame="false" transparent="false" mouse-enabled="false" wants-focus="false" />
+    <view class="CTextLabel" origin="44, 497" size="170, 22" title="Codec detail" font="Heading" font-color="Text" font-antialias="true" text-alignment="left" text-inset="0, 0" transparent="true" style-no-frame="true" mouse-enabled="false" wants-focus="false" />
+    <view class="CTextLabel" origin="260, 498" size="636, 21" title="Only the codecs on this route are active." font="Small" font-color="Muted" font-antialias="true" text-alignment="right" text-inset="0, 0" transparent="true" style-no-frame="true" mouse-enabled="false" wants-focus="false" telephony-name="codec-note" />
+    <view class="CViewContainer" origin="44, 525" size="200, 52" transparent="true" telephony-group="g711" mouse-enabled="true">
+      <view class="CTextLabel" origin="0, 0" size="200, 18" title="Fixed line / G.711 law" font="Label" font-color="Muted" font-antialias="true" text-alignment="left" text-inset="0, 0" transparent="true" style-no-frame="true" mouse-enabled="false" wants-focus="false" />
+      <view class="COptionMenu" origin="0, 21" size="200, 30" control-tag="G711Law" font="Body" font-color="Text" back-color="Control" frame-color="Border" frame-width="1" style-round-rect="true" round-rect-radius="5" text-alignment="left" text-inset="10, 0" transparent="false" mouse-enabled="true" wants-focus="true" menu-check-style="true" tooltip="G.711 companding law. Active when either endpoint is a fixed line." />
+      <view class="CTextLabel" origin="175, 23" size="18, 26" title="▼" font="Small" font-color="Muted" font-antialias="true" text-alignment="center" text-inset="0, 0" transparent="true" style-no-frame="true" mouse-enabled="false" wants-focus="false" />
+    </view>
+    <view class="CViewContainer" origin="266, 525" size="200, 52" transparent="true" telephony-group="amr-nb" mouse-enabled="true">
+      <view class="CTextLabel" origin="0, 0" size="200, 18" title="3G / AMR-NB bitrate" font="Label" font-color="Muted" font-antialias="true" text-alignment="left" text-inset="0, 0" transparent="true" style-no-frame="true" mouse-enabled="false" wants-focus="false" />
+      <view class="COptionMenu" origin="0, 21" size="200, 30" control-tag="AmrNb" font="Body" font-color="Text" back-color="Control" frame-color="Border" frame-width="1" style-round-rect="true" round-rect-radius="5" text-alignment="left" text-inset="10, 0" transparent="false" mouse-enabled="true" wants-focus="true" menu-check-style="true" tooltip="AMR-NB mode. Active when either endpoint is 3G mobile." />
+      <view class="CTextLabel" origin="175, 23" size="18, 26" title="▼" font="Small" font-color="Muted" font-antialias="true" text-alignment="center" text-inset="0, 0" transparent="true" style-no-frame="true" mouse-enabled="false" wants-focus="false" />
+    </view>
+    <view class="CViewContainer" origin="488, 525" size="200, 52" transparent="true" telephony-group="amr-wb" mouse-enabled="true">
+      <view class="CTextLabel" origin="0, 0" size="200, 18" title="4G / AMR-WB bitrate" font="Label" font-color="Muted" font-antialias="true" text-alignment="left" text-inset="0, 0" transparent="true" style-no-frame="true" mouse-enabled="false" wants-focus="false" />
+      <view class="COptionMenu" origin="0, 21" size="200, 30" control-tag="AmrWb" font="Body" font-color="Text" back-color="Control" frame-color="Border" frame-width="1" style-round-rect="true" round-rect-radius="5" text-alignment="left" text-inset="10, 0" transparent="false" mouse-enabled="true" wants-focus="true" menu-check-style="true" tooltip="AMR-WB mode. Active when either endpoint is 4G mobile." />
+      <view class="CTextLabel" origin="175, 23" size="18, 26" title="▼" font="Small" font-color="Muted" font-antialias="true" text-alignment="center" text-inset="0, 0" transparent="true" style-no-frame="true" mouse-enabled="false" wants-focus="false" />
+    </view>
+    <view class="CTextButton" origin="710, 525" size="186, 24" control-tag="Artifacts" title="Artifacts: Off" telephony-name="artifacts" font="Body" text-color="Text" text-color-highlighted="Dark Text" gradient="Button" gradient-highlighted="Button Active" frame-color="Border" frame-color-highlighted="Teal" frame-width="1" round-radius="5" kick-style="false" text-alignment="center" mouse-enabled="true" wants-focus="true" tooltip="Enable synthetic telephone artifacts. Amount is a separate control." />
+    <view class="CViewContainer" origin="710, 553" size="186, 26" transparent="true" telephony-group="artifact-amount" mouse-enabled="true">
+      <view class="CSlider" custom-view-name="TelephonySlider" origin="0, 4" size="106, 18" control-tag="ArtifactAmount" min-value="0" max-value="1" orientation="horizontal" reverse-orientation="false" mode="free click" draw-back="true" draw-back-color="Control" draw-frame="true" draw-frame-color="Border" draw-value="true" draw-value-color="Teal" transparent="false" mouse-enabled="true" wants-focus="true" wheel-inc-value="0.01" zoom-factor="10" tooltip="Synthetic artifact amount, from 0 to 100 percent." />
+      <view class="CTextEdit" origin="120, 0" size="52, 26" control-tag="ArtifactAmount" font="Body" font-color="Text" back-color="Control" frame-color="Border" frame-width="1" style-round-rect="true" round-rect-radius="5" text-alignment="center" text-inset="5, 0" transparent="false" mouse-enabled="true" wants-focus="true" immediate-text-change="false" style-doubleclick="false" tooltip="Artifact amount in percent, 0–100." />
+      <view class="CTextLabel" origin="176, 0" size="10, 26" title="%" font="Small" font-color="Muted" text-alignment="center" transparent="true" style-no-frame="true" mouse-enabled="false" wants-focus="false" />
+    </view>
+    <view class="CViewContainer" origin="44, 584" size="200, 52" transparent="true" telephony-group="evs-rate" mouse-enabled="true">
+      <view class="CTextLabel" origin="0, 0" size="200, 18" title="5G precise / EVS sample rate" font="Label" font-color="Muted" font-antialias="true" text-alignment="left" text-inset="0, 0" transparent="true" style-no-frame="true" mouse-enabled="false" wants-focus="false" />
+      <view class="COptionMenu" origin="0, 21" size="200, 30" control-tag="EvsRate" font="Body" font-color="Text" back-color="Control" frame-color="Border" frame-width="1" style-round-rect="true" round-rect-radius="5" text-alignment="left" text-inset="10, 0" transparent="false" mouse-enabled="true" wants-focus="true" menu-check-style="true" tooltip="EVS sampling rate. Active for a precise 5G or JBM endpoint." />
+      <view class="CTextLabel" origin="175, 23" size="18, 26" title="▼" font="Small" font-color="Muted" font-antialias="true" text-alignment="center" text-inset="0, 0" transparent="true" style-no-frame="true" mouse-enabled="false" wants-focus="false" />
+    </view>
+    <view class="CViewContainer" origin="266, 584" size="200, 52" transparent="true" telephony-group="evs-bitrate" mouse-enabled="true">
+      <view class="CTextLabel" origin="0, 0" size="200, 18" title="EVS bitrate" font="Label" font-color="Muted" font-antialias="true" text-alignment="left" text-inset="0, 0" transparent="true" style-no-frame="true" mouse-enabled="false" wants-focus="false" />
+      <view class="COptionMenu" origin="0, 21" size="200, 30" control-tag="EvsBitrate" font="Body" font-color="Text" back-color="Control" frame-color="Border" frame-width="1" style-round-rect="true" round-rect-radius="5" text-alignment="left" text-inset="10, 0" transparent="false" mouse-enabled="true" wants-focus="true" menu-check-style="true" tooltip="Requested EVS bitrate. 5.9 kbps inherently uses SC-VBR. Force VBR overrides this selection; switching it off restores the selected rate. NB is capped at 24.4 kbps." />
+      <view class="CTextLabel" origin="175, 23" size="18, 26" title="▼" font="Small" font-color="Muted" font-antialias="true" text-alignment="center" text-inset="0, 0" transparent="true" style-no-frame="true" mouse-enabled="false" wants-focus="false" />
+    </view>
+    <view class="CViewContainer" origin="488, 584" size="200, 52" transparent="true" telephony-group="evs-bandwidth" mouse-enabled="true">
+      <view class="CTextLabel" origin="0, 0" size="200, 18" title="EVS maximum bandwidth" font="Label" font-color="Muted" font-antialias="true" text-alignment="left" text-inset="0, 0" transparent="true" style-no-frame="true" mouse-enabled="false" wants-focus="false" />
+      <view class="COptionMenu" origin="0, 21" size="200, 30" control-tag="EvsBandwidth" font="Body" font-color="Text" back-color="Control" frame-color="Border" frame-width="1" style-round-rect="true" round-rect-radius="5" text-alignment="left" text-inset="10, 0" transparent="false" mouse-enabled="true" wants-focus="true" menu-check-style="true" tooltip="Requested EVS maximum bandwidth. The codec caps it by sample rate. SC-VBR uses NB/WB; other codec-safe bitrate and bandwidth constraints also apply." />
+      <view class="CTextLabel" origin="175, 23" size="18, 26" title="▼" font="Small" font-color="Muted" font-antialias="true" text-alignment="center" text-inset="0, 0" transparent="true" style-no-frame="true" mouse-enabled="false" wants-focus="false" />
+    </view>
+    <view class="CViewContainer" origin="710, 584" size="186, 52" transparent="true" telephony-group="evs-options" mouse-enabled="true">
+      <view class="CTextLabel" origin="0, 0" size="186, 18" title="SID interval (frames) / 0 = auto" font="Small" font-color="Muted" font-antialias="true" text-alignment="left" text-inset="0, 0" transparent="true" style-no-frame="true" mouse-enabled="false" wants-focus="false" />
+      <view class="CTextEdit" origin="0, 21" size="66, 30" control-tag="EvsSid" font="Body" font-color="Text" back-color="Control" frame-color="Border" frame-width="1" style-round-rect="true" round-rect-radius="5" text-alignment="center" text-inset="5, 0" transparent="false" mouse-enabled="true" wants-focus="true" immediate-text-change="false" style-doubleclick="false" tooltip="DTX SID interval: 0 is variable; 3–100 are fixed 20 ms frames. Values 1 and 2 are treated as variable (0)." />
+      <view class="CTextButton" origin="78, 21" size="108, 30" control-tag="EvsScVbr" title="Force VBR: Off" telephony-name="sc-vbr" font="Label" text-color="Text" text-color-highlighted="Dark Text" gradient="Button" gradient-highlighted="Button Active" frame-color="Border" frame-color-highlighted="Teal" frame-width="1" round-radius="5" kick-style="false" text-alignment="center" mouse-enabled="true" wants-focus="true" tooltip="Force EVS SC-VBR regardless of the selected bitrate (nominal 5.9 kbps, NB/WB). Off restores the selected rate, except that a 5.9 kbps selection always uses SC-VBR." />
+    </view>
+    <view class="CViewContainer" origin="266, 525" size="422, 52" transparent="true" telephony-group="distribution-note" mouse-enabled="true">
+      <view class="CTextLabel" origin="0, 0" size="422, 24" title="GSM FR needs no extra settings." font="Body" font-color="Muted" font-antialias="true" text-alignment="left" text-inset="0, 0" transparent="true" style-no-frame="true" mouse-enabled="false" wants-focus="false" />
+      <view class="CTextLabel" origin="0, 27" size="422, 22" title="AMR and EVS reference modes are excluded." font="Label" font-color="Muted" font-antialias="true" text-alignment="left" text-inset="0, 0" transparent="true" style-no-frame="true" mouse-enabled="false" wants-focus="false" />
+    </view>
+    <view class="CViewContainer" origin="44, 584" size="852, 52" transparent="true" telephony-group="distribution-bandwidth-note" mouse-enabled="true">
+      <view class="CTextLabel" origin="0, 0" size="852, 22" title="5G approximation" font="Body" font-color="Teal" font-antialias="true" text-alignment="left" text-inset="0, 0" transparent="true" style-no-frame="true" mouse-enabled="false" wants-focus="false" />
+      <view class="CTextLabel" origin="0, 27" size="852, 22" title="Models bandwidth and filtering without an EVS encoder. Use Network character to shape degradation." font="Label" font-color="Muted" font-antialias="true" text-alignment="left" text-inset="0, 0" transparent="true" style-no-frame="true" mouse-enabled="false" wants-focus="false" />
+    </view>
+    <view class="CTextLabel" origin="24, 656" size="360, 16" title="PERSONAL BUILD / contains reference codecs" font="Small" font-color="Muted" font-antialias="true" text-alignment="left" text-inset="0, 0" transparent="true" style-no-frame="true" mouse-enabled="false" wants-focus="false" telephony-name="build-note" />
+    <view class="CTextLabel" origin="434, 656" size="482, 16" title="Tab: focus   •   Arrows: adjust   •   Right-click: zoom" font="Small" font-color="Muted" font-antialias="true" text-alignment="right" text-inset="0, 0" transparent="true" style-no-frame="true" mouse-enabled="false" wants-focus="false" />
+  </template>
+  <custom>
+    <attributes name="FocusDrawing" color="Focus" enabled="true" width="2" />
+  </custom>
+</vstgui-ui-description>

@@ -26,6 +26,7 @@ namespace TelephonyDSP {
     size_t RingBuffer::getWriteAvailable() const { return buffer.size() - (writePos - readPos); }
 
     size_t RingBuffer::write(const float* data, size_t count) {
+        if (!data || count == 0 || buffer.empty()) return 0;
         size_t available = getWriteAvailable();
         if (count > available) count = available;
         size_t off = writePos & mask;
@@ -37,6 +38,7 @@ namespace TelephonyDSP {
     }
 
     size_t RingBuffer::read(float* data, size_t count) {
+        if (!data || count == 0 || buffer.empty()) return 0;
         size_t available = getReadAvailable();
         if (count > available) count = available;
         size_t off = readPos & mask;
@@ -48,6 +50,7 @@ namespace TelephonyDSP {
     }
 
     size_t RingBuffer::peek(float* data, size_t count) const {
+        if (!data || count == 0 || buffer.empty()) return 0;
         size_t available = getReadAvailable();
         if (count > available) count = available;
         size_t off = readPos & mask;

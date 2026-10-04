@@ -1,3 +1,4 @@
+#include <cstring>
 #include "dsp/OpusCodec.h"
 #if TELEPHONY_EXPERIMENTAL_NETWORK
 #include <opus.h>
@@ -12,7 +13,7 @@ namespace TelephonyDSP {
 #if TELEPHONY_EXPERIMENTAL_NETWORK
     OpusCodec::OpusCodec(int sr, int bitrate, int complexity, int maxBw)
         : sampleRate(sr)
-        , bitrateBps(bitrate)
+        , bitrateBps(std::clamp(bitrate, 6000, 510000))
         , frameSize(sr / 50) // 20 ms
         , complexity(complexity)
         , maxBandwidth(maxBw)
@@ -126,8 +127,7 @@ namespace TelephonyDSP {
     }
 
     void OpusCodec::setBitrate(int bps) {
-        // Opus's legal range per opus_defines.h is OPUS_BITRATE_MIN
-        // (6000) .. OPUS_BITRATE_MAX (510000). Clamp to that range so an
+        // Keep the supported telephony range at 6000..510000 bps. Clamp so an
         // out-of-range caller value (e.g. from automation or a typo in
         // the host UI) cannot trigger an OPUS_BAD_ARG error from
         // OPUS_SET_BITRATE.
@@ -327,7 +327,7 @@ namespace TelephonyDSP {
     void OpusCodec::reset() { fallbackPLC.reset(frameSize); }
     void OpusCodec::configureNetwork(float, float) {}
     void OpusCodec::setMaxBandwidth(int bw) { maxBandwidth = bw; }
-    void OpusCodec::setBitrate(int bps) { bitrateBps = bps; }
+    void OpusCodec::setBitrate(int bps) { bitrateBps = std::clamp(bps, 6000, 510000); }
     void OpusCodec::processFrame(const int16_t* in, int16_t* out, bool) {
         const int fs = frameSize;
         std::memcpy(out, in, fs * sizeof(int16_t));

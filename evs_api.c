@@ -27,17 +27,21 @@
 struct EVS_Encoder {
     Encoder_State* st;
     Indice*        ind_buf;     // MAX_NUM_INDICES entries
+    int            bitrate_bps; // normalized public rate, stable during DTX
+    int            rf_on;      // requested RF state, reapplied after SID frames
+    int            rf_offset;
+    int            rf_hi;
 };
 
 struct EVS_Decoder {
     Decoder_State* st;
-    float*         pcm_buf;     // output_Fs / 50 samples, reused every frame
+    float*         pcm_buf;     // L_FRAME48k workspace, reused every frame
 };
 
 // MAX_BITS_PER_FRAME is defined in cnst.h (2560).
 // MAX_NUM_INDICES = IND_UNUSED + 127 (also from cnst.h).
 
-// Frame lengths that map to a defined EVS primary or AMR-WB IO mode.
+// Frame lengths that map to a defined EVS primary mode.
 // Mirrors the switch in the reference rate2EVSmode() (lib_com/bitstream.c),
 // which is static there, so the accepted set is restated here. Used to
 // reject corrupt G.192 headers before they reach decoder_selectCodec().
@@ -47,9 +51,6 @@ static int is_valid_g192_rate(long rate) {
         case 0:      case 2400:  case 2800:  case 7200:  case 8000:
         case 9600:   case 13200: case 16400: case 24400: case 32000:
         case 48000:  case 64000: case 96000: case 128000:
-        // AMR-WB IO modes
-        case 1750:   case 6600:  case 8850:  case 12650: case 14250:
-        case 15850:  case 18250: case 19850: case 23050: case 23850:
             return 1;
         default:
             return 0;
@@ -92,52 +93,13 @@ EVS_Encoder* evs_enc_create(int sample_rate_hz, int bitrate_bps, EVS_Bandwidth m
 
 EVS_Encoder* evs_enc_create_ex(int sample_rate_hz, int bitrate_bps, EVS_Bandwidth max_bw,
                                const EVS_EncOptions* opts) {
-    if (sample_rate_to_index(sample_rate_hz) < 0) return NULL;
-    if (bitrate_bps < 5900 || bitrate_bps > 128000) return NULL;
-
-    // Resolve the effective options (defaults match the historical
-    // evs_enc_create path: DTX / RF / SC-VBR all off, variable SID).
+    // Validate and normalize before allocating reference-code state. The
+    // frontend uses the same helper so its effective settings stay coherent.
     EVS_EncOptions local;
     evs_enc_options_init(&local);
     if (opts) local = *opts;
-
-    // ---- DTX validation: only specific intervals are acceptable ----
-    if (local.dtx_enable) {
-        if (local.dtx_sid_interval == 0) {
-            // variable SID update interval (codec picks per-frame)
-        } else if (local.dtx_sid_interval >= 3 && local.dtx_sid_interval <= 100) {
-            // fixed SID update interval
-        } else {
-            // Out-of-range: fail cleanly (mirrors io_enc.c usage_enc(), but
-            // without exiting the caller).
-            return NULL;
-        }
-    }
-
-    // ---- RF validation: only 13.2 kbps and >= 16 kHz input are accepted ----
-    if (local.rf_enable && (bitrate_bps != ACELP_13k20 || sample_rate_hz < 16000)) {
-        // Disabling safely matches io_enc.c's "Reset RF parameters if NB
-        // input_Fs" / "channel-aware mode is supported only at 13.20" paths.
-        // Emit the reference CLI's diagnostic so callers notice the silent
-        // downgrade of their request.
-        fprintf(stderr,
-                "Warning: Channel-aware mode only available for 13.2 kbps WB/SWB\n"
-                "Switched to normal mode!\n");
-        local.rf_enable = 0;
-    }
-    if (local.rf_enable && local.rf_fec_offset != 0) {
-        if (local.rf_fec_offset != 2 && local.rf_fec_offset != 3 &&
-            local.rf_fec_offset != 5 && local.rf_fec_offset != 7) {
-            return NULL;
-        }
-    }
-
-    // ---- SC-VBR validation: the reference CLI only enables it for 5.90 kbps
-    // and forces total_brate up to 7.20 kbps. Keep the caller's bitrate as-is
-    // here (we are a wrapper, not a CLI), but the encoder will still respect
-    // the bitrate we pass. We honour the flag conservatively: if enabled
-    // together with DTX we leave DTX as requested; the reference handles the
-    // interaction internally. ----
+    if (evs_enc_normalize_config(sample_rate_hz, &bitrate_bps, &max_bw, &local)
+        != EVS_OK) return NULL;
 
     EVS_Encoder* enc = (EVS_Encoder*)calloc(1, sizeof(EVS_Encoder));
     if (!enc) return NULL;
@@ -145,14 +107,17 @@ EVS_Encoder* evs_enc_create_ex(int sample_rate_hz, int bitrate_bps, EVS_Bandwidt
     enc->st = (Encoder_State*)calloc(1, sizeof(Encoder_State));
     enc->ind_buf = (Indice*)calloc(MAX_NUM_INDICES, sizeof(Indice));
     if (!enc->st || !enc->ind_buf) {
-        evs_enc_destroy(enc);
+        free(enc->ind_buf);
+        free(enc->st);
+        free(enc);
         return NULL;
     }
 
     // Mirror what io_ini_enc() would have done for the CLI, but only the
     // fields actually consulted by init_encoder() and evs_enc().
     enc->st->input_Fs        = sample_rate_hz;
-    enc->st->total_brate     = bitrate_bps;
+    enc->bitrate_bps         = bitrate_bps;
+    enc->st->total_brate     = local.sc_vbr_enable ? ACELP_7k20 : bitrate_bps;
     enc->st->max_bwidth      = (short)bandwidth_to_enum(max_bw);
     enc->st->Opt_AMR_WB      = 0;          // 0 = native EVS (not AMR-WB IO)
     enc->st->bitstreamformat = G192;
@@ -177,6 +142,9 @@ EVS_Encoder* evs_enc_create_ex(int sample_rate_hz, int bitrate_bps, EVS_Bandwidt
 
     // ---- Apply RF options ----
     enc->st->Opt_RF_ON        = local.rf_enable ? 1 : 0;
+    enc->rf_on               = local.rf_enable;
+    enc->rf_offset           = local.rf_fec_offset;
+    enc->rf_hi               = local.rf_fec_hi;
     // rf_fec_indicator only carries meaning when RF is on (it selects LO/HI
     // for the channel-aware mode). When RF is off, match the legacy/reference
     // default of 1 so the encoder state matches what io_ini_enc() would have
@@ -191,22 +159,24 @@ EVS_Encoder* evs_enc_create_ex(int sample_rate_hz, int bitrate_bps, EVS_Bandwidt
         enc->st->rf_fec_offset = 0;
     }
 
-    // ---- Apply SC-VBR option ----
+    // Match io_ini_enc(), including last_Opt_SC_VBR. 5900 is a public
+    // SC-VBR selection, never a valid constant total_brate for evs_enc().
     enc->st->Opt_SC_VBR = local.sc_vbr_enable ? 1 : 0;
+    enc->st->last_Opt_SC_VBR = enc->st->Opt_SC_VBR;
 
-    // Pick codec mode the way the CLI does. The values follow cnst.h.
-    //   - 5.90k = SC-VBR (we treat as constant; not used here)
-    //   - 13.2k RF/LO = MODE2
-    //   - bitrates that need MODE2: 13.2k (HQ partial), 16.4k WB TBE, 24.4k WB BWE, 32k SWB TBE, 48k SWB BWE, 64k FB TBE, 96k FB BWE, 128k
-    //   - everything else at this point is MODE1
-    // Always start with MODE1; the encoder will adjust if needed.
-    enc->st->codec_mode = MODE1;
+    // MODE2 must be selected before init_encoder(): its state allocation
+    // and first-frame signalling depend on this choice (io_enc.c).
+    switch (enc->st->total_brate) {
+        case 9600: case 16400: case 24400: case 48000:
+        case 96000: case 128000:
+            enc->st->codec_mode = MODE2;
+            break;
+        default:
+            enc->st->codec_mode = MODE1;
+            break;
+    }
+    if (enc->st->Opt_RF_ON) enc->st->codec_mode = MODE2;
     enc->st->last_codec_mode = enc->st->codec_mode;
-
-    // Clamp max_bwidth to what the sample rate can carry (CLI does this).
-    if (sample_rate_hz ==  8000 && enc->st->max_bwidth > NB)  enc->st->max_bwidth = NB;
-    if (sample_rate_hz == 16000 && enc->st->max_bwidth > WB)  enc->st->max_bwidth = WB;
-    if (sample_rate_hz == 32000 && enc->st->max_bwidth > SWB) enc->st->max_bwidth = SWB;
 
     init_encoder(enc->st);
 
@@ -226,8 +196,21 @@ void evs_enc_destroy(EVS_Encoder* enc) {
 void evs_enc_set_rf(EVS_Encoder* enc, int rf_on, int rf_fec_offset, int rf_fec_indicator) {
     if (!enc || !enc->st) return;
 
-    if (rf_on && (enc->st->total_brate != ACELP_13k20 || enc->st->input_Fs < 16000)) {
+    if (rf_on && (enc->bitrate_bps != ACELP_13k20 || enc->st->input_Fs < 16000 ||
+                  enc->st->max_bwidth == NB)) {
         rf_on = 0;
+    }
+    if (rf_on && rf_fec_offset != 0 && rf_fec_offset != 2 && rf_fec_offset != 3 &&
+        rf_fec_offset != 5 && rf_fec_offset != 7) return;
+    enc->rf_on = rf_on != 0;
+    enc->rf_offset = rf_fec_offset;
+    enc->rf_hi = rf_fec_indicator != 0;
+
+    // Mirror encoder.c's per-frame RF switching. Merely flipping Opt_RF_ON
+    // leaves the old MODE1/MODE2 signalling state and stale RF indices.
+    if (enc->st->Opt_RF_ON != (rf_on != 0)) reset_rf_indices(enc->st);
+    if (enc->bitrate_bps == ACELP_13k20) {
+        enc->st->codec_mode = rf_on ? MODE2 : MODE1;
     }
 
     enc->st->Opt_RF_ON = rf_on ? 1 : 0;
@@ -235,12 +218,9 @@ void evs_enc_set_rf(EVS_Encoder* enc, int rf_on, int rf_fec_offset, int rf_fec_i
     if (rf_on) {
         enc->st->rf_fec_indicator = rf_fec_indicator ? 1 : 0;
 
-        if (rf_fec_offset == 0 || rf_fec_offset == 2 || rf_fec_offset == 3 ||
-            rf_fec_offset == 5 || rf_fec_offset == 7) {
-            enc->st->rf_fec_offset = (short)((rf_fec_offset == 0)
-                                             ? FEC_OFFSET
-                                             : rf_fec_offset);
-        }
+        enc->st->rf_fec_offset = (short)((rf_fec_offset == 0)
+                                         ? FEC_OFFSET
+                                         : rf_fec_offset);
     } else {
         enc->st->rf_fec_offset   = 0;
         enc->st->rf_fec_indicator = 1;
@@ -256,9 +236,14 @@ int evs_enc_process(EVS_Encoder* enc,
     short i, k, value, nb_bits;
     int mask, need;
 
+    if (bitstream_used) *bitstream_used = 0;
     if (!enc || !enc->st || !pcm_in || !bitstream_out || !bitstream_used) return EVS_ERROR;
     if (n_samples != enc->st->input_Fs / 50) return EVS_ERROR;
 
+    // DTX can temporarily change codec_mode and Opt_RF_ON. The reference
+    // executable reapplies its requested RF settings before every frame;
+    // omitting this step corrupts the MODE2 transition out of CNG.
+    evs_enc_set_rf(enc, enc->rf_on, enc->rf_offset, enc->rf_hi);
     evs_enc(enc->st, pcm_in, (short)n_samples);
 
     // The encoder filled st->ind_list via push_indice(). Serialise it into
@@ -266,7 +251,12 @@ int evs_enc_process(EVS_Encoder* enc,
     // reference write_indices() (lib_com/bitstream.c) including its
     // post-write clearing of the index list and bit counters.
     need = (2 + enc->st->nb_bits_tot) * (int)sizeof(unsigned short);
-    if (bitstream_max < need) return EVS_ERROR;
+    if (bitstream_max < need) {
+        // The input frame has been consumed, but no packet is returned.
+        // Never leave its indices queued for the next encode call.
+        reset_indices_enc(enc->st);
+        return EVS_ERROR;
+    }
 
     pt_stream = stream;
     *pt_stream++ = SYNC_GOOD_FRAME;
@@ -275,7 +265,7 @@ int evs_enc_process(EVS_Encoder* enc,
     for (i = 0; i < MAX_NUM_INDICES; i++) {
         value   = enc->st->ind_list[i].value;
         nb_bits = enc->st->ind_list[i].nb_bits;
-        if (nb_bits != -1) {
+        if (nb_bits > 0) {
             // mask from MSB to LSB
             mask = 1 << (nb_bits - 1);
             for (k = 0; k < nb_bits; k++) {
@@ -285,12 +275,7 @@ int evs_enc_process(EVS_Encoder* enc,
         }
     }
 
-    for (i = 0; i < MAX_NUM_INDICES; i++) {
-        enc->st->ind_list[i].nb_bits = -1;
-    }
-    enc->st->nb_bits_tot = 0;
-    enc->st->next_ind = 0;
-    enc->st->last_ind = -1;
+    reset_indices_enc(enc->st);
 
     // memcpy instead of a direct unsigned short* store: the caller's byte
     // buffer is not guaranteed to be 2-byte aligned.
@@ -305,20 +290,27 @@ int evs_enc_process(EVS_Encoder* enc,
 // ---------------------------------------------------------------------------
 EVS_Decoder* evs_dec_create(int sample_rate_hz, int bitrate_bps) {
     if (sample_rate_to_index(sample_rate_hz) < 0) return NULL;
-    if (bitrate_bps < 5900 || bitrate_bps > 128000) return NULL;
+    if (bitrate_bps != 5900 &&
+        (!is_valid_g192_rate(bitrate_bps) || bitrate_bps < 7200)) return NULL;
 
     EVS_Decoder* dec = (EVS_Decoder*)calloc(1, sizeof(EVS_Decoder));
     if (!dec) return NULL;
 
     dec->st = (Decoder_State*)calloc(1, sizeof(Decoder_State));
-    dec->pcm_buf = (float*)calloc(sample_rate_hz / 50, sizeof(float));
+    // The reference decoder uses this buffer for its internal synthesis
+    // before output-rate conversion. MODE2 NB can temporarily write 256
+    // samples even when its final 8-kHz output contains only 160 samples.
+    // Match decoder.c's maximum-rate workspace, not just the output length.
+    dec->pcm_buf = (float*)calloc(L_FRAME48k, sizeof(float));
     if (!dec->st || !dec->pcm_buf) {
-        evs_dec_destroy(dec);
+        free(dec->pcm_buf);
+        free(dec->st);
+        free(dec);
         return NULL;
     }
 
     dec->st->output_Fs       = sample_rate_hz;
-    dec->st->total_brate     = bitrate_bps;
+    dec->st->total_brate     = bitrate_bps == 5900 ? ACELP_7k20 : bitrate_bps;
     dec->st->Opt_AMR_WB      = 0;
     dec->st->bitstreamformat = G192;
     dec->st->bfi             = 0;
@@ -386,6 +378,9 @@ int evs_dec_process(EVS_Decoder* dec,
     // frame while not in CNG) as bfi; mirror the reference decoder main
     // loop and run concealment for it.
     evs_dec(dec->st, dec->pcm_buf, dec->st->bfi ? FRAMEMODE_MISSING : FRAMEMODE_NORMAL);
+    // decoder.c advances this outside evs_dec(). Keeping it at zero makes
+    // every packet look like the first frame and breaks later mode changes.
+    if (dec->st->ini_frame < MAX_FRAME_COUNTER) ++dec->st->ini_frame;
 
     N = dec->st->output_Fs / 50;
     for (i = 0; i < N; ++i) {
@@ -400,16 +395,21 @@ int evs_dec_process(EVS_Decoder* dec,
 
 int evs_dec_process_lost(EVS_Decoder* dec,
                          short* pcm_out, int* n_samples) {
+    unsigned char empty_au = 0;
     if (!dec || !dec->st || !pcm_out || !n_samples) return EVS_ERROR;
 
     int N = dec->st->output_Fs / 50;
 
-    dec->st->bfi = 1;
+    // A missing packet still needs the reference reader's per-frame reset
+    // (bit position, BER and MDCT-switch flags). In CNG it means NO_DATA,
+    // while an active decoder conceals it as a lost speech frame.
+    read_indices_from_djb(dec->st, &empty_au, 0, 0, 0);
     if (dec->st->codec_mode == 0 && dec->st->last_codec_mode != 0) {
         dec->st->codec_mode = dec->st->last_codec_mode;
     }
 
-    evs_dec(dec->st, dec->pcm_buf, FRAMEMODE_MISSING);
+    evs_dec(dec->st, dec->pcm_buf, dec->st->bfi ? FRAMEMODE_MISSING : FRAMEMODE_NORMAL);
+    if (dec->st->ini_frame < MAX_FRAME_COUNTER) ++dec->st->ini_frame;
 
     for (int i = 0; i < N; ++i) {
         float v = dec->pcm_buf[i];

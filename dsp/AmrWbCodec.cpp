@@ -1,3 +1,4 @@
+#include <cstring>
 #include "dsp/AmrWbCodec.h"
 #include <algorithm>
 #ifndef TELEPHONY_DISTRIBUTION_BUILD

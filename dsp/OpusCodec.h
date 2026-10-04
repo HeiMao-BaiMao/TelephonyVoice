@@ -27,7 +27,7 @@ namespace TelephonyDSP {
         void configureNetwork(float packetLossRate, float networkDegradation) override;
 
         // Update the target encoder bitrate at runtime. `bps` is clamped to
-        // Opus's legal range (6..510000) before being stored and pushed into
+        // the supported telephony bitrate range (6000..510000) before being stored and pushed into
         // the live encoder. Safe to call before the encoder exists; the
         // value is then applied the next time the encoder is (re)created
         // (see ctor and applyNetworkCtls()).

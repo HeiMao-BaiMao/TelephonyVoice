@@ -32,8 +32,8 @@ typedef struct EVS_Decoder EVS_Decoder;
 
 // ---------------------------------------------------------------------------
 // Supported EVS native bitrates (bps) for the chosen bandwidth.
-// The encoder's total_brate field accepts any of these. The decoder mirrors
-// whatever bitrate the encoder is configured with.
+// 5900 denotes source-controlled VBR, requires DTX, and uses 7200 internally.
+// NB coding supports at most 24400 bps.
 // ---------------------------------------------------------------------------
 typedef enum {
     EVS_BR_5900   = 5900,
@@ -81,7 +81,8 @@ typedef struct EVS_EncOptions {
 
     // ---- Channel-aware mode (RF, TS 26.443 Annex C) ----
     //   0 = RF disabled (default), 1 = RF requested
-    //   Ignored safely when bitrate != 13200 bps or sample rate < 16000 Hz,
+    //   Ignored safely when bitrate != 13200 bps, sample rate < 16000 Hz,
+    //   or the effective bandwidth ceiling is NB,
     //   matching the reference CLI's validation in io_enc.c.
     int  rf_enable;
     //   0 -> use the reference default (FEC_OFFSET, currently 3)
@@ -92,9 +93,10 @@ typedef struct EVS_EncOptions {
     int  rf_fec_hi;
 
     // ---- Source-controlled VBR (SC-VBR, 5.90 kbps mode) ----
-    //   0 = SC-VBR disabled (default). When enabled, the reference CLI
-    //     forces total_brate to 7.20 kbps and may override DTX settings.
-    //     Keep conservative: enabled only if explicitly requested.
+    //   0 = SC-VBR disabled unless bitrate_bps is 5900.
+    //   Non-zero explicitly selects the 5900-bps SC-VBR mode, overriding
+    //   the selected native bitrate and limiting bandwidth to NB/WB.
+    //   SC-VBR requires dtx_enable != 0. Internally the codec uses 7200 bps.
     int  sc_vbr_enable;
 } EVS_EncOptions;
 
@@ -110,6 +112,72 @@ static inline void evs_enc_options_init(EVS_EncOptions* opts) {
     opts->sc_vbr_enable    = 0;
 }
 
+// Validate and normalize an encoder request without initializing the codec.
+// This inline helper is also available to distribution-build frontends.
+// On success, bitrate_bps, max_bw and (if non-NULL) opts receive the effective
+// public configuration. On error, no caller-owned values are changed.
+// Bandwidth is a ceiling: it is reduced to the input sample rate and the
+// selected bitrate's supported bandwidth. Unsupported RF requests are disabled.
+// SC-VBR is represented publicly by 5900 bps, not its internal 7200-bps rate.
+static inline int evs_enc_normalize_config(int sample_rate_hz, int* bitrate_bps,
+                                          EVS_Bandwidth* max_bw,
+                                          EVS_EncOptions* opts) {
+    int bitrate;
+    EVS_Bandwidth bw, sample_bw;
+    EVS_EncOptions local;
+    if (!bitrate_bps || !max_bw) return EVS_ERROR;
+    bitrate = *bitrate_bps;
+    bw = *max_bw;
+    switch (sample_rate_hz) {
+        case 8000: sample_bw = EVS_NB; break;
+        case 16000: sample_bw = EVS_WB; break;
+        case 32000: sample_bw = EVS_SWB; break;
+        case 48000: sample_bw = EVS_FB; break;
+        default: return EVS_ERROR;
+    }
+    if (bw < EVS_NB || bw > EVS_FB) return EVS_ERROR;
+    switch (bitrate) {
+        case 5900: case 7200: case 8000: case 9600: case 13200:
+        case 16400: case 24400: case 32000: case 48000: case 64000:
+        case 96000: case 128000: break;
+        default: return EVS_ERROR;
+    }
+    evs_enc_options_init(&local);
+    if (opts) local = *opts;
+    local.dtx_enable = local.dtx_enable != 0;
+    local.sc_vbr_enable = local.sc_vbr_enable != 0 || bitrate == 5900;
+    local.rf_enable = local.rf_enable != 0;
+    local.rf_fec_hi = local.rf_fec_hi != 0;
+    if (local.dtx_enable && local.dtx_sid_interval != 0 &&
+        (local.dtx_sid_interval < 3 || local.dtx_sid_interval > 100)) {
+        return EVS_ERROR;
+    }
+    if (bw > sample_bw) bw = sample_bw;
+    if (local.sc_vbr_enable) {
+        if (!local.dtx_enable) return EVS_ERROR;
+        bitrate = 5900;
+    }
+    if (bitrate < 9600 && bw > EVS_WB) bw = EVS_WB;
+    if (bitrate < 16400 && bw > EVS_SWB) bw = EVS_SWB;
+    if (bw == EVS_NB && bitrate > 24400) return EVS_ERROR;
+    if (bitrate != 13200 || sample_rate_hz < 16000 || bw == EVS_NB) {
+        local.rf_enable = 0;
+    }
+    if (local.rf_enable && local.rf_fec_offset != 0 &&
+        local.rf_fec_offset != 2 && local.rf_fec_offset != 3 &&
+        local.rf_fec_offset != 5 && local.rf_fec_offset != 7) {
+        return EVS_ERROR;
+    }
+    if (!local.rf_enable) {
+        local.rf_fec_offset = 0;
+        local.rf_fec_hi = 1;
+    }
+    *bitrate_bps = bitrate;
+    *max_bw = bw;
+    if (opts) *opts = local;
+    return EVS_OK;
+}
+
 // ---------------------------------------------------------------------------
 // Encoder lifecycle.
 // sample_rate_hz : 8000, 16000, 32000, 48000
@@ -118,6 +186,8 @@ static inline void evs_enc_options_init(EVS_EncOptions* opts) {
 // opts           : optional encoder configuration; pass NULL to use the
 //                  legacy defaults (DTX/RF/SC-VBR all off, matching the
 //                  historical evs_enc_create behaviour).
+// Invalid configurations return NULL. Normalization follows
+// evs_enc_normalize_config; in particular 5900 requires DTX via opts.
 // ---------------------------------------------------------------------------
 EVS_Encoder* evs_enc_create_ex(int sample_rate_hz, int bitrate_bps, EVS_Bandwidth max_bw,
                                const EVS_EncOptions* opts);
@@ -129,7 +199,9 @@ void         evs_enc_destroy(EVS_Encoder* enc);
 // pcm_in         : 16-bit linear PCM, exactly sample_rate_hz/50 samples
 // bitstream_out  : caller-allocated buffer for the encoded payload
 // bitstream_max  : capacity of bitstream_out in bytes
-// bitstream_used : on return, number of bytes actually written
+// bitstream_used : on return, number of bytes actually written (zero on error)
+// If capacity is insufficient, the frame is consumed and its packet discarded;
+// subsequent calls remain usable. evs_max_bitstream_bytes avoids this case.
 //
 // Returns EVS_OK or EVS_ERROR.
 // ---------------------------------------------------------------------------
@@ -154,8 +226,9 @@ int evs_enc_process(EVS_Encoder* enc,
 // rf_fec_indicator :0 = LO, non-zero = HI.
 //
 // Same bitrate/sample-rate guard as the constructor: if rf_on is
-// requested but the encoder is not at ACELP_13k20 or the input rate is
-// below16 kHz, rf_on is silently turned off and the encoder is reset
+// requested but the encoder is not configured for ACELP_13k20, the input
+// rate is below 16 kHz, or its bandwidth ceiling is NB, RF is turned off
+// and the encoder is reset
 // to the no-RF defaults (rf_fec_offset =0, rf_fec_indicator =1).
 // ---------------------------------------------------------------------------
 void evs_enc_set_rf(EVS_Encoder* enc, int rf_on, int rf_fec_offset, int rf_fec_indicator);
@@ -176,13 +249,15 @@ void         evs_dec_destroy(EVS_Decoder* dec);
 // n_samples      : on return, number of samples produced (sample_rate_hz/50)
 //
 // Returns EVS_OK or EVS_ERROR.
+// Only native EVS payloads are supported; AMR-WB IO packets are rejected.
 // ---------------------------------------------------------------------------
 int evs_dec_process(EVS_Decoder* dec,
                     const unsigned char* bitstream_in, int bitstream_len,
                     short* pcm_out, int* n_samples);
 
 // Decode one missing 20 ms frame using the reference decoder's packet-loss
-// concealment path (FRAMEMODE_MISSING). No encoded payload is supplied.
+// concealment or continuing comfort noise after a SID frame, as appropriate.
+// No encoded payload is supplied.
 int evs_dec_process_lost(EVS_Decoder* dec,
                          short* pcm_out, int* n_samples);
 

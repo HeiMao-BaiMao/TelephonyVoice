@@ -1,3 +1,4 @@
+#include <cstring>
 #include "dsp/EvsCodec.h"
 
 namespace TelephonyDSP {

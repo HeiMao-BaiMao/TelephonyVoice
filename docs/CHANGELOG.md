@@ -1,3 +1,16 @@
+# 2026-10-04 — Editor and supported-path reliability
+
+- Add a native VSTGUI editor with a route overview, relevant codec controls, keyboard controls, tooltips and host-provided zoom. Keep parameter IDs stable and use the SDK's automation binding.
+- Fix non-JBM endpoint normalization and default-reset metadata. Old normalized route automation may play differently because its previous mapping was wrong; existing projects should review their in/out lanes.
+- Make stream startup, in-place processing, bypass and route/configuration changes consistent. Use a shared 150 ms reported buffering reserve and 96 dB / 10% minimum-phase speech resampling.
+- Validate state reads atomically, retain complete historical state tails, reject truncated/nonfinite state, check writes, and harden invalid audio/automation inputs.
+- Keep codec histories intact for unchanged controls, initialize codec settings, and make artifact/loss reset behavior per-instance and repeatable.
+- Replace unchecked CLI WAV handling with checked PCM16 parsing, strict options, explicit failure exits and safe output replacement. Drain short clips instead of dropping delayed tails.
+- Isolate EVS/opencore symbol collisions, including differently typed AMR-WB codebooks and phase-dispersion routines; remove suppressed duplicate-symbol errors from the supported float EVS build.
+- Initialize EVS modes from the reference encoder rules and validate/normalize configuration combinations before allocating a codec, including 5.9 kbps SC-VBR.
+- Add synthetic DSP, VST state/processing, CLI and editor-description regression suites plus Linux headless CI beside Windows normal/distribution/JBM builds.
+- Preserve the experimental status of EVS FX and the remaining research roadmap. Native DAW rendering, audition and accessibility validation still require a supported host; static layout checks are not a visual smoke test.
+
 # Changelog / 作業履歴
 
 作業履歴の詳細ログです。新しいものが上。技術的な正確さを保つため、

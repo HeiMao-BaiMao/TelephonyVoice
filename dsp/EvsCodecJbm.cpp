@@ -1,3 +1,4 @@
+#include <cstring>
 #include "dsp/EvsCodecJbm.h"
 #include <cmath>
 

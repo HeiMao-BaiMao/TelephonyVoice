@@ -29,7 +29,7 @@ namespace Vst {
         kParamG711Law,               // 0 = mu-law, 1 = A-law
         kParamEvsDtxSidInterval,     // 0 = variable SID, 3..100 = fixed frames
         kParamEvsScVbr,              // EVS Source-Controlled VBR toggle
-        kParamOpusBitrate            // Opus target bitrate in bps (6..510000)
+        kParamOpusBitrate            // Opus target bitrate in bps (6000..510000)
     };
 
     // --------------------------------------------------------------------------
@@ -104,6 +104,7 @@ namespace Vst {
 
         tresult PLUGIN_API initialize(FUnknown* context) override;
         tresult PLUGIN_API setComponentState(IBStream* state) override;
+        IPlugView* PLUGIN_API createView(FIDString name) override;
 
         static FUnknown* createInstance(void*) { return (IEditController*)new TelephonyVoiceController; }
 

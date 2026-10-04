@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.15)
+cmake_minimum_required(VERSION 3.25)
 
 project(TelephonyVoice VERSION 1.0.0 LANGUAGES C CXX)
 
@@ -49,10 +49,12 @@ endif()
 # ---------------------------------------------------------------------------
 set(SMTG_ENABLE_VST3_PLUGIN_EXAMPLES OFF CACHE BOOL "Disable examples" FORCE)
 set(SMTG_ENABLE_VST3_HOSTING_EXAMPLES OFF CACHE BOOL "Disable hosting examples" FORCE)
-set(SMTG_ENABLE_VSTGUI_SUPPORT ON CACHE BOOL "Enable VSTGUI" FORCE)
+option(TELEPHONY_BUILD_PLUGIN "Build the VST3 plugin and its graphical editor" ON)
+set(SMTG_ENABLE_VSTGUI_SUPPORT ${TELEPHONY_BUILD_PLUGIN} CACHE BOOL "Enable VSTGUI" FORCE)
 set(SMTG_CREATE_PLUGIN_LINK OFF CACHE BOOL "Disable symbolic link creation" FORCE)
 set(SMTG_CREATE_MODULE_INFO OFF CACHE BOOL "Disable moduleinfo.json creation" FORCE)
-set(SMTG_RUN_VST_VALIDATOR OFF CACHE BOOL "Disable VST validator" FORCE)
+option(TELEPHONY_VALIDATE_PLUGIN "Run the SDK validator after linking the VST3 plugin" ON)
+set(SMTG_RUN_VST_VALIDATOR ${TELEPHONY_VALIDATE_PLUGIN} CACHE BOOL "Validate VST3 plugin" FORCE)
 
 add_subdirectory(external/vst3sdk)
 
@@ -228,9 +230,16 @@ target_include_directories(TelephonyDSP PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
 # ---------------------------------------------------------------------------
 # TelephonyVoice VST3 Plugin
 # ---------------------------------------------------------------------------
+if(TELEPHONY_BUILD_PLUGIN)
 smtg_add_vst3plugin(TelephonyVoice
     TelephonyVoice.cpp
     TelephonyVoice.h
+    TelephonyEditor.cpp
+    TelephonyEditor.h
+)
+
+smtg_target_add_plugin_resources(TelephonyVoice
+    RESOURCES resources/telephonyvoice.uidesc
 )
 
 target_link_libraries(TelephonyVoice
@@ -245,6 +254,8 @@ target_include_directories(TelephonyVoice PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/e
 if(MSVC)
     target_compile_options(TelephonyVoice PRIVATE /W3 /MP)
 endif()
+
+endif() # TELEPHONY_BUILD_PLUGIN
 
 # Fix for vo-amrwbenc crash in Debug mode:
 # vo-amrwbenc requires optimization /O2 to avoid stack corruption crashes (likely due to internal buffer overflows hidden by optimization).
@@ -266,15 +277,10 @@ endif()
 # ---------------------------------------------------------------------------
 # TelephonyRunner (Sample EXE)
 # ---------------------------------------------------------------------------
-set(WAV_TOOLS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/external/opencore-amr/test")
-
 add_executable(TelephonyRunner
     TelephonyRunner.cpp
-    "${WAV_TOOLS_DIR}/wavreader.c"
-    "${WAV_TOOLS_DIR}/wavwriter.c"
 )
 
-target_include_directories(TelephonyRunner PRIVATE "${WAV_TOOLS_DIR}")
 target_link_libraries(TelephonyRunner PRIVATE TelephonyDSP)
 
 if(MSVC)
@@ -305,7 +311,43 @@ if(NOT TELEPHONY_USE_EVS_FX)
 
     add_test(NAME dsp_smoke COMMAND TelephonyDspSmoke)
 
+    add_executable(TelephonyDspRegression tests/TelephonyDspRegression.cpp)
+    target_link_libraries(TelephonyDspRegression PRIVATE TelephonyDSP)
+    add_test(NAME dsp_regressions COMMAND TelephonyDspRegression)
+
+    add_executable(TelephonyPluginRegression
+        tests/TelephonyPluginRegression.cpp
+        TelephonyVoice.cpp
+        external/vst3sdk/public.sdk/source/common/memorystream.cpp
+    )
+    target_link_libraries(TelephonyPluginRegression PRIVATE TelephonyDSP sdk)
+    target_include_directories(TelephonyPluginRegression PRIVATE external/vst3sdk)
+    add_test(NAME plugin_regressions COMMAND TelephonyPluginRegression)
+
+    add_executable(TelephonyRunnerTests tests/TelephonyRunnerTests.cpp)
+    target_link_libraries(TelephonyRunnerTests PRIVATE TelephonyDSP)
+    add_test(NAME runner_regressions COMMAND TelephonyRunnerTests)
+    set_tests_properties(dsp_smoke dsp_regressions plugin_regressions runner_regressions
+        PROPERTIES TIMEOUT 120)
+
+    if(NOT TELEPHONY_DISTRIBUTION_BUILD)
+        add_executable(TelephonyEvsConfigTests tests/EvsApiConfiguration.c)
+        target_link_libraries(TelephonyEvsConfigTests PRIVATE TelephonyDSP)
+        if(UNIX)
+            target_link_libraries(TelephonyEvsConfigTests PRIVATE m)
+        endif()
+        add_test(NAME evs_configurations COMMAND TelephonyEvsConfigTests)
+        set_tests_properties(evs_configurations PROPERTIES TIMEOUT 120)
+    endif()
+
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME editor_description
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/ValidateEditor.py)
+    endif()
+
     if(TELEPHONY_USE_EVS_JBM)
         add_test(NAME evs_jbm_smoke COMMAND EVSJbmSmoke)
+        set_tests_properties(evs_jbm_smoke PROPERTIES TIMEOUT 120)
     endif()
 endif()

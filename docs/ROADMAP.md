@@ -54,7 +54,7 @@ Each item below decouples them or adds new independent simulation knobs.
 | 2.6 | **Codec mode-switching transient artifacts** — simulate audible clicks / bandwidth-transition artifacts when AMR/EVS changes bitrate mid-call. Requires filter-coefficient interpolation and encoder-state preservation across mode changes. | ★★★★ |
 | 2.7 | **VAD→DTX extension to AMR / G.711 / GSM** — wire the existing SpeexDSP energy VAD to the legacy codecs (currently only OPUS_VOIP / EVS_LIKE). | ★ |
 | 2.8 | **EVS AMR-WB IO mode** — enable the 3GPP EVS encoder's inter-op mode that produces AMR-WB-compatible bitstreams. Requires `evs_dec_create` signature change (breaking). | ★★★ |
-| 2.9 | **VSTGUI editor** — custom visual route diagram showing the `in → exchange → out` path with live VU meters, loss-rate indicators, and codec labels. | ★★★★★ |
+| 2.9 | **VSTGUI editor** — route diagram, codec labels, configured-loss readout, grouped controls, host automation binding and zoom are implemented. Live VU meters and measured loss telemetry remain future work; the editor does not present simulated readouts as measurements. | ★★★★★ |
 
 ---
 

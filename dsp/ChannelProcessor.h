@@ -10,7 +10,7 @@
 #include <memory>
 #include <array>
 
-namespace r8b { class CDSPResampler24; }
+namespace r8b { class CDSPResampler; }
 
 namespace TelephonyDSP {
 
@@ -51,12 +51,11 @@ namespace TelephonyDSP {
         // cached and picked up the next time OPUS_VOIP rebuilds its
         // codec. Defaults to FB (1105) which mirrors Opus's own default.
         void setOpusBandwidth(int bw);
-        // Opus target bitrate in bps (default 24000, range 6..510000).
+        // Opus target bitrate in bps (default 24000, range 6000..510000).
         // For OPUS_VOIP mode the active OpusCodec is updated in place via
         // OpusCodec::setBitrate(); for other modes the value is cached in
         // evsOpusBitrateBps and applied the next time OPUS_VOIP rebuilds
-        // its codec. OPUS_VOIP also re-creates the codec to make sure
-        // the bitstream buffer is sized for the new rate cleanly.
+        // its codec. Active changes preserve the codec and packet queues.
         void setOpusBitrate(int bps);
         // Toggle EVS Source-Controlled VBR (sc_vbr_enable). If the active
         // codec is an EVSCodec or EVSCodecJbm the change is pushed
@@ -88,6 +87,7 @@ namespace TelephonyDSP {
         float paramPacketLossRate;
         float paramNetworkDegradation;
         uint32_t packetLossSeed;
+        uint32_t artifactSeed;
         int packetLossBurstFrames;
 
         // EVS configuration (only used when currentMode == EVS_NATIVE)
@@ -139,13 +139,13 @@ namespace TelephonyDSP {
         RingBuffer ringCodecOut;
         RingBuffer outputBuffer;
 
-        std::unique_ptr<r8b::CDSPResampler24> resamplerDown;
-        std::unique_ptr<r8b::CDSPResampler24> resamplerUp;
+        std::unique_ptr<r8b::CDSPResampler> resamplerDown;
+        std::unique_ptr<r8b::CDSPResampler> resamplerUp;
         std::unique_ptr<ICodec> codec;
 
         // Maximum input length that was used to construct the resamplers.
         // Callers of resamplerDown/resamplerUp must never pass more than this
-        // many input samples in a single r8brain::CDSPResampler24::process()
+        // many input samples in a single r8brain::CDSPResampler::process()
         // call, otherwise r8brain's pre-allocated internal buffers overflow.
         // We track both values so we can chunk process() calls safely.
         int downMaxInLen;

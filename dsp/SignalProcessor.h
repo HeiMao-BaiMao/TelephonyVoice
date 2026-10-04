@@ -23,7 +23,7 @@ namespace TelephonyDSP {
         // cached for the next OPUS_VOIP rebuild.
         void setOpusBandwidth(int bw);
         // Forward an Opus target bitrate in bps (default 24000, range
-        // 6..510000) to every leg's ChannelProcessor. Applied
+        // 6000..510000) to every leg's ChannelProcessor. Applied
         // immediately to a live OpusCodec, or cached for the next
         // OPUS_VOIP rebuild.
         void setOpusBitrate(int bps);
@@ -48,6 +48,8 @@ namespace TelephonyDSP {
         void setEvsDtxSidInterval(int interval);
         void setParameters(float dryWet, float outGaindB, bool artifacts, float artifactAmount,
                            float packetLossRate = 0.0f, float networkDegradation = 0.0f);
+        // Codec paths always reserve 150 ms for streaming frame/resampler
+        // availability. This switch controls that delay for direct Bypass.
         void setSimulateLatency(bool enable);
         void reset();
         void process(float** inputs, int numIns, float** outputs, int numOuts, int numSamples);
@@ -76,7 +78,7 @@ namespace TelephonyDSP {
         // Opus OPUS_BANDWIDTH_* cap (1101..1105). Mirrored to every
         // ChannelProcessor via setOpusBandwidth().
         int opusBandwidth;
-        // Opus target bitrate in bps (default 24000, range 6..510000).
+        // Opus target bitrate in bps (default 24000, range 6000..510000).
         // Mirrored to every ChannelProcessor via setOpusBitrate().
         int opusBitrate;
         // AMR-NB bitrate mode (0..7). Mirrored to every ChannelProcessor

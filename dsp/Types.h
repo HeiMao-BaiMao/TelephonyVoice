@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <algorithm>
+#include <cmath>
 
 namespace TelephonyDSP {
 
@@ -43,7 +44,7 @@ enum class EraMode {
         None
     };
 
-    static const int LATENCY_MS = 100;
+    static const int LATENCY_MS = 150;
 
 #ifdef TELEPHONY_DISTRIBUTION_BUILD
 inline EraMode distributionSafeMode(EraMode m) {
@@ -62,7 +63,7 @@ inline EraMode distributionSafeMode(EraMode m) { return m; }
 #endif
 
 inline int clampToInt16(float v) {
-    return (int)std::clamp(v, -32768.0f, 32767.0f);
+    return std::isfinite(v) ? (int)std::clamp(v, -32768.0f, 32767.0f) : 0;
 }
 
 } // namespace TelephonyDSP

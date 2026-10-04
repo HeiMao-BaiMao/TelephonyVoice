@@ -8,9 +8,27 @@ UI はコーデック規格名ではなく「`in -> 交換局 -> out`」「固�
 - 作業履歴の詳細: [docs/CHANGELOG.md](docs/CHANGELOG.md)
 - 実装ロードマップ (Tier 0〜4): [docs/ROADMAP.md](docs/ROADMAP.md)
 
+## 専用エディタとサポート範囲
+
+VST3 ホストでプラグインを開くと、`in → 交換局 → out` の経路、通信劣化、
+ミックス／出力、コーデック詳細をまとめた専用エディタを表示します。
+ホストのオートメーションおよび保存状態と連動し、現在の経路で使わない
+コーデック設定は無効表示になります。配布ビルドでは利用できない
+コーデック設定を表示しません。Opus は引き続き CLI 専用です。
+
+注意: 通常ビルド (JBM 無効) の経路リストと音声処理の値変換のずれを修正しました。
+パラメータ ID と保存済みの経路整数は維持しますが、旧版で記録した経路の
+オートメーションは、以前の誤った音声経路と異なる結果になる場合があります。
+既存プロジェクトでは in / out の選択とオートメーションを確認してください。
+
+これは DAW 内の音声エフェクトです。電話発信、録音、外部ネットワーク通信は
+行いません。ロードマップの Tier 1〜4 は将来の研究・拡張項目を含み、
+すべてを実装済みとするものではありません。固定小数点 EVS は引き続き実験中です。
+
 ## クイックスタート
 
 ```pwsh
+# 必要: CMake 3.25 以上、C++20 コンパイラ、Ninja
 # 1. サブモジュールごとクローン
 git clone --recurse-submodules <this-repo> TelephonyVoice
 cd TelephonyVoice
@@ -27,8 +45,11 @@ cmd /c "call `"C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliar
 * `out/build/x64-release/TelephonyRunner.exe` – CLI
 * `out/build/x64-release/VST3/Release/TelephonyVoice.vst3` – プラグイン
 
-CLI は 16-bit PCM WAV を入力すると、各モードの出力 `<入力名>.<モード>.wav` を
-まとめて生成します:
+CLI は 16-bit 整数 PCM WAV (8〜192 kHz、1〜32 ch) を入力すると、各モードの出力 `<入力名>.<モード>.wav` を
+まとめて入力ファイルと同じフォルダへ生成します。壊れた WAV、無効なオプション、
+読み書き失敗は非ゼロ終了コードになります。出力は変換成功後に置き換えるため、
+処理が失敗しても既存の出力ファイルを壊しません。非空の入力には末尾のコーデック音声を
+排出する 1〜10 秒のテールが追加されます (入力が空なら空の WAV のままです):
 
 ```pwsh
 .\out\build\x64-release\TelephonyRunner.exe path\to\input.wav
@@ -56,6 +77,11 @@ UI パラメータ:
 * コーデック詳細 – G.711 Law / AMR-NB・AMR-WB モード / Opus ビットレート・帯域 /
   EVS サンプルレート・ビットレート・帯域・DTX SID 間隔・SC-VBR
 
+EVS は選択したサンプルレートに合わせて帯域を制限し、5.9 kbps は NB/WB の
+SC-VBR として処理します。8 kHz または NB の上限は 24.4 kbps です。CLI は
+無効な組合せを出力作成前に拒否します。VST3 の要求値が NB 上限を超えた場合は、
+音声処理で 24.4 kbps に決定的に制限し、エディタに注意を表示します。
+
 ユーザー向けエンドポイントは内部的に次のコーデック世代モードへマップされます:
 
 | `EraMode`                | サンプルレート | コーデック             | 実装                                   |
@@ -72,11 +98,18 @@ UI パラメータ:
 
 バイパスはレイテンシ補正付きです(プラグインがホストへ報告するレイテンシと同じ
 遅延をドライ信号にも与えるので、バイパス切替で音の位置がずれません)。
+音声経路のバッファは 150 ms とし、ホストへ同じ遅延を報告します。
+16-bit 音声向けのリサンプラ設定 (96 dB 阻止帯域、10% 遷移帯域、最小位相) を使い、
+経路切替時はドライ／ウェットを一緒に初期化します。CLI で追加の遅延シミュレーションを
+無効化しても、コーデック経路の処理に必要なバッファは維持します。
+
 
 ## ビルドオプション
 
 | オプション                  | 既定値  | 効果                                                                 |
 | -------------------------- | ------- | ---------------------------------------------------------------------- |
+| `TELEPHONY_BUILD_PLUGIN` | ON | VST3 と GUI をビルド。OFF は SDK を利用する headless 回帰テストと CLI のみ。 |
+| `TELEPHONY_VALIDATE_PLUGIN` | ON | VST3 ビルド後に Steinberg SDK validator でプラグインを検査。 |
 | `TELEPHONY_USE_EVS_FX`     | OFF     | 実験的な固定小数点 EVS (TS 26.442)。FX ライブラリと `TelephonyDSP` まではビルドできるが、`TelephonyRunner` の最終リンクが未解決シンボルでブロック中(詳細は [docs/CHANGELOG.md](docs/CHANGELOG.md))。 |
 | `TELEPHONY_USE_EVS_JBM`    | OFF     | 3GPP `EvsRXlib` を包む実験的な EVS Stage-1 JBM/VoIP 受信アダプタ (`evs_api_rx`) と `EVSJbmSmoke` をビルド。`TELEPHONY_DISTRIBUTION_BUILD`・`TELEPHONY_USE_EVS_FX` とは併用不可。 |
 | `TELEPHONY_DISTRIBUTION_BUILD` | OFF | AMR/AMR-WB/EVS 参照実装を除外し、配布可能なモードのみを公開。 |
@@ -104,8 +137,25 @@ ctest --test-dir out/build/x64-release --output-on-failure
 
 JBM ビルドでは `EVSJbmSmoke` も `evs_jbm_smoke` として ctest に登録されます。
 GitHub Actions (`.github/workflows/ci.yml`) が push / PR ごとに
-`x64-release` / `x64-release-dist` / `x64-release-jbm` の 3 構成を
+`x64-release` / `x64-release-dist` / `x64-release-jbm` の Windows 3 構成を
 ビルド+テストします。
+
+### GUI なしのローカル回帰テスト
+
+Linux などで VSTGUI の開発ライブラリを入れずに音声処理／CLI／VST 状態管理を
+検証する場合は、プラグインのビルドだけを無効化できます。VST3 SDK を含む
+サブモジュールは必要です。この構成は GUI の表示確認を代替しません。
+
+```sh
+cmake -S . -B out/build/headless -G Ninja -DCMAKE_BUILD_TYPE=Release -DTELEPHONY_BUILD_PLUGIN=OFF
+cmake --build out/build/headless --parallel
+ctest --test-dir out/build/headless --output-on-failure
+```
+
+`dsp_regressions`、`plugin_regressions`、`runner_regressions`、非配布ビルドの
+`evs_configurations` は合成信号と一時 WAV を
+使います。マイク、実通話、外部サービスへの接続は不要です。Windows の VST3
+ビルド 3 構成と Linux の GUI なし 3 構成を CI で検証します。
 
 ## コード構成
 
@@ -131,6 +181,8 @@ GitHub Actions (`.github/workflows/ci.yml`) が push / PR ごとに
 │                          # PLC、リサンプラ/フィルタチェーン(クラス毎に27ファイル)
 ├── TelephonyVoice.h       # VST3 プロセッサ + エディットコントローラ
 ├── TelephonyVoice.cpp     # VST3 グルー
+├── TelephonyEditor.cpp/.h # VSTGUI エディタ
+├── resources/telephonyvoice.uidesc # エディタのレイアウト
 ├── TelephonyRunner.cpp    # CLI: 入力 WAV に全モードを適用
 ├── tests/
 │   └── TelephonyDspSmoke.cpp  # ctest スモークテスト
