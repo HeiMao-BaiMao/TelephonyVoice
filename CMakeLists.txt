@@ -4,6 +4,8 @@ project(TelephonyVoice VERSION 1.0.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+# DSP static libraries are also linked into a shared VST3 module on Unix.
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 # ---------------------------------------------------------------------------
 # 3GPP EVS codec variant selection
@@ -231,6 +233,14 @@ target_include_directories(TelephonyDSP PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
 # TelephonyVoice VST3 Plugin
 # ---------------------------------------------------------------------------
 if(TELEPHONY_BUILD_PLUGIN)
+# The SDK's third-party setup must run in the target's scope: it supplies the
+# platform entry point and bundle layout. Keep its directory-wide flags/output
+# paths scoped to the plugin so CLI and regression targets retain their layout.
+function(telephony_add_plugin)
+get_directory_property(_compile_options COMPILE_OPTIONS)
+get_directory_property(_compile_definitions COMPILE_DEFINITIONS)
+get_directory_property(_link_libraries LINK_LIBRARIES)
+smtg_enable_vst3_sdk()
 smtg_add_vst3plugin(TelephonyVoice
     TelephonyVoice.cpp
     TelephonyVoice.h
@@ -252,9 +262,17 @@ target_link_libraries(TelephonyVoice
 target_include_directories(TelephonyVoice PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/external/vst3sdk")
 
 if(MSVC)
-    target_compile_options(TelephonyVoice PRIVATE /W3 /MP)
+    target_compile_options(TelephonyVoice PRIVATE /W3 /MP /fp:precise)
 endif()
 
+# add_compile_options/definitions and link_libraries are directory properties,
+# unlike ordinary CMake variables. Restore them explicitly for later targets.
+set_directory_properties(PROPERTIES
+    COMPILE_OPTIONS "${_compile_options}"
+    COMPILE_DEFINITIONS "${_compile_definitions}"
+    LINK_LIBRARIES "${_link_libraries}")
+endfunction()
+telephony_add_plugin()
 endif() # TELEPHONY_BUILD_PLUGIN
 
 # Fix for vo-amrwbenc crash in Debug mode:
