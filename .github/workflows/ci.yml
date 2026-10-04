@@ -44,7 +44,13 @@ jobs:
         run: cmake --build out/build/${{ matrix.preset }} --parallel
 
       - name: Test
-        run: ctest --test-dir out/build/${{ matrix.preset }} --output-on-failure
+        run: |
+          ctest --test-dir out/build/${{ matrix.preset }} --output-on-failure
+          $testExit = $LASTEXITCODE
+          if ($testExit -ne 0) {
+            python tests/DescribeCodecCrash.py "out/build/${{ matrix.preset }}/TelephonyCodecControls.map" "out/build/${{ matrix.preset }}/Testing/Temporary/LastTest.log"
+          }
+          exit $testExit
 
   linux-regressions:
     runs-on: ubuntu-latest

@@ -10,11 +10,35 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 #if TELEPHONY_EXPERIMENTAL_NETWORK
 #include <opus.h>
 #endif
 using namespace TelephonyDSP;
 #define CHECK(x) do { if (!(x)) { std::fprintf(stderr,"codec control line %d: %s\n",__LINE__,#x); std::exit(1); } } while(0)
+// CTest captures stdout through a pipe. Keep the last completed stage visible
+// even if a third-party reference codec raises an OS-level exception.
+static void stage(const char* name) { std::printf("[codec_controls] %s\n", name); }
+#if defined(_WIN32)
+static LONG WINAPI reportCodecException(EXCEPTION_POINTERS* exception) {
+    const auto* record = exception->ExceptionRecord;
+    const auto base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+    std::fprintf(stderr, "[codec_controls] Windows exception 0x%08lx at %p (image+0x%llx)\n",
+        record->ExceptionCode, record->ExceptionAddress,
+        static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(record->ExceptionAddress) - base));
+    if (record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && record->NumberParameters >= 2)
+        std::fprintf(stderr, "[codec_controls] access type %llu, address 0x%llx\n",
+            static_cast<unsigned long long>(record->ExceptionInformation[0]),
+            static_cast<unsigned long long>(record->ExceptionInformation[1]));
+    std::fflush(stderr);
+    return EXCEPTION_CONTINUE_SEARCH; // Diagnose, never hide or handle the failure.
+}
+#endif
 struct Capture : ICodecTransport {
     CodecPacketInfo info{CodecPacketFormat::GSM,0,0}; std::vector<uint8_t> bytes; int calls = 0;
     bool exchange(const CodecPacketInfo& i,const uint8_t* p,size_t n,bool lost,CodecPlayout& out) override {
@@ -76,6 +100,7 @@ static void opusControls() {
 #if TELEPHONY_EXPERIMENTAL_NETWORK
     OpusCodec codec(48000,24000,5); Capture capture; codec.setTransport(&capture); codec.configureDtx(false,false);
     for(float duration:{2.5f,5.f,10.f,20.f,40.f,60.f}) {
+        std::printf("[codec_controls] Opus duration %.1f ms\n", duration);
         CHECK(codec.setExpertFrameDuration(duration)); CHECK(codec.getFrameSize()==(int)(48*duration));
         std::vector<int16_t> input(codec.getFrameSize()), output(input.size()); tone(input,48000,440);
         codec.processFrame(input.data(),output.data(),false);
@@ -89,6 +114,7 @@ static void opusControls() {
     CHECK(!codec.setExpertFrameDuration(15)); CHECK(codec.supportsForceMode());
     codec.setBitrate(48000); codec.setFecEnabled(false);
     for(auto mode : {OpusMode::Silk, OpusMode::Hybrid, OpusMode::Celt, OpusMode::Auto}) {
+        std::printf("[codec_controls] Opus forced mode %d\n", static_cast<int>(mode));
         CHECK(codec.setForceMode(mode));
         std::vector<int16_t> input(codec.getFrameSize()),output(input.size());
         for(int f=0;f<10;++f) { tone(input,48000,1000,f); codec.processFrame(input.data(),output.data(),false); }
@@ -106,6 +132,7 @@ static void opusControls() {
 static void evsControls() {
 #ifndef TELEPHONY_DISTRIBUTION_BUILD
     for(int mode=0;mode<9;++mode) {
+        std::printf("[codec_controls] EVS AMR-WB IO mode %d\n", mode);
         static const int rates[]={6600,8850,12650,14250,15850,18250,19850,23050,23850};
         EVS_EncOptions opts; evs_enc_options_init(&opts); opts.amr_wb_io=1; opts.dtx_enable=1; opts.dtx_sid_interval=3;
         EVS_Encoder* enc=evs_enc_create_ex(16000,rates[mode],EVS_WB,&opts);
@@ -123,6 +150,7 @@ static void evsControls() {
         CHECK(sids>0); CHECK(evs_enc_reconfigure(enc,12345,EVS_WB,&opts)==EVS_ERROR);
         evs_enc_destroy(enc); evs_dec_destroy(dec);
     }
+    stage("EVS auto bandwidth and runtime profiles");
     EVSCodec dynamic(48000,16400,EVS_FB); dynamic.configureDtx(false,false); dynamic.setAutoBandwidth(true);
     std::vector<int16_t> input(960),output(960);
     for(int f=0;f<20;++f) { tone(input,48000,500,f); dynamic.processFrame(input.data(),output.data(),false); }
@@ -141,6 +169,7 @@ static void evsControls() {
     dynamic.setTransport(nullptr);
     CHECK(dynamic.setAmrWbIo(false));
     for(int f=0;f<8;++f) dynamic.processFrame(input.data(),output.data(),false);
+    stage("EVS native profile restoration");
     EVSCodec restored(32000,24400,EVS_SWB), fresh(32000,24400,EVS_SWB);
     CHECK(restored.setAmrWbIo(true,12650)); CHECK(restored.getMaxBandwidth()==EVS_SWB);
     CHECK(restored.getActiveBandwidth()==EVS_WB); CHECK(restored.setAmrWbIo(false));
@@ -149,6 +178,7 @@ static void evsControls() {
     std::vector<int16_t> restoredInput(640), restoredOutput(640), freshOutput(640);
     tone(restoredInput,32000,680);
     for(int f=0;f<8;++f) { restored.processFrame(restoredInput.data(),restoredOutput.data(),false); fresh.processFrame(restoredInput.data(),freshOutput.data(),false); CHECK(restoredOutput==freshOutput); }
+    stage("EVS dense BER and DTX");
     EVSCodec corrupt(16000,13200,EVS_WB); packetAndDtx(corrupt);
 #endif
 }
@@ -190,6 +220,7 @@ static void bitErrorStress() {
     // The reference decoder must survive dense valid-symbol corruption,
     // including speech/SID transitions and changing core/bandwidth modes.
     for (int bitrate : {7200,8000,9600,13200,16400,24400,32000,48000,64000,96000,128000}) {
+        std::printf("[codec_controls] EVS BER bitrate %d\n", bitrate);
         EVSCodec codec(48000,bitrate,EVS_FB); codec.configureBitErrors(.05f,(uint32_t)bitrate);
         std::vector<int16_t> input(960), output(960);
         for(int f=0;f<80;++f) { tone(input,48000,120+(f*77)%15000,f); codec.processFrame(input.data(),output.data(),f%19==0); }
@@ -209,13 +240,26 @@ static void bitErrorStress() {
 #endif
 }
 int main(int argc, char** argv) {
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
+    std::setvbuf(stderr, nullptr, _IONBF, 0);
+#if defined(_WIN32)
+    SetUnhandledExceptionFilter(reportCodecException);
+#endif
     if(argc>1 && std::string(argv[1])=="--jbm-short") { jbmClockDrift(1000); return 0; }
     if(argc>1 && std::string(argv[1])=="--jbm-clock") { jbmClockDrift(); return 0; }
     if(argc>1 && std::string(argv[1])=="--evs-only") { evsControls(); bitErrorStress(); return 0; }
     if(argc>1 && std::string(argv[1])=="--opus-only") { opusControls(); return 0; }
-    G711Codec g711(8000); packetAndDtx(g711); GSMCodec gsm; packetAndDtx(gsm);
+    stage("G.711 packet, BER and DTX"); G711Codec g711(8000); packetAndDtx(g711);
+    stage("GSM packet, BER and DTX"); GSMCodec gsm; packetAndDtx(gsm);
 #ifndef TELEPHONY_DISTRIBUTION_BUILD
-    AMRNBCodec nb; packetAndDtx(nb); AMRWBCodec wb; packetAndDtx(wb);
+    stage("AMR-NB packet, BER and DTX"); AMRNBCodec nb; packetAndDtx(nb);
+    stage("AMR-WB packet, BER and DTX"); AMRWBCodec wb; packetAndDtx(wb);
 #endif
-    deterministicBer(); amrModeContinuity(); opusControls(); evsControls(); sourceControlledProfiles(); bitErrorStress(); std::puts("Codec control regressions passed");
+    stage("Deterministic BER"); deterministicBer();
+    stage("AMR mode continuity"); amrModeContinuity();
+    stage("Opus controls"); opusControls();
+    stage("EVS controls"); evsControls();
+    stage("Source-controlled profiles"); sourceControlledProfiles();
+    stage("BER stress"); bitErrorStress();
+    std::puts("Codec control regressions passed");
 }

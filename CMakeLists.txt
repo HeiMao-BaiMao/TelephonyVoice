@@ -301,6 +301,9 @@ if(BUILD_TESTING OR NOT DEFINED BUILD_TESTING)
 
     add_executable(TelephonyCodecControls tests/TelephonyCodecControls.cpp)
     target_link_libraries(TelephonyCodecControls PRIVATE TelephonyDSP)
+    if(MSVC)
+        target_link_options(TelephonyCodecControls PRIVATE "/MAP:${CMAKE_CURRENT_BINARY_DIR}/TelephonyCodecControls.map")
+    endif()
     add_test(NAME codec_controls COMMAND TelephonyCodecControls)
     set_tests_properties(codec_controls PROPERTIES TIMEOUT 120)
 
