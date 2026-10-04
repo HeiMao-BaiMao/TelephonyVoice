@@ -57,7 +57,10 @@ target_include_directories(opencore-amrnb PRIVATE
 
 # Keep opencore's arithmetic ABI separate from the EVS reference implementation.
 # Some identically named routines carry an extra overflow-pointer parameter.
-foreach(_symbol L_abs L_negate L_shr_r div_s mult_r negate norm_l norm_s
+# L_mac's C-equivalent header uses non-static __inline. MSVC emits its
+# out-of-line COMDAT for VAD2; EVS exports a different three-argument L_mac.
+# Namespace even header-defined arithmetic, never suppress duplicate symbols.
+foreach(_symbol L_mac L_abs L_negate L_shr_r div_s mult_r negate norm_l norm_s
         shr shr_r sub Pow2)
     target_compile_definitions(opencore-amrnb PRIVATE "${_symbol}=telephony_amrnb_${_symbol}")
 endforeach()
