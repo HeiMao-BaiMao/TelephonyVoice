@@ -60,12 +60,12 @@
 #include "rom_com_fx.h"
 #include "stl.h"
 #include <math.h>
+#include <stdlib.h>   /* calloc / free for the per-handle CLDFB instances */
 
 /* -------------------------------------------------------------------------- */
 /* Static resource limits                                                     */
 /* -------------------------------------------------------------------------- */
 
-#define EVS_FX_CLDFB_MAX_INSTANCES    8
 #define EVS_FX_CLDFB_MAX_CHANNELS     CLDFB_NO_CHANNELS_MAX   /* 60 */
 #define EVS_FX_CLDFB_MAX_COLS         CLDFB_NO_COL_MAX        /* 16 */
 #define EVS_FX_CLDFB_MAX_FILTER_LEN   (10 * EVS_FX_CLDFB_MAX_CHANNELS)
@@ -76,16 +76,22 @@
 #define EVS_FX_CLDFB_PI 3.14159265358979323846
 
 /* One CLDFB instance.  CLDFB_FILTER_BANK is the first member so that a
- * HANDLE_CLDFB_FILTER_BANK pointer can be cast back to this struct. */
+ * HANDLE_CLDFB_FILTER_BANK pointer can be cast back to this struct.
+ *
+ * Instances are heap-allocated one per openCldfb() call and released by
+ * deleteCldfb().  They used to come from a fixed pool of 8 static slots, which
+ * the decoder silently exhausted as soon as more than one EVS codec instance
+ * existed: a stereo render opens ten CLDFB banks (two encoders + two decoders,
+ * three banks each in the decoder), openCldfb() then returned NULL, and the
+ * reference dereferences the handle unconditionally
+ * (init_dec_fx.c: "st_fx->cldfbSyn_fx->scale"), which killed the process with
+ * an access violation in the second instance's init_decoder_fx(). */
 typedef struct
 {
     CLDFB_FILTER_BANK bank;
     Word16            state[EVS_FX_CLDFB_MAX_STATE_WORDS];
     Word16            memory[EVS_FX_CLDFB_MAX_STATE_WORDS];
-    Word16            in_use;
 } evs_fx_cldfb_inst_t;
-
-static evs_fx_cldfb_inst_t s_cldfb_pool[EVS_FX_CLDFB_MAX_INSTANCES];
 
 /* Shared modulation tables, one entry per supported channel count. */
 static Word16 s_cos_tbl[6][EVS_FX_CLDFB_MAX_MOD_SIZE];
@@ -287,8 +293,7 @@ void openCldfb(HANDLE_CLDFB_FILTER_BANK *h_cldfb,
                const Word16 maxCldfbBands,
                const Word16 frameSize)
 {
-    Word16 i;
-    evs_fx_cldfb_inst_t *inst = NULL;
+    evs_fx_cldfb_inst_t *inst;
     CLDFB_FILTER_BANK *hs;
     (void)frameSize;   /* no_col is fixed at CLDFB_NO_COL_MAX */
 
@@ -297,25 +302,14 @@ void openCldfb(HANDLE_CLDFB_FILTER_BANK *h_cldfb,
         return;
     }
 
-    /* Reject obviously bogus handles; otherwise find a free pool slot. */
-    for (i = 0; i < EVS_FX_CLDFB_MAX_INSTANCES; i++)
-    {
-        if (s_cldfb_pool[i].in_use == 0)
-        {
-            inst = &s_cldfb_pool[i];
-            break;
-        }
-    }
-
+    /* One heap instance per handle: the number of CLDFB banks a session needs
+     * is bounded by the number of codec instances, not by a fixed pool. */
+    inst = (evs_fx_cldfb_inst_t *)calloc(1, sizeof(evs_fx_cldfb_inst_t));
     if (inst == NULL)
     {
         *h_cldfb = NULL;
         return;
     }
-
-    inst->in_use = 1;
-    evs_fx_set16((Word16 *)inst, 0, (Word32)sizeof(*inst) / 2);
-    inst->in_use = 1;   /* set16_fx just zeroed the flag; restore it. */
 
     hs = &inst->bank;
     hs->type = (CLDFB_TYPE)type;
@@ -355,9 +349,11 @@ void deleteCldfb(HANDLE_CLDFB_FILTER_BANK *h_cldfb)
         return;
     }
 
+    /* CLDFB_FILTER_BANK is the first member of the instance, so the handle
+     * doubles as the allocation pointer. */
     inst = cldfb_inst_from_handle(hs);
-    evs_fx_set16((Word16 *)inst, 0, (Word32)sizeof(*inst) / 2);
     *h_cldfb = NULL;
+    free(inst);
 }
 
 void resampleCldfb(HANDLE_CLDFB_FILTER_BANK hs,

@@ -5,6 +5,33 @@
 
 ---
 
+## 2026-10-06 (3) — EVS FX: CLDFB pool fix, DTX workaround, real status measured
+
+The fixed-point EVS path was re-measured on HEAD and is far healthier than the
+June notes suggest:
+
+* **Mono `evs_native` renders correctly**: SWB 32 kHz / 13.2 kbps completes with
+  exit code 0, RMS -12.5 dBFS (float reference: -12.4 dBFS) and **0.994
+  correlation with the float EVS reference output** (both correlate ~0.92 with
+  the dry input, so this is decoded speech, not a passthrough).
+* **`cldfb_fx.c`: CLDFB instances are now heap-allocated** instead of coming
+  from a fixed pool of 8 static slots.  A stereo render needs ten banks (two
+  encoders + two decoders), the pool ran dry, `openCldfb()` returned NULL and
+  the reference dereferences the handle unconditionally
+  (`init_dec_fx.c: st_fx->cldfbSyn_fx->scale`), so the second codec instance died
+  in `init_decoder_fx` with `0xC0000005`.  `deleteCldfb()` frees the instance.
+* **`evs_api_fx.c`: DTX is forced off.**  The FD-CNG family
+  (`fdcng_enc_fx.c` / `fdcng_dec_fx.c`) is still link-unblock stubs, and running
+  the DTX/SID path through them corrupts memory: with DTX enabled a mono render
+  died with `0xC0000409` inside `evs_enc_fx` after ~30 frames, while the same
+  render completes with DTX off.  The override is documented in the wrapper and
+  must be removed once FD-CNG is ported.
+* **Still broken**: stereo renders longer than ~1.3 s die with `0xC0000409`
+  (stack cookie).  Rebuilding the `evs-float-acelp` bridge with `/GS-` did not
+  move the fault, so the remaining corruption is inside the stub-implemented
+  core families (FD-CNG, LPD state machine, TCX) rather than the ACELP bridge.
+  A debug-CRT / sanitizer build is the recommended next step.
+
 ## 2026-10-06 (2) — EVS FX: G.192 encoder moved fully in-memory
 
 * **`evs_api_fx.c` no longer round-trips its bitstream through a temp file on

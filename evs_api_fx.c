@@ -143,6 +143,19 @@ EVS_Encoder* evs_enc_create_ex(int sample_rate_hz, int bitrate_bps, EVS_Bandwidt
     evs_enc_options_init(&local);
     if (opts) local = *opts;
 
+    // The fixed-point FD-CNG family is still a set of link-unblock stubs
+    // (lib_enc/fdcng_enc_fx.c and its decoder counterpart): noise
+    // estimation, SID encoding and comfort-noise generation do not
+    // implement the reference behaviour, and letting the DTX/SID path run
+    // through them corrupts memory - with DTX enabled a mono render died
+    // with 0xC0000409 inside evs_enc_fx after ~30 frames of real speech.
+    //
+    // DTX is therefore forced off here, which keeps the encoder on the
+    // speech-only path that the ported core handles correctly: the same
+    // render then completes and its output correlates 0.994 with the
+    // float EVS reference.  Remove this override once FD-CNG is ported.
+    local.dtx_enable = 0;
+
     // ---- DTX validation: only specific intervals are acceptable ----
     if (local.dtx_enable) {
         if (local.dtx_sid_interval == 0) {
