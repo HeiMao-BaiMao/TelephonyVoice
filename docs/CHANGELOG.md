@@ -5,15 +5,40 @@
 
 ---
 
-## 2026-10-06 (3) — EVS FX: CLDFB pool fix, DTX workaround, real status measured
+## 2026-10-06 (4) — SpeexDSP denoiser removed from the audio path; FX status corrected
+
+* **`dsp/SpeexDSPAux` no longer filters the audio path.**  `runPreprocess()` ran
+  `speex_preprocess_run()` in place on the caller's frame, so the denoiser
+  silently processed the `OPUS_VOIP` signal before the codec - an emulator of
+  telephony degradation should not clean its input up, and no parameter exposed
+  it.  The preprocessor now runs on a private copy that only feeds the energy
+  VAD, which keeps the VAD's dynamic range (that was the original reason for
+  enabling denoise) while the codec sees the untouched frame.  Measured effect:
+  `opus_voip` output changes (3.73 s -> 2.83 s tail, correlation 0.27 with the
+  old render); every other mode is byte-identical, because `EVS_LIKE` never
+  configures `SpeexDSPAux` (it has no codec, so `speexAux` stays null and the
+  denoiser was never reached there - the CHANGELOG's earlier claim that the
+  energy VAD drives DTX for `EVS_LIKE` only holds after a mode switch, when a
+  previous mode left the helper configured).
+* **FX status corrected.**  The previous entry said mono `evs_native` completes;
+  that measurement was taken with diagnostic `fprintf` instrumentation compiled
+  into the parent helpers and does **not** reproduce on a clean build.  Measured
+  now: renders up to ~25 codec frames (stereo 0.50 s) complete correctly and
+  correlate 0.994 with the float reference; from ~32 frames on the process dies
+  with `0xC0000409`, deterministically as a function of input length, mono or
+  stereo alike.  README, ROADMAP 4.3 and EVS_FX_PROGRESS.md §0 were updated to
+  the reproducible numbers.
+
+## 2026-10-06 (3) — EVS FX: CLDFB pool fix, DTX workaround, measured status
 
 The fixed-point EVS path was re-measured on HEAD and is far healthier than the
 June notes suggest:
 
-* **Mono `evs_native` renders correctly**: SWB 32 kHz / 13.2 kbps completes with
-  exit code 0, RMS -12.5 dBFS (float reference: -12.4 dBFS) and **0.994
-  correlation with the float EVS reference output** (both correlate ~0.92 with
-  the dry input, so this is decoded speech, not a passthrough).
+* **Short `evs_native` renders work** (see entry (4) for the corrected,
+  reproducible frame-count limit): SWB 32 kHz / 13.2 kbps output is at
+  RMS -12.5 dBFS (float reference: -12.4 dBFS) with **0.994 correlation with
+  the float EVS reference output** (both correlate ~0.92 with the dry input, so
+  this is decoded speech, not a passthrough).
 * **`cldfb_fx.c`: CLDFB instances are now heap-allocated** instead of coming
   from a fixed pool of 8 static slots.  A stereo render needs ten banks (two
   encoders + two decoders), the pool ran dry, `openCldfb()` returned NULL and

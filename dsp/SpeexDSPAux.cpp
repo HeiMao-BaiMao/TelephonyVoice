@@ -1,5 +1,6 @@
 #include "dsp/SpeexDSPAux.h"
 #include <cmath>
+#include <cstring>
 #if TELEPHONY_EXPERIMENTAL_NETWORK
 #include <speex/speex_preprocess.h>
 #endif
@@ -130,7 +131,14 @@ namespace TelephonyDSP {
 
  void SpeexDSPAux::runPreprocess(int16_t* frame) {
  if (!state || !configured || !frame) return;
- speex_preprocess_run(static_cast<SpeexPreprocessState*>(state), (spx_int16_t*)frame);
+ // The SpeexDSP preprocessor (denoise) feeds the energy VAD only: it runs on a
+ // private copy so the caller's audio is never modified.  It used to be applied
+ // in place, which silently filtered the EVS_LIKE / OPUS_VOIP signal path
+ // before the codec - an emulator of telephony degradation should not clean the
+ // input up, and no parameter exposed that behaviour.
+ if (static_cast<int>(vadScratch.size()) < frameSize) vadScratch.resize(static_cast<size_t>(frameSize));
+ std::memcpy(vadScratch.data(), frame, static_cast<size_t>(frameSize) * sizeof(int16_t));
+ speex_preprocess_run(static_cast<SpeexPreprocessState*>(state), (spx_int16_t*)vadScratch.data());
  if (!energyVadEnabled) {
  // Without the energy VAD we leave lastEnergyVadProb untouched; it
  // still holds the value from the last run() that had it enabled
@@ -138,11 +146,12 @@ namespace TelephonyDSP {
  // "unknown"-style behavior of getSpeechProbability().
  return;
  }
- // Energy VAD: RMS of the (post-denoise) frame vs. the configured
+ // Energy VAD: RMS of the (denoised) VAD copy vs. the configured
  // threshold, squashed to [0,1] via a soft ramp. We intentionally
- // use the post-denoise frame: SpeexDSP's denoise leaves near-silence
+ // use the preprocessed copy: SpeexDSP's denoise leaves near-silence
  // very close to zero, which gives the VAD a wide dynamic range to
- // distinguish speech from background hiss.
+ // distinguish speech from background hiss - while the audio path
+ // still sees the untouched frame.
  const int fs = frameSize >0 ? frameSize :0;
  if (fs <=0) {
  lastEnergyVadProb =0.0f;
@@ -150,7 +159,7 @@ namespace TelephonyDSP {
  }
  double sumSq =0.0;
  for (int i =0; i < fs; ++i) {
- const int s =static_cast<int>(frame[i]);
+ const int s =static_cast<int>(vadScratch[static_cast<size_t>(i)]);
  // Clamp to int16 range before squaring: the input should already
  // be in [-32768,32767], but defensively clamp so a stray out-of-
  // range sample (e.g. from a buggy upstream resampler) cannot push

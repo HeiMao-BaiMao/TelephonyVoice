@@ -57,6 +57,11 @@ namespace TelephonyDSP {
  bool energyVadEnabled;
  float energyVadThreshold;
  float lastEnergyVadProb;
+ // Private copy of the frame the SpeexDSP preprocessor runs on.  The
+ // denoiser feeds the energy VAD only; the caller's frame is left
+ // untouched so the denoiser cannot filter the audio path (see
+ // runPreprocess()).
+ std::vector<int16_t> vadScratch;
  };
 
 } // namespace TelephonyDSP
