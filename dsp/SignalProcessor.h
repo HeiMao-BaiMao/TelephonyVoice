@@ -106,8 +106,18 @@ namespace TelephonyDSP {
         std::vector<std::unique_ptr<ChannelProcessor>> outputLegs;
         std::vector<std::unique_ptr<RingBuffer>> dryBuffers;
 
+        // Scratch storage reused across process() calls.  The audio thread
+        // must not allocate, so every temporary that used to be a local
+        // std::vector inside process() lives here instead and is only grown
+        // (never reallocated in steady state) by ensureScratch().
+        std::vector<float> exchangeScratch;   // per-leg exchange (numSamples)
+        std::vector<float> dryScratch;        // dry signal for one leg
+        std::vector<float> wetScratch;        // processed signal for one leg
+        std::vector<std::vector<float>> legOutScratch; // [numIns][numSamples]
+
         void updateLatency();
         void ensureChannels(int count);
+        void ensureScratch(int numIns, int numSamples);
         EraMode endpointToMode(RouteEndpoint endpoint) const;
         bool degradesInputLeg() const;
         bool degradesOutputLeg() const;

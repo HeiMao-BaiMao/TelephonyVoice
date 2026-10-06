@@ -89,6 +89,12 @@ namespace TelephonyDSP {
         float paramNetworkDegradation;
         uint32_t packetLossSeed;
         int packetLossBurstFrames;
+        // Deterministic LCG state for the artifact generator.  Kept per
+        // instance (it used to be a function-local static shared by every
+        // ChannelProcessor, and the GSM branch used std::rand()) so offline
+        // renders stay reproducible and independent of how many plugin
+        // instances exist or how the host schedules them.
+        uint32_t artifactSeed;
 
         // EVS configuration (only used when currentMode == EVS_NATIVE)
         int evsSampleRate;
@@ -179,6 +185,7 @@ namespace TelephonyDSP {
         void prepareInternalBuffers(int maxBlockSize);
         void updateFilters();
         float nextPacketRandom();
+        float nextArtifactRandom();
         bool shouldDropPacket();
 
         void processG711(int numSamples, const float* in, float* out);

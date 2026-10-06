@@ -35,6 +35,24 @@ struct EVS_Encoder {
 struct EVS_Decoder {
     Decoder_State_fx* st;
     FILE*             bitfile;
+    // Backing store for st->bit_stream_fx.
+    //
+    // The fixed-point reference declares this field as a *pointer*
+    // (lib_dec/stat_dec_fx.h: "UWord16 *bit_stream_fx;") whereas the float
+    // variant embeds a fixed array ("unsigned short bit_stream[MAX_BITS_PER_FRAME+16]"
+    // in lib_dec/stat_dec.h).  Nothing in external/3gpp-evs allocates the FX
+    // pointer - read_indices_fx() only fills it in:
+    //
+    //     bit_stream_ptr = st->bit_stream_fx;
+    //     for (k = 0; k < num_bits; ++k) *bit_stream_ptr++ = (*pt_stream++ == G192_BIN1);
+    //     (lib_com/bitstream_fx.c, G.192 "GOOD frame" branch)
+    //
+    // so a calloc'd Decoder_State_fx leaves it NULL and the first decoded
+    // frame faults with an access violation (0xC0000005).  Allocate
+    // MAX_BITS_PER_FRAME+16 entries, mirroring the float array size, and
+    // hand the pointer to the decoder state.  Ownership stays here so
+    // evs_dec_destroy() frees exactly what was allocated.
+    UWord16*          bitStreamBuf;
 };
 
 // MAX_BITS_PER_FRAME is defined in cnst_fx.h (2560).
@@ -255,7 +273,29 @@ int evs_enc_process(EVS_Encoder* enc,
     if (!enc || !enc->st || !pcm_in || !bitstream_out || !bitstream_used) return EVS_ERROR;
     if (n_samples != (int)(enc->st->input_Fs_fx / 50)) return EVS_ERROR;
 
-    evs_enc_fx(enc->st, (const Word16*)pcm_in, (Word16)n_samples);
+    // Digital silence must not reach the fixed-point core: the basic-op
+    // div_s() implementation in basic_op/basop32.c calls abort() when its
+    // denominator is zero ("Division by zero, Fatal error"), and an
+    // all-zero frame is exactly the input that makes the Levinson-Durbin /
+    // gain recursion divide by zero.  The reference CLI never sees such a
+    // frame because its input files always carry a noise floor, but the
+    // plugin does: TelephonyRunner feeds zeroed blocks while flushing and
+    // real speech has silent passages - either one killed the process.
+    //
+    // Skipping evs_enc_fx() leaves the index list empty (the previous
+    // write_indices_fx() run already cleared it, and nb_bits_tot_fx is 0
+    // after init_encoder_fx()), so the serialisation below emits a valid
+    // zero-length G.192 frame.  That is the standard "no data" marker and
+    // the decoder maps it onto its DTX / SP_LOST path.
+    {
+        int all_zero = 1;
+        for (int i = 0; i < n_samples; ++i) {
+            if (pcm_in[i] != 0) { all_zero = 0; break; }
+        }
+        if (!all_zero) {
+            evs_enc_fx(enc->st, (const Word16*)pcm_in, (Word16)n_samples);
+        }
+    }
 
     // The encoder filled st->ind_list_fx via push_indice_fx() /
     // push_next_indice_fx(). write_indices_fx() serialises that into the
@@ -298,10 +338,14 @@ EVS_Decoder* evs_dec_create(int sample_rate_hz, int bitrate_bps) {
 
     dec->st = (Decoder_State_fx*)calloc(1, sizeof(Decoder_State_fx));
     dec->bitfile = open_temp_bitstream();
-    if (!dec->st || !dec->bitfile) {
+    // See the EVS_Decoder::bitStreamBuf comment: the FX reference reads/writes
+    // the G.192 unpack buffer through this pointer and never allocates it.
+    dec->bitStreamBuf = (UWord16*)calloc(MAX_BITS_PER_FRAME + 16, sizeof(UWord16));
+    if (!dec->st || !dec->bitfile || !dec->bitStreamBuf) {
         evs_dec_destroy(dec);
         return NULL;
     }
+    dec->st->bit_stream_fx = dec->bitStreamBuf;
 
     dec->st->output_Fs_fx       = sample_rate_hz;
     dec->st->total_brate_fx     = bitrate_bps;
@@ -321,6 +365,7 @@ void evs_dec_destroy(EVS_Decoder* dec) {
         destroy_decoder(dec->st);
         free(dec->st);
     }
+    if (dec->bitStreamBuf) free(dec->bitStreamBuf);
     if (dec->bitfile) fclose(dec->bitfile);
     free(dec);
 }
@@ -345,7 +390,8 @@ int evs_dec_process(EVS_Decoder* dec,
     Word16* out = (Word16*)calloc((size_t)N, sizeof(Word16));
     if (!out) return EVS_ERROR;
 
-    evs_dec_fx(dec->st, out, FRAMEMODE_NORMAL);
+    evs_dec_fx(dec->st, out,
+               dec->st->bfi_fx ? FRAMEMODE_MISSING : FRAMEMODE_NORMAL);
 
     // The fixed-point reference produces Q0 PCM samples that already fit
     // in Word16 (the reference's own resample / de-emphasis chain takes

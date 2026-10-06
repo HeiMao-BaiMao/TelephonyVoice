@@ -162,7 +162,20 @@ void processFile(const std::string& inputFile, TelephonyDSP::EraMode mode,
     for (int ch=0; ch<channels; ++ch) std::fill(inputs[ch].begin(), inputs[ch].end(), 0.0f);
     
     int consecutiveSilentBlocks = 0;
-    const int MAX_FLUSH_BLOCKS = 500; // ~10 seconds safety limit
+    // Upper bound on the drained tail, expressed in *time* so the cap does
+    // not depend on the host sample rate.
+    //
+    // The silence rule below cannot terminate DTX/CNG codecs: Opus keeps
+    // emitting comfort noise after the input stops (the energy VAD forces
+    // the packet-lost/DTX path on digital silence), and that noise floor
+    // sits well above SIGNAL_THRESHOLD forever, so the loop used to run to
+    // the old 500-block safety limit and append ~10.7 s of comfort noise to
+    // a 2.7 s file.  1.0 s comfortably exceeds every internal buffer that
+    // actually needs draining (codec 20 ms frames, r8brain resampler group
+    // delay, Opus/JBM jitter queues <= 320 ms) while bounding the tail.
+    const double MAX_FLUSH_SECONDS = 1.0;
+    const int MAX_FLUSH_BLOCKS =
+        (std::max)(1, (int)std::ceil(MAX_FLUSH_SECONDS * sampleRate / BLOCK_SIZE));
     const int SILENCE_THRESHOLD_BLOCKS = 5; // Stop after ~100ms of silence
     const float SIGNAL_THRESHOLD = 0.002f; // ~ -54dB, ignores codec noise floor
 

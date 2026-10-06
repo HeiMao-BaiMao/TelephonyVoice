@@ -222,8 +222,15 @@ namespace TelephonyDSP {
     }
 
     void SignalProcessor::updateLatency() {
-        if (simulateLatency) targetLatencySamples = (int)std::round(0.1 * hostSampleRate);
-        else targetLatencySamples = 0;
+        // LATENCY_MS (dsp/Types.h) is the single source of truth for the
+        // latency reported to the host: the bypass path in TelephonyVoice.cpp
+        // compensates using getLatencySamples(), so the delay there and the
+        // delay the host is told about must come from the same constant.
+        if (simulateLatency) {
+            targetLatencySamples = (int)std::round((LATENCY_MS / 1000.0) * hostSampleRate);
+        } else {
+            targetLatencySamples = 0;
+        }
     }
 
     int SignalProcessor::getLatencySamples() const {
@@ -244,17 +251,34 @@ namespace TelephonyDSP {
         }
     }
 
+    void SignalProcessor::ensureScratch(int numIns, int numSamples) {
+        if ((int)exchangeScratch.size() < numSamples) exchangeScratch.resize(numSamples);
+        if ((int)dryScratch.size()      < numSamples) dryScratch.resize(numSamples);
+        if ((int)wetScratch.size()      < numSamples) wetScratch.resize(numSamples);
+        if ((int)legOutScratch.size()   < numIns)     legOutScratch.resize(numIns);
+        for (int i = 0; i < numIns; ++i) {
+            if ((int)legOutScratch[i].size() < numSamples) legOutScratch[i].resize(numSamples);
+        }
+    }
+
     void SignalProcessor::process(float** inputs, int numIns, float** outputs, int numOuts, int numSamples) {
         ensureChannels(numIns);
+        ensureScratch(numIns, numSamples);
         inTotalSamples += numSamples;
 
         for (int i=0; i<numIns; ++i) {
             dryBuffers[i]->write(inputs[i], numSamples);
             if (routeModelEnabled) {
-                std::vector<float> exchange(numSamples, 0.0f);
                 inputLegs[i]->pushInput(inputs[i], numSamples);
-                inputLegs[i]->pullOutput(exchange.data(), numSamples);
-                outputLegs[i]->pushInput(exchange.data(), numSamples);
+                // pullOutput() may return fewer samples than requested; clear
+                // the tail it did not write so the output leg never sees
+                // stale scratch data from a previous block.
+                const size_t got = inputLegs[i]->pullOutput(exchangeScratch.data(), numSamples);
+                if (got < (size_t)numSamples) {
+                    std::fill(exchangeScratch.begin() + got,
+                              exchangeScratch.begin() + numSamples, 0.0f);
+                }
+                outputLegs[i]->pushInput(exchangeScratch.data(), numSamples);
             } else {
                 outputLegs[i]->pushInput(inputs[i], numSamples);
             }
@@ -275,30 +299,34 @@ namespace TelephonyDSP {
         }
 
         if (samplesToWrite > 0) {
-            std::vector<std::vector<float>> processedChannels(numIns, std::vector<float>(samplesToWrite));
-            
+            // Reused scratch is not zero-initialised per block, so clear the
+            // regions the readers below only partially overwrite.
+            std::fill(dryScratch.begin(), dryScratch.begin() + samplesToWrite, 0.0f);
+            std::fill(wetScratch.begin(), wetScratch.begin() + samplesToWrite, 0.0f);
+
             for (int i=0; i<numIns; ++i) {
-                std::vector<float> d(samplesToWrite);
+                float* d = dryScratch.data();
                 if (dryBuffers[i]->getReadAvailable() >= (size_t)samplesToWrite) {
-                    dryBuffers[i]->read(d.data(), samplesToWrite);
+                    dryBuffers[i]->read(d, samplesToWrite);
                 } else {
-                    dryBuffers[i]->read(d.data(), dryBuffers[i]->getReadAvailable());
+                    dryBuffers[i]->read(d, dryBuffers[i]->getReadAvailable());
                 }
 
-                std::vector<float> w(samplesToWrite);
-                outputLegs[i]->pullOutput(w.data(), samplesToWrite);
-                
+                float* w = wetScratch.data();
+                outputLegs[i]->pullOutput(w, samplesToWrite);
+
+                float* dst = legOutScratch[i].data();
                 for (int s=0; s<samplesToWrite; ++s) {
-                    processedChannels[i][s] = (d[s] * (1.0f - paramDryWet) + w[s] * paramDryWet) * paramOutGain;
+                    dst[s] = (d[s] * (1.0f - paramDryWet) + w[s] * paramDryWet) * paramOutGain;
                 }
             }
 
             for (int ch=0; ch<numOuts; ++ch) {
                 int inCh = (ch < numIns) ? ch : 0;
                 float* dest = outputs[ch] + outputOffset;
-                std::memcpy(dest, processedChannels[inCh].data(), samplesToWrite * sizeof(float));
+                std::memcpy(dest, legOutScratch[inCh].data(), samplesToWrite * sizeof(float));
             }
-            
+
             outTotalSamples += samplesToWrite;
         }
     }

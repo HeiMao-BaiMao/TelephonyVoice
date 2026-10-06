@@ -25,7 +25,9 @@ cmd /c "call `"C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliar
 成果物:
 
 * `out/build/x64-release/TelephonyRunner.exe` – CLI
-* `out/build/x64-release/VST3/Release/TelephonyVoice.vst3` – プラグイン
+* `out/build/x64-release/VST3/TelephonyVoice.vst3` – プラグイン (読み込み可能な
+  モジュール本体。`VST3/Release/TelephonyVoice.vst3/` はアイコン等のリソース
+  置き場で、その中にバイナリはありません)
 
 CLI は 16-bit PCM WAV を入力すると、各モードの出力 `<入力名>.<モード>.wav` を
 まとめて生成します:
@@ -77,7 +79,7 @@ UI パラメータ:
 
 | オプション                  | 既定値  | 効果                                                                 |
 | -------------------------- | ------- | ---------------------------------------------------------------------- |
-| `TELEPHONY_USE_EVS_FX`     | OFF     | 実験的な固定小数点 EVS (TS 26.442)。FX ライブラリと `TelephonyDSP` まではビルドできるが、`TelephonyRunner` の最終リンクが未解決シンボルでブロック中(詳細は [docs/CHANGELOG.md](docs/CHANGELOG.md))。 |
+| `TELEPHONY_USE_EVS_FX`     | OFF     | 実験的な固定小数点 EVS (TS 26.442)。FX ライブラリ・`TelephonyDSP`・`TelephonyRunner` まで**ビルドとリンクは通る**(`LNK1120` = 0)が、固定小数点コアの主要部が未移植のスタブのままで、実音声を通すと動作中にクラッシュする。詳細は [docs/CHANGELOG.md](docs/CHANGELOG.md) と [EVS_FX_PROGRESS.md](EVS_FX_PROGRESS.md)。 |
 | `TELEPHONY_USE_EVS_JBM`    | OFF     | 3GPP `EvsRXlib` を包む実験的な EVS Stage-1 JBM/VoIP 受信アダプタ (`evs_api_rx`) と `EVSJbmSmoke` をビルド。`TELEPHONY_DISTRIBUTION_BUILD`・`TELEPHONY_USE_EVS_FX` とは併用不可。 |
 | `TELEPHONY_DISTRIBUTION_BUILD` | OFF | AMR/AMR-WB/EVS 参照実装を除外し、配布可能なモードのみを公開。 |
 | `TELEPHONY_EXPERIMENTAL_NETWORK` | ON (配布ビルドでは強制 OFF) | SpeexDSP + Opus をビルドし `OPUS_VOIP` モードを公開 (BSD ライセンス)。 |
@@ -103,6 +105,8 @@ ctest --test-dir out/build/x64-release --output-on-failure
 ```
 
 JBM ビルドでは `EVSJbmSmoke` も `evs_jbm_smoke` として ctest に登録されます。
+`TELEPHONY_USE_EVS_FX=ON` の構成では、固定小数点 EVS がまだ実行時に安定しない
+ため ctest 自体を登録していません ([CMakeLists.txt](CMakeLists.txt) の該当ブロック参照)。
 GitHub Actions (`.github/workflows/ci.yml`) が push / PR ごとに
 `x64-release` / `x64-release-dist` / `x64-release-jbm` の 3 構成を
 ビルド+テストします。
@@ -125,7 +129,10 @@ GitHub Actions (`.github/workflows/ci.yml`) が push / PR ごとに
 │   └── vo-amrwbenc.cmake
 ├── evs_api.h              # 3GPP EVS ラッパーの公開 C API
 ├── evs_api.c              # 浮動小数点版(完全インメモリ、ファイルI/Oなし)
-├── evs_api_fx.c           # 固定小数点版(実験的 / リンクブロック中)
+├── evs_api_fx.c           # 固定小数点版(実験的 / リンクは可、実行時は未完成)
+├── *_fx.c (ルート直下)     # 固定小数点コアの親リポジトリ側ヘルパー(大半がスタブ)
+├── helpers/               # evs-float-acelp: float 版 ACELP 探索を FX から利用する糊
+├── EVS_FX_PROGRESS.md     # 固定小数点 EVS の作業メモ(リンク到達点と残スタブ)
 ├── evs_api_rx.h / .c      # EVS JBM/VoIP 受信アダプタ (TELEPHONY_USE_EVS_JBM)
 ├── dsp/                   # 経路対応 SignalProcessor、コーデック別クラス、
 │                          # PLC、リサンプラ/フィルタチェーン(クラス毎に27ファイル)
@@ -190,7 +197,9 @@ Ericsson、Nokia など)は商用配布に適用されます。配布には
   受信側ジッタバッファ(JBM)アダプタ。`5G携帯 (JBM)` エンドポイントと
   `EVSJbmSmoke` テストを追加します。浮動小数点 EVS 専用・非配布のみ。
 * **固定小数点 EVS** (`TELEPHONY_USE_EVS_FX`, 既定 OFF): TS 26.442 v16.4.0 の
-  移植作業中。コンパイルは通るものの最終リンクが未解決シンボルでブロックされて
-  おり、出荷可能な状態ではありません。浮動小数点版が引き続きサポート対象です。
+  移植作業中。`TelephonyRunner` までのリンクは通るようになったが、固定小数点
+  コア (ACELP/TCX 符号化、FD-CNG、LPD 状態機械) の多くがまだリンク用スタブで、
+  実音声を流すと内部でメモリ破壊を起こして異常終了する。**出荷可能な状態では
+  ない**。浮動小数点版が引き続きサポート対象です。
 
 詳細な経緯・設計メモはすべて [docs/CHANGELOG.md](docs/CHANGELOG.md) にあります。

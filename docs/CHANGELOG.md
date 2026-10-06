@@ -5,6 +5,77 @@
 
 ---
 
+## 2026-10-06 — End-to-end build/run verification, realtime-safety and FX fixes
+
+All four configurations were built and exercised on this machine
+(MSVC 14.51.36231 / VS 18, CMake 4.3.1, Ninja 1.13.2). `x64-release`,
+`x64-release-dist` and `x64-release-jbm` build and pass ctest
+(`dsp_smoke` 3/3, plus `evs_jbm_smoke` in the JBM tree).
+
+* **EVS fixed-point NULL dereference fixed** (`evs_api_fx.c`): the FX
+  `Decoder_State_fx` declares `UWord16 *bit_stream_fx` as a *pointer*
+  (`lib_dec/stat_dec_fx.h`) where the float variant embeds an array, and
+  nothing in `external/3gpp-evs` allocates it - `read_indices_fx()` writes the
+  unpacked G.192 bits through it (`lib_com/bitstream_fx.c`, G.192 GOOD-frame
+  branch).  With a `calloc`'d state that pointer was NULL, so the first decoded
+  frame died with `0xC0000005`.  `evs_dec_create()` now allocates
+  `MAX_BITS_PER_FRAME+16` entries and `evs_dec_destroy()` frees them.  This
+  restores the fix described in `EVS_FX_PROGRESS.md` §6.3 that was lost in the
+  later `_fx` field-rename rewrite.
+* **EVS fixed-point digital-silence guard restored** (`evs_api_fx.c`): the
+  basic-op `div_s()` implementation calls `abort()` on a zero denominator, and
+  an all-zero frame is what drives the Levinson-Durbin / gain recursion into
+  it.  `evs_enc_process()` now detects an all-zero frame, skips `evs_enc_fx()`
+  and lets the serialiser emit a zero-length G.192 frame (the standard "no
+  data" marker the decoder maps onto DTX / SP_LOST) - the same lost fix the
+  progress notes describe.
+* **FX decoder concealment path aligned with the float wrapper**: `bfi_fx` now
+  selects `FRAMEMODE_MISSING` instead of always running `FRAMEMODE_NORMAL`.
+* **OPUS_VOIP flush tail bounded** (`TelephonyRunner.cpp`): the smart-flush
+  loop stopped on a -54 dBFS threshold, which DTX/CNG codecs never cross -
+  Opus kept emitting comfort noise and the loop ran to its 500-block safety
+  limit, appending ~10.7 s of noise to a 2.7 s file (13.39 s output).  The cap
+  is now expressed in time (1.0 s) and the same file renders 3.73 s.  All
+  other modes are byte-identical to their previous output.
+* **Audio-thread allocations removed** (`dsp/SignalProcessor.{h,cpp}`):
+  `process()` allocated `exchange`, `processedChannels`, `d` and `w` vectors on
+  every block.  They are now preallocated members grown on demand by
+  `ensureScratch()`, and the partially-written regions are explicitly cleared
+  so the reused buffers keep the old zero-fill semantics.
+* **Artifact noise made deterministic** (`dsp/ChannelProcessor.{h,cpp}`):
+  `applyArtifacts()` used a function-local `static` seed shared by every
+  instance plus `std::rand()` for the GSM clicks, so artifact output depended
+  on instance count, processing order and the CRT's global rand() state.  It
+  now uses a per-instance LCG (`artifactSeed`, re-seeded in `reset()`).
+* **G.711 codec no longer rebuilt on unchanged law**
+  (`dsp/ChannelProcessor.cpp`): `setG711Law()` is called for both legs on every
+  parameter update via `applyRouteToChannels()`, and it unconditionally called
+  `recreateCodec()` while PSTN_G711 was selected - i.e. every host knob move
+  re-created the codec and its resampler/PLC state.
+* **Uninitialised members fixed** (`dsp/ChannelProcessor.cpp`): `evsG711Law`,
+  `evsScVbrEnabled`, `opusBandwidth` and `amrNbMode` were missing from the
+  constructor initialiser list and were read uninitialised.
+* **Latency constant single-sourced** (`dsp/SignalProcessor.cpp`):
+  `updateLatency()` now derives from `LATENCY_MS` (`dsp/Types.h`) instead of a
+  duplicated literal `0.1`.
+* **Docs corrected**: README no longer claims the FX variant is link-blocked
+  (`TelephonyRunner.exe` links with `LNK1120 = 0`) and documents the real
+  VST3 module path (`VST3/TelephonyVoice.vst3`; the `VST3/Release/...` bundle
+  holds only resources); CMakeLists' test-skip comment and ROADMAP 4.3 now
+  describe the runtime situation instead of a link failure.
+
+**Still open (verified, not fixed):** the FX core port itself.  With the
+wrapper bugs above fixed, a mono FX render now completes `init_encoder_fx`,
+`init_decoder_fx`, roughly 30 frames of encode/decode and then dies with
+`0xC0000409` (stack-buffer overrun) inside `evs_enc_fx`; a stereo render dies
+earlier with `0xC0000005` in the second `init_decoder_fx`.  Both point at
+memory corruption inside the stub-implemented core families (ACELP/TCX coding,
+FD-CNG, LPD state machine) that ROADMAP 4.3 tracks, not at the wrapper.
+`evs_api_fx.c` also still round-trips its G.192 bitstream through a `tmpfile()`
+per frame (with a fixed-name `evs_tandem.192` fallback in the CWD), unlike the
+float wrapper which was converted to fully in-memory serialisation.
+
+
 ## 2026-07-03 — Bypass latency alignment, CI, README restructure
 
 * **Latency-compensated bypass** (`TelephonyVoice.cpp/h`): the bypass path

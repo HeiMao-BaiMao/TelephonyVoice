@@ -18,11 +18,22 @@ namespace TelephonyDSP {
           paramArtifactsEnabled(false), paramArtifactAmount(0.0f),
           paramPacketLossRate(0.0f), paramNetworkDegradation(0.0f),
           packetLossSeed(0x12345678u), packetLossBurstFrames(0),
+          artifactSeed(0xA5A5F00Du),
           evsSampleRate(32000), evsBitrateBps(EVS_BR_13200), evsMaxBandwidth(EVS_SWB),
           evsDtxSidInterval(0),
-          downMaxInLen(0), upMaxInLen(0),
+          // These four used to be left out of the initialiser list and were
+          // therefore read while uninitialised: setG711Law() compares against
+          // the cached law (and now short-circuits on an unchanged value),
+          // setEvsScVbrEnabled()/setOpusBandwidth()/setAmrNbMode() are all
+          // consulted by recreateCodec().  Seed them with the same defaults
+          // SignalProcessor and the codec classes use.
+          evsScVbrEnabled(false),
+          evsG711Law(0),        // 0 = mu-law
+          opusBandwidth(kOpusBandwidthFullband),
+          evsOpusBitrateBps(24000), // default Opus target bitrate (24 kbps).
           amrWbMode(2), // 12.65 kbps; matches AMRWBCodec's own default.
-          evsOpusBitrateBps(24000) // default Opus target bitrate (24 kbps).
+          amrNbMode(7), // 12.2 kbps (MR122); matches AMRNBCodec's own default.
+          downMaxInLen(0), upMaxInLen(0)
     {
         size_t bigSize = 131072;
         ringCodecIn.resize(bigSize);
@@ -144,6 +155,13 @@ namespace TelephonyDSP {
     }
 
     void ChannelProcessor::setG711Law(int law) {
+        // No-op when the law did not change.  This setter is called on every
+        // parameter update (SignalProcessor::applyRouteToChannels() mirrors
+        // the cached value into both legs, and the VST calls that on every
+        // parameter change), so the unconditional recreateCodec() below used
+        // to destroy and re-create the G.711 codec - including its resampler
+        // and PLC state - on every knob move while PSTN_G711 was selected.
+        if (evsG711Law == law) return;
         evsG711Law = law;
         // If the active codec is a G.711 codec, push the new law flag through
         // in place; otherwise the change is remembered in evsG711Law and picked
@@ -244,6 +262,9 @@ void ChannelProcessor::reset() {
         hpFilter1.reset(); hpFilter2.reset();
         lpFilter1.reset(); lpFilter2.reset();
         packetLossBurstFrames = 0;
+        // Re-seed the artifact generator so a reset() (host seek / transport
+        // restart) reproduces the same deterministic noise pattern.
+        artifactSeed = 0xA5A5F00Du;
         simulatedPathPLC.reset(640);
         if (resamplerDown) resamplerDown->clear();
         if (resamplerUp) resamplerUp->clear();
@@ -443,6 +464,14 @@ void ChannelProcessor::reset() {
     float ChannelProcessor::nextPacketRandom() {
         packetLossSeed = packetLossSeed * 1664525u + 1013904223u;
         return (float)((packetLossSeed >> 8) & 0x00FFFFFFu) / 16777216.0f;
+    }
+
+    // Deterministic [0,1) generator for the artifact path.  Same LCG as
+    // nextPacketRandom() but with its own state so loss and artifact
+    // randomness do not perturb each other.
+    float ChannelProcessor::nextArtifactRandom() {
+        artifactSeed = artifactSeed * 1664525u + 1013904223u;
+        return (float)((artifactSeed >> 8) & 0x00FFFFFFu) / 16777216.0f;
     }
 
     bool ChannelProcessor::shouldDropPacket() {
@@ -660,12 +689,20 @@ void ChannelProcessor::recreateCodec() {
     
     void ChannelProcessor::applyArtifacts(float* buffer, int numSamples) {
         if (!paramArtifactsEnabled || paramArtifactAmount <= 0.001f) return;
-        static uint32_t seed = 12345;
-        auto randf = [&]() { seed = seed * 1664525 + 1013904223; return (float)(seed & 0xFFFF) / 32768.0f - 1.0f; };
-        for (int i=0; i<numSamples; ++i) {
-            if (currentMode == EraMode::GSM_FR && (rand() % 1000) < (10 * paramArtifactAmount)) buffer[i] += randf() * 0.5f * paramArtifactAmount;
+        // Deterministic, per-instance LCG (see nextArtifactRandom()).  The
+        // previous implementation used a function-local `static` seed plus
+        // std::rand(), which made the artifact noise depend on how many
+        // ChannelProcessor instances existed, on their processing order, and
+        // on the C runtime's global rand() state - i.e. offline renders were
+        // not reproducible.
+        const float gsmClickProbability = 10.0f * paramArtifactAmount / 1000.0f;
+        for (int i = 0; i < numSamples; ++i) {
+            if (currentMode == EraMode::GSM_FR &&
+                nextArtifactRandom() < gsmClickProbability) {
+                buffer[i] += (nextArtifactRandom() * 2.0f - 1.0f) * 0.5f * paramArtifactAmount;
+            }
             // General noise
-            buffer[i] += randf() * 0.01f * paramArtifactAmount;
+            buffer[i] += (nextArtifactRandom() * 2.0f - 1.0f) * 0.01f * paramArtifactAmount;
         }
     }
 

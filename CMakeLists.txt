@@ -289,9 +289,15 @@ endif()
 # configuration through SignalProcessor and, on non-distribution builds,
 # round-trips the raw EVS C API including the DTX SID/NO_DATA path.
 #
-# Skipped under TELEPHONY_USE_EVS_FX because that variant is still
-# link-blocked (see README) - any executable linking TelephonyDSP would
-# fail to link there.
+# Still skipped under TELEPHONY_USE_EVS_FX, but no longer because of the
+# linker: the FX variant now builds and links TelephonyRunner.exe with
+# LNK1120 = 0 (verified 2026-10-06).  The blocker is runtime: the fixed-point
+# core is still mostly link-unblock stubs (ACELP/TCX coding, FD-CNG, LPD
+# state machine), and running real audio through it corrupts memory and kills
+# the process (mono: 0xC0000409 inside evs_enc_fx after ~30 frames; stereo:
+# 0xC0000005 in the second init_decoder_fx).  The smoke test would therefore
+# crash instead of reporting a result, so it stays disabled until the core
+# port lands.  See README.md and EVS_FX_PROGRESS.md.
 # ---------------------------------------------------------------------------
 if(NOT TELEPHONY_USE_EVS_FX)
     enable_testing()
