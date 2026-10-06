@@ -5,6 +5,30 @@
 
 ---
 
+## 2026-10-06 (2) — EVS FX: G.192 encoder moved fully in-memory
+
+* **`evs_api_fx.c` no longer round-trips its bitstream through a temp file on
+  the encode side.**  `evs_enc_process()` now replicates the G192 branch of the
+  reference `write_indices_fx()` (including its post-write index-list reset)
+  directly into the caller's buffer, exactly like the float wrapper already
+  did.  Equivalence was verified byte-for-byte: a mono FX render produces the
+  same 61,440 bytes as the previous file-based encoder.
+* **The shared, fixed-name fallback temp file is gone.**  `open_temp_bitstream()`
+  used to fall back to `fopen("evs_tandem.192")` in the current directory when
+  `tmpfile()` failed, so two plugin instances (or two processes sharing a
+  directory) would have interleaved writes into one bitstream file.  If
+  `tmpfile()` fails now, `evs_dec_create()` fails cleanly and `EVSCodec` passes
+  audio through untouched instead of corrupting silently.
+* **The decode side deliberately stays file-backed.**  The reference exposes two
+  different G.192/RTP decoders: `read_indices_fx()` (G.192 word stream, with the
+  SID/CRC/BER bookkeeping and a static DTX helper) and
+  `read_indices_from_djb_fx()` (compact RTP access unit).  Swapping the wrapper
+  onto the latter was tried and **crashed on the very first frame** - it is a
+  different transport implementation, and the helper that carries the G.192 DTX
+  semantics is `static` inside the read-only submodule.  An in-memory G.192
+  decoder therefore requires a submodule change or a full re-implementation and
+  is deferred with the rest of the fixed-point core work.
+
 ## 2026-10-06 — End-to-end build/run verification, realtime-safety and FX fixes
 
 All four configurations were built and exercised on this machine

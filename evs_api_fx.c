@@ -6,8 +6,22 @@
 // evs_enc_fx, init_decoder_fx, evs_dec_fx).
 //
 // The fixed-point reference shares the same G.192 bitstream format with the
-// floating-point reference, so we re-use the same flat uint16_t encoding on
-// top of write_indices_fx() / read_indices_fx() via a temporary FILE*.
+// floating-point reference.
+//
+// Encoding is fully in-memory, like the float wrapper: the encoder replicates
+// the G192 branch of write_indices_fx() (lib_com/bitstream_fx.c) straight into
+// the caller's buffer, so no temporary file is touched and concurrent plugin
+// instances cannot share one.
+//
+// Decoding still goes through the reference's file-based G.192 reader
+// read_indices_fx() with a private tmpfile() per decoder instance.  The
+// alternative in-memory entry point, read_indices_from_djb_fx(), implements the
+// *RTP payload* transport instead: it skips the G.192 SID/CRC/BER bookkeeping
+// and drives a static helper that is not exported from the submodule, so
+// swapping it in changes DTX behaviour (measured: it crashed on the first
+// frame).  Porting the G.192 semantics in memory therefore requires either a
+// submodule change or a full re-implementation, and is deferred until the
+// fixed-point core itself is ported.
 
 #include "evs_api.h"
 
@@ -29,11 +43,18 @@
 struct EVS_Encoder {
     Encoder_State_fx* st;
     Indice_fx*        ind_buf;   // MAX_NUM_INDICES entries
-    FILE*             bitfile;   // tmpfile() roundtrip for the bitstream
 };
 
 struct EVS_Decoder {
     Decoder_State_fx* st;
+    // Private scratch file for the per-frame G.192 round-trip required by
+    // read_indices_fx() (see evs_dec_process()).  tmpfile() creates a unique,
+    // anonymous stream per decoder instance; the previous implementation also
+    // had a fallback that opened the *fixed* name "evs_tandem.192" relative to
+    // the current directory, which two plugin instances (or two processes
+    // sharing a directory) would have shared and corrupted.  If tmpfile()
+    // fails we now fail the codec creation instead of corrupting silently -
+    // EVSCodec then passes audio through untouched.
     FILE*             bitfile;
     // Backing store for st->bit_stream_fx.
     //
@@ -41,16 +62,17 @@ struct EVS_Decoder {
     // (lib_dec/stat_dec_fx.h: "UWord16 *bit_stream_fx;") whereas the float
     // variant embeds a fixed array ("unsigned short bit_stream[MAX_BITS_PER_FRAME+16]"
     // in lib_dec/stat_dec.h).  Nothing in external/3gpp-evs allocates the FX
-    // pointer - read_indices_fx() only fills it in:
+    // pointer - the unpacking code only fills it in:
     //
     //     bit_stream_ptr = st->bit_stream_fx;
     //     for (k = 0; k < num_bits; ++k) *bit_stream_ptr++ = (*pt_stream++ == G192_BIN1);
-    //     (lib_com/bitstream_fx.c, G.192 "GOOD frame" branch)
+    //     (lib_com/bitstream_fx.c, read_indices_fx G.192 "GOOD frame" branch)
     //
     // so a calloc'd Decoder_State_fx leaves it NULL and the first decoded
     // frame faults with an access violation (0xC0000005).  Allocate
-    // MAX_BITS_PER_FRAME+16 entries, mirroring the float array size, and
-    // hand the pointer to the decoder state.  Ownership stays here so
+    // MAX_BITS_PER_FRAME+16 entries, mirroring the float array size (the
+    // compact-AU reader also appends 16 zero bits for the arithmetic coder),
+    // and hand the pointer to the decoder state.  Ownership stays here so
     // evs_dec_destroy() frees exactly what was allocated.
     UWord16*          bitStreamBuf;
 };
@@ -60,16 +82,20 @@ struct EVS_Decoder {
 // G192 / MIME / ACELP_13k20 / FEC_OFFSET / FIXED_SID_RATE / MODE1 / MODE2
 // are all exposed by cnst_fx.h.
 
+// Scratch stream for the file-based G.192 reader.  tmpfile() only: see the
+// EVS_Decoder::bitfile comment for why the old fixed-name fallback is gone.
+// (MSVC's CRT deprecation warning for tmpfile() is suppressed locally; the
+// function is plain C89 and remains the portable choice here.)
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4996)
+#endif
 static FILE* open_temp_bitstream(void) {
-    FILE* f = tmpfile();
-    if (!f) {
-        // tmpfile() may fail on some Windows configurations; fall back to
-        // a real temp file path (same fallback as the float wrapper).
-        const char* path = "evs_tandem.192";
-        f = fopen(path, "w+b");
-    }
-    return f;
+    return tmpfile();
 }
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
 
 static int sample_rate_to_index(int sr_hz) {
     switch (sr_hz) {
@@ -159,8 +185,7 @@ EVS_Encoder* evs_enc_create_ex(int sample_rate_hz, int bitrate_bps, EVS_Bandwidt
 
     enc->st = (Encoder_State_fx*)calloc(1, sizeof(Encoder_State_fx));
     enc->ind_buf = (Indice_fx*)calloc(MAX_NUM_INDICES, sizeof(Indice_fx));
-    enc->bitfile = open_temp_bitstream();
-    if (!enc->st || !enc->ind_buf || !enc->bitfile) {
+    if (!enc->st || !enc->ind_buf) {
         evs_enc_destroy(enc);
         return NULL;
     }
@@ -234,7 +259,6 @@ void evs_enc_destroy(EVS_Encoder* enc) {
         free(enc->st);
     }
     if (enc->ind_buf) free(enc->ind_buf);
-    if (enc->bitfile) fclose(enc->bitfile);
     free(enc);
 }
 
@@ -298,30 +322,52 @@ int evs_enc_process(EVS_Encoder* enc,
     }
 
     // The encoder filled st->ind_list_fx via push_indice_fx() /
-    // push_next_indice_fx(). write_indices_fx() serialises that into the
-    // G.192 format into our temp file.
-    UWord8 pFrame[(MAX_BITS_PER_FRAME + 7) >> 3];
-    Word16 pFrame_size = 0;
+    // push_next_indice_fx().  Serialise that into the caller's buffer as a
+    // G.192 word stream, replicating the G192 branch of the reference
+    // write_indices_fx() (lib_com/bitstream_fx.c) including its post-write
+    // index-list reset, so no temporary file is needed.
+    {
+        const Word32 numBits = (Word32)enc->st->nb_bits_tot_fx;
+        const int need = (int)(2u + (unsigned)numBits) * (int)sizeof(unsigned short);
+        if (bitstream_max < need) return EVS_ERROR;
 
-    if (enc->st->bitstreamformat == MIME) {
-        // No direct indices_to_serial() equivalent in the FX reference; for
-        // the G.192 path (our default) write_indices_fx() reads ind_list_fx
-        // directly so we leave pFrame empty.
+        unsigned short stream[2 + MAX_BITS_PER_FRAME];
+        unsigned short* pt_stream = stream;
+        int i, k;
+
+        for (i = 0; i < 2 + MAX_BITS_PER_FRAME; ++i) {
+            stream[i] = 0;
+        }
+        *pt_stream++ = (unsigned short)SYNC_GOOD_FRAME;
+        *pt_stream++ = (unsigned short)enc->st->nb_bits_tot_fx;
+
+        for (i = 0; i < MAX_NUM_INDICES; ++i) {
+            const Word16 nb_bits = enc->st->ind_list_fx[i].nb_bits;
+            if (nb_bits != -1) {
+                // mask from MSB to LSB
+                Word32 mask = 1 << (nb_bits - 1);
+                for (k = 0; k < nb_bits; ++k) {
+                    *pt_stream++ = (enc->st->ind_list_fx[i].value & mask)
+                                       ? (unsigned short)G192_BIN1
+                                       : (unsigned short)G192_BIN0;
+                    mask >>= 1;
+                }
+            }
+        }
+
+        // Clearing of indices (mirrors the reference writer).
+        for (i = 0; i < MAX_NUM_INDICES; ++i) {
+            enc->st->ind_list_fx[i].nb_bits = -1;
+        }
+        enc->st->nb_bits_tot_fx = 0;
+        enc->st->next_ind_fx    = 0;
+        enc->st->last_ind_fx    = -1;
+
+        // memcpy instead of a direct unsigned short* store: the caller's byte
+        // buffer has no alignment guarantee.
+        memcpy(bitstream_out, stream, (size_t)need);
+        *bitstream_used = need;
     }
-
-    rewind(enc->bitfile);
-    write_indices_fx(enc->st, enc->bitfile, pFrame, pFrame_size);
-    fflush(enc->bitfile);
-
-    // Copy the G.192 stream out as a flat byte buffer.
-    rewind(enc->bitfile);
-    int need = (2 + MAX_BITS_PER_FRAME) * (int)sizeof(unsigned short);
-    if (bitstream_max < need) return EVS_ERROR;
-
-    unsigned short* stream = (unsigned short*)bitstream_out;
-    size_t read = fread(stream, sizeof(unsigned short), 2 + MAX_BITS_PER_FRAME, enc->bitfile);
-    *bitstream_used = (int)read * (int)sizeof(unsigned short);
-    if (read < 2) return EVS_ERROR;
 
     return EVS_OK;
 }
@@ -339,7 +385,7 @@ EVS_Decoder* evs_dec_create(int sample_rate_hz, int bitrate_bps) {
     dec->st = (Decoder_State_fx*)calloc(1, sizeof(Decoder_State_fx));
     dec->bitfile = open_temp_bitstream();
     // See the EVS_Decoder::bitStreamBuf comment: the FX reference reads/writes
-    // the G.192 unpack buffer through this pointer and never allocates it.
+    // the unpacked bit array through this pointer and never allocates it.
     dec->bitStreamBuf = (UWord16*)calloc(MAX_BITS_PER_FRAME + 16, sizeof(UWord16));
     if (!dec->st || !dec->bitfile || !dec->bitStreamBuf) {
         evs_dec_destroy(dec);
@@ -376,6 +422,16 @@ int evs_dec_process(EVS_Decoder* dec,
     if (!dec || !dec->st || !bitstream_in || !pcm_out || !n_samples) return EVS_ERROR;
     if (bitstream_len <= 0) return EVS_ERROR;
 
+    // The G.192 reader stays file-backed on purpose.  The reference exposes
+    // two different decoders for the two transports:
+    //   * read_indices_fx()          - G.192 word stream (what we produce)
+    //   * read_indices_from_djb_fx() - compact RTP access unit
+    // The G.192 path additionally runs SID/CRC/BER bookkeeping and drives the
+    // static read_indices_mime_handle_dtx() helper, which is not exported, so
+    // an in-memory reimplementation would have to clone that logic.  Rather
+    // than diverge from the reference semantics we keep read_indices_fx() and
+    // only make sure its temporary file is private to this instance (see
+    // evs_dec_create()).
     rewind(dec->bitfile);
     if ((int)fwrite(bitstream_in, 1, bitstream_len, dec->bitfile) != bitstream_len) return EVS_ERROR;
     fflush(dec->bitfile);
